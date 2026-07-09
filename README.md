@@ -1,0 +1,373 @@
+# yarddog
+
+A yard dog for a home network: a self-hosted watchdog that lives on a machine
+inside your LAN, watches the internet uplink and reboots the GPON router when
+the link goes down. Like a proper yard dog it guards its own yard only —
+nothing is exposed to the outside world and no cloud is involved. The watchdog
+itself is a short-lived process fired by cron on a home server (a Raspberry Pi
+in the reference setup) and opens no ports; an optional companion daemon
+(`yarddogd`) serves the recorded history as a read-only JSON API and listens on
+the LAN only — loopback by default, behind a shared token.
+
+Built for the **Nokia G-240W-A** GPON Home Gateway, whose stock firmware has a
+reboot button but no reboot scheduler.
+
+## What it does
+
+- checks internet connectivity against several independent targets: raw IPs
+  (bypassing DNS) and domain URLs (exercising DNS);
+- **soft mode** (default, cron twice an hour): if — and only if — the internet
+  is down, logs into the router web UI and triggers a reboot;
+- **hard mode** (`--hard-reboot`, nightly cron): reboots unconditionally;
+- after triggering a reboot it stays alive, polling the same targets every
+  minute and tracking the phases *router went down → router is up → internet
+  restored*;
+- announces every phase in Telegram;
+- records every check, run and phase timestamp in a local SQLite database;
+- optionally captures a **host-telemetry snapshot** each run — CPU load, memory, disk,
+  uptime, and (on Linux) temperature, fan RPM and per-interface network counters — each
+  individually toggleable; pure-Go with no cgo, on Linux (`arm64`/`amd64`) and macOS
+  (Apple Silicon, where temperature/fans are unavailable without cgo);
+- supports a **monitor-only** mode (`REBOOT_ENABLED=false`) that watches and records
+  everything but never reboots the router;
+- ships an optional read-only **query daemon** (`yarddogd`) that serves the recorded
+  history — runs, checks, telemetry — as a JSON API over the LAN (see
+  [Daemon / query API](#daemon--query-api)).
+
+## How a reboot goes
+
+```
+starting router reboot          <- telegram, before anything happens
+POST /login.cgi                 <- session cookies (sid/lsid)
+GET  /reboot.cgi                <- fresh per-request CSRF token
+POST /reboot.cgi?reboot         <- token in the body -> 200 "done reboot";
+                                   a login-page redirect means rejected
+poll every 60s, up to 15m:
+    router went down            <- telegram, gateway stopped answering
+    router is up                <- telegram, gateway answers again
+    reboot completed,
+    internet restored (4m10s)   <- telegram, all checks green
+```
+
+If the router restarts faster than the polling interval, the down/up messages
+are skipped and only the completion message is sent.
+
+## Deciding "the internet is down"
+
+Targets are split into two groups: `ip` (TCP dial to `1.1.1.1:443`,
+`8.8.8.8:53`) and `domain` (HTTP requests to `generate_204`-style endpoints,
+which also exercise the DNS path). The verdict is conservative: the internet is
+considered down only when *all* targets of a group fail — either every IP
+target (link is dead) or every domain target (DNS is dead). A single failed
+target never triggers a reboot.
+
+Soft mode also honours a **cooldown** (default 2 h): if the previous reboot was
+recent and the internet is still down, the problem is most likely upstream (an
+ISP outage), and rebooting the router every half hour would help nobody. Hard
+mode ignores the cooldown.
+
+## Telegram notifications
+
+Every message starts with a tag and a label:
+
+```
+#REBOOT home starting router reboot (reason: no internet)
+#REBOOT home router went down
+#REBOOT home router is up, waiting for internet
+#REBOOT home reboot completed, internet restored (downtime 4m10s)
+#REBOOT home no internet, skipping reboot (cooldown: last reboot 40m ago)
+```
+
+The bot is configured with a single DSN:
+
+```
+YARDDOG_TELEGRAMBOT_DSN="tbot://<chat_id>:@<bot_token>/"
+```
+
+**Outbox.** The machine running yarddog is normally connected through the very
+router it reboots, so at the exact moment a message matters most there may be
+no internet to deliver it. Every message is therefore written to an outbox
+table first and sent when possible; anything undelivered is flushed once
+connectivity returns (and again on the next run), annotated with the original
+time: `... [queued 04:02]`.
+
+## Installation
+
+The host uses the release-layout: binaries live in immutable
+`/opt/yarddog/artifacts/<VERSION_ID>/` dirs and `/opt/yarddog/bin/release` is a
+symlink to the live one, which the cron collector and the systemd daemon both run.
+Build, stage the binaries on the host, then run `deploy/pi5-install.sh` once — it
+establishes that layout plus the cron, the systemd unit, and the
+passwordless-restart grant. After that, tagged releases deploy automatically (see
+[Continuous integration & deployment](#continuous-integration--deployment)).
+
+```bash
+git clone https://github.com/prorochestvo/yarddog.git
+cd yarddog
+make build-arm                                 # -> build/{yarddog,yarddogd}-arm64
+
+# stage on the host; the installer seeds these into the artifact store on first run
+sudo mkdir -p /opt/yarddog
+sudo cp build/yarddog-arm64  /opt/yarddog/yarddog
+sudo cp build/yarddogd-arm64 /opt/yarddog/yarddogd
+sudo cp deploy/pi5-install.sh /opt/yarddog/
+sudo cp yarddog.env.example   /opt/yarddog/.env
+sudo chmod 600 /opt/yarddog/.env               # router password + bot token live here
+# edit /opt/yarddog/.env, then:
+sudo bash /opt/yarddog/pi5-install.sh
+```
+
+`pi5-install.sh` moves the two staged binaries into
+`/opt/yarddog/artifacts/<VERSION_ID>/`, points `bin/release` at them, writes the
+cron + systemd unit (both targeting `bin/release/…`), and installs the sudoers
+drop-in the release pipeline needs to restart the daemon. It is idempotent.
+
+Pure Go, no cgo (SQLite via `modernc.org/sqlite`), so cross-compilation is
+painless:
+
+```bash
+GOOS=linux GOARCH=arm64 go build -o yarddog ./cmd/yarddog   # e.g. for a Raspberry Pi
+```
+
+## Configuration
+
+Settings are read from an env file (`--env /path`, default `/opt/yarddog/.env`,
+fallback `./.env`); real environment variables take precedence over the file.
+Every key is namespaced with the `YARDDOG_` prefix, in both the file and the
+real environment.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `YARDDOG_LABEL` | yes | — | label in messages: `#REBOOT {LABEL}` |
+| `YARDDOG_TELEGRAMBOT_DSN` | yes | — | `tbot://<chat_id>:@<bot_token>/` |
+| `YARDDOG_ROUTER_ADDR` | no | `http://192.168.1.1` | router web UI address |
+| `YARDDOG_ROUTER_KIND` | no | `nokia` | reboot driver to use (device family; more devices to come) |
+| `YARDDOG_ROUTER_USER` | yes | — | router admin login |
+| `YARDDOG_ROUTER_PASS` | yes | — | router admin password |
+| `YARDDOG_DB_PATH` | no | `/var/lib/yarddog/yarddog.db` | SQLite location |
+| `YARDDOG_CHECK_IPS` | no | `1.1.1.1:443,8.8.8.8:53` | csv of `host:port` TCP targets |
+| `YARDDOG_CHECK_DOMAINS` | no | `https://www.google.com/generate_204,https://cloudflare.com/cdn-cgi/trace` | csv of HTTP targets |
+| `YARDDOG_CHECK_TIMEOUT` | no | `5s` | per-target timeout |
+| `YARDDOG_RECOVERY_INTERVAL` | no | `60s` | polling period after a reboot |
+| `YARDDOG_RECOVERY_TIMEOUT` | no | `15m` | how long to wait for recovery |
+| `YARDDOG_REBOOT_COOLDOWN` | no | `2h` | minimal gap between soft reboots |
+| `YARDDOG_RETENTION_DAYS` | no | `90` | prune old checks/metrics (0 = keep forever) |
+| `YARDDOG_REBOOT_ENABLED` | no | `true` | `false` = monitor-only: check/record/notify, never reboot |
+| `YARDDOG_METRICS_ENABLED` | no | `true` | master switch for the per-run host-telemetry snapshot |
+| `YARDDOG_METRICS_TEMPERATURE` | no | `true` | temperatures in °C (Linux only) |
+| `YARDDOG_METRICS_FANS` | no | `true` | fan RPM, best-effort — only if the hwmon driver exposes it (Linux only) |
+| `YARDDOG_METRICS_CPU` | no | `true` | load average (1/5/15) |
+| `YARDDOG_METRICS_MEMORY` | no | `true` | total/free/available memory |
+| `YARDDOG_METRICS_DISK` | no | `true` | usage of `YARDDOG_METRICS_DISK_MOUNT` |
+| `YARDDOG_METRICS_UPTIME` | no | `true` | uptime |
+| `YARDDOG_METRICS_NETWORK` | no | `true` | per-interface rx/tx bytes (Linux only) |
+| `YARDDOG_METRICS_DISK_MOUNT` | no | `/` | filesystem the disk collector stats |
+
+## Scheduling
+
+```cron
+# soft check twice an hour; minutes are offset from :00/:30
+# so the 04:00 hard reboot never collides with a soft run
+7,37 * * * *  /opt/yarddog/bin/release/yarddog >> /opt/yarddog/yarddog.log 2>&1
+
+# unconditional nightly reboot
+0 4 * * *     /opt/yarddog/bin/release/yarddog --hard-reboot >> /opt/yarddog/yarddog.log 2>&1
+```
+
+The command is the `bin/release` channel symlink, so a deploy's atomic flip
+retargets the next tick with no cron edit.
+
+A `flock` on `yarddog.lock` — kept in the database's own directory, so it stays
+self-contained beside the data — additionally guarantees that runs never overlap
+(a recovery loop can outlive the 30-minute cron interval). The lock is released
+by the kernel when the process dies, so it can never go stale.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | internet is up / reboot completed successfully |
+| 1 | configuration error |
+| 2 | another instance is already running |
+| 3 | reboot request failed (login / reboot.cgi) |
+| 4 | reboot done, internet not restored within the timeout |
+| 5 | reboot skipped due to cooldown |
+
+## History
+
+Everything lands in SQLite: `runs` (one row per invocation with all phase
+timestamps), `checks` (one row per probed target), `tg_outbox` (the message
+queue), and — when telemetry is enabled — `metrics` and `host` (the per-run
+snapshot and its host identity). `yarddogd` serves all of it over HTTP (see
+[Daemon / query API](#daemon--query-api)).
+
+```bash
+sqlite3 /var/lib/yarddog/yarddog.db \
+  "select started_at, mode, action, outcome from runs order by id desc limit 10;"
+```
+
+## Daemon / query API
+
+`yarddog` records everything locally; `yarddogd` is an optional long-running
+companion that serves that record as a read-only JSON REST API, so a dashboard,
+an uptime monitor, or another host on the LAN can read the runs, checks and host
+telemetry without touching the SQLite file directly. The collector stays the
+sole writer — the daemon only ever reads.
+
+```bash
+YARDDOG_DAEMON_TOKEN=$(openssl rand -hex 32) YARDDOG_DAEMON_ADDR=192.168.1.10:8420 yarddogd
+```
+
+It binds `YARDDOG_DAEMON_ADDR` (loopback `127.0.0.1:8420` by default — set a LAN
+`ip:port` to expose it) and requires `YARDDOG_DAEMON_TOKEN`: every route but `/ping`
+demands that secret in the `Authorization: Bearer <token>` header. There is no TLS and no
+per-user auth, so bind it to the LAN behind your firewall, never the open
+internet.
+
+| Method & path | Auth | Returns |
+|---|---|---|
+| `GET /ping` | — | liveness, always `200 {"status":"ok"}` |
+| `GET /health/check` | token | readiness: per-dependency probe report, `200` / `503` |
+| `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
+| `GET /api/v1/metrics/latest` | token | every metric of the newest run that has any (`404` if none) |
+| `GET /api/v1/metrics?since=&collector=&limit=` | token | metrics history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` bad id, `404` unknown) |
+
+`since` is RFC3339 UTC; `collector` is one of
+`temperature`/`fans`/`cpu`/`memory`/`disk`/`uptime`/`network`; `limit` is capped
+server-side (runs 500, metrics 1000). `/health/check` probes the SQLite handle
+(`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
+than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
+it is token-gated because its body names internal dependencies.
+
+```bash
+curl -s -H "Authorization: Bearer $YARDDOG_DAEMON_TOKEN" \
+  "http://192.168.1.10:8420/api/v1/runs?limit=5"
+```
+
+### Daemon configuration
+
+Read from the same env file; only `YARDDOG_DAEMON_TOKEN` is required, and none of
+the collector's router/Telegram keys are — a monitor-only host can run just the
+daemon.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `YARDDOG_DAEMON_TOKEN` | yes | — | shared secret sent as `Authorization: Bearer <token>` |
+| `YARDDOG_DAEMON_ADDR` | no | `127.0.0.1:8420` | bind address; set a LAN `ip:port` to expose |
+| `YARDDOG_DB_PATH` | no | `/var/lib/yarddog/yarddog.db` | SQLite location (shared with the collector) |
+| `YARDDOG_DAEMON_STALE_AFTER` | no | `90m` | freshness budget for `/health/check` |
+| `YARDDOG_DAEMON_MAX_CONNS` | no | `2` | SQLite read-pool size (≥2 keeps the health probe off the data path) |
+| `YARDDOG_DAEMON_HEALTH_TIMEOUT` | no | `5s` | whole-sweep budget for `/health/check` |
+| `YARDDOG_DAEMON_READ_TIMEOUT` | no | `10s` | HTTP read timeout |
+| `YARDDOG_DAEMON_WRITE_TIMEOUT` | no | `15s` | HTTP write timeout |
+| `YARDDOG_DAEMON_IDLE_TIMEOUT` | no | `60s` | HTTP idle (keep-alive) timeout |
+
+**Optional router credential probe** — adds a third `/health/check` entry that logs into the
+router web UI and immediately resets the session (never reboots). Enabled only when **both**
+`YARDDOG_ROUTER_USER` and `YARDDOG_ROUTER_PASS` are set; setting exactly one is a startup error.
+The token-gated endpoint is LAN-only, so the operator controls poll cadence.
+
+> **Security trade-off:** enabling the probe places the router password in the daemon's env file,
+> on a host that previously needed none. The daemon never reboots (it holds only
+> `CheckCredentials`, not `Reboot`), but a compromised env file now also exposes the router
+> login. Omit both `ROUTER_USER` and `ROUTER_PASS` to keep the monitor-only isolation.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `YARDDOG_ROUTER_USER` | — | *(disables probe)* | router admin login — set with PASS to enable |
+| `YARDDOG_ROUTER_PASS` | — | *(disables probe)* | router admin password — set with USER to enable |
+| `YARDDOG_ROUTER_ADDR` | no | `http://192.168.1.1` | router web UI address |
+| `YARDDOG_ROUTER_KIND` | no | `nokia` | device driver (`nokia` is the only current value) |
+| `YARDDOG_DAEMON_HEALTH_ROUTER` | no | `router` | probe display name in the `services` map (e.g. `gipon`) |
+| `YARDDOG_CHECK_TIMEOUT` | no | `3s` | per-request HTTP timeout for the login call; must be less than `DAEMON_HEALTH_TIMEOUT` (default 5s) |
+
+Exit codes: `0` clean shutdown, `1` configuration error, `2` the listen address
+is already in use. Run it under systemd from the hardened sample unit in
+[`deploy/yarddogd.service`](deploy/yarddogd.service) — it runs as the same user
+as the collector so both share the database.
+
+## Router compatibility
+
+Tested against Nokia G-240W-A, software `3FE56557HJHL16`. The web UI flow:
+`POST /login.cgi` with `name`/`pswd` (plaintext) sets the `sid`/`lsid` session
+cookies; `GET /reboot.cgi` returns a page carrying a fresh per-request
+`csrf_token`; `POST /reboot.cgi?reboot` must echo that token in its
+form-urlencoded body, on which a confirmed reboot answers `200` with
+`done reboot` while a rejected one redirects back to the login page. Other
+Nokia/ALU ONTs with the same interface will likely work; anything
+else is a new driver in `gateway/router/` selected via `ROUTER_KIND` — the reboot path
+is a driver family, so a different device (or a Tapo/Sonoff smart-plug hard-reset
+fallback) is an added file, not a fork.
+
+Note the router admin UI speaks plain HTTP, so the password travels in
+cleartext over the LAN. yarddog itself opens no ports and talks only to the
+router and `api.telegram.org`; keep `/opt/yarddog/.env` at mode `600` and never
+expose the router UI beyond the LAN.
+
+## Continuous integration & deployment
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **`ci-main`** — on every push and PR to `main`: `make lint`, `make test`, and a
+  production-shape `linux/arm64` sanity build of both binaries. No deploy.
+- **`release`** — on every `v*` tag (and manual `workflow_dispatch` selecting a
+  `v*` tag): lints and tests the tagged commit, cross-compiles both `linux/arm64`
+  binaries (`yarddog` + `yarddogd`), and **deploys** them onto the Pi over a
+  **two-hop SSH path**. The runner cannot reach `pi5` directly, so it connects
+  *through* the public `be-happy` host via SSH `ProxyJump`; `be-happy` only
+  forwards the TCP connection, and authentication to `pi5` uses the runner's
+  deploy key — no private key is ever stored on `be-happy`.
+
+The deploy is the release-layout flow: upload both binaries into an immutable
+`/opt/yarddog/artifacts/<VERSION_ID>/` (the daemon embeds `VERSION_ID` and reports
+it as `server.version` in `/health/check`), verify each SHA256 there, flip
+`bin/release` to the new version (atomic symlink), and `sudo systemctl restart
+yarddogd`. The collector re-execs `bin/release/yarddog` on its next cron tick, so
+only the daemon is restarted. A liveness gate then polls the daemon's `/ping`; if
+it never comes up the pipeline **rolls `bin/release` back** to the previous
+`VERSION_ID`, restarts, and fails the job. Older artifacts are pruned to the
+newest few (versions a channel still points at are never deleted).
+
+**One-time host setup** (before the first `v*` tag): run `deploy/pi5-install.sh`
+(see [Installation](#installation)). It establishes the layout, points the unit +
+cron at `bin/release/…`, and installs `/etc/sudoers.d/yarddog-deploy` granting the
+deploy user exactly `NOPASSWD: /usr/bin/systemctl restart yarddogd` — the sole
+privilege CI needs. **Manual rollback**, any time:
+
+```bash
+ssh pi5 'ln -sfn ../artifacts/<previous-VERSION_ID> /opt/yarddog/bin/release \
+  && sudo systemctl restart yarddogd'
+```
+
+> **Hardening note.** The CI deploy user and the service user are the same user
+> (`seil`), so a leaked deploy key equals `seil` and can read `/opt/yarddog/.env`
+> (router password + bot token). Full release-layout confinement — a dedicated CI
+> user, a root-owned `.env`, the collector on a systemd timer — is a deliberate
+> follow-up, not yet done.
+
+The `deploy` job runs under a `PRIME` GitHub Environment (configure the
+required-reviewer rule and the values below in *Settings → Environments → PRIME*):
+
+| Kind | Name | Purpose |
+|---|---|---|
+| Secret | `SSH_PRIVATEKEY` | deploy key, public half in `authorized_keys` on **both** `be-happy` and `pi5` |
+| Secret | `ACTION_EMITER_TBOT_TOKEN` | CI notifier bot token (optional; distinct from the app's `TELEGRAMBOT_DSN`) |
+| Variable | `SSH_HOSTNAME` / `SSH_HOSTPORT` / `SSH_USERNAME` | first hop — the `be-happy` jump host |
+| Variable | `PI5_SSH_HOSTNAME` / `PI5_SSH_HOSTPORT` / `PI5_SSH_USERNAME` | second hop — the Pi, reached through the jump |
+| Variable | `TELEGRAM_ROOT_CHAT_ID` | chat for CI notifications (optional) |
+
+The public jump host is pinned via `ssh-keyscan`; the Pi's host key is accepted
+trust-on-first-use (`StrictHostKeyChecking=accept-new`) since it is only reachable
+behind the jump.
+
+## Development
+
+```bash
+go vet ./... && go test ./...
+```
+
+Tests use `httptest` servers for the router and Telegram, `:memory:` SQLite for
+the store, and an injected fake clock/checker for the recovery state machine —
+no real network required.

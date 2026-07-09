@@ -1,0 +1,31 @@
+# build artifacts (only ./build/, ./tmp/, ./logs/ are gitignored at root)
+/build/
+/tmp/
+/logs/
+# stray binaries from a bare `go build ./cmd/...`
+/yarddog
+/yarddog-arm64
+/yarddogd
+/yarddogd-arm64
+
+# runtime SQLite database (real db lives under /var/lib/yarddog)
+*.db
+*.db-wal
+*.db-shm
+
+# runtime collector flock (created beside the db)
+*.lock
+
+# secrets / local config — never commit (router password + bot token live here)
+.env
+*.env
+!*.env.example
+
+# Claude Code: local per-developer permission overrides + agent working notes
+.claude/settings.local.json
+.claude/agent-memory/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

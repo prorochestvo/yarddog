@@ -1,0 +1,28 @@
+# yarddog collector — sample cron.d drop-in. Install as /etc/cron.d/yarddog
+# (root-owned, mode 0644). This schedules the short-lived connectivity check;
+# the query daemon (yarddogd) is a separate long-running service — see
+# deploy/yarddogd.service, it is NOT a cron job.
+#
+# The collector creates its flock (yarddog.lock) and its SQLite database in the
+# same directory (YARDDOG_DB_PATH's), so it can run as any user that owns that
+# directory — no /var/run provisioning. Run it as the SAME user as the daemon
+# (deploy/yarddogd.service) so both share the WAL database without a permission
+# mismatch. The sample below runs as root; change `root` in the command lines to
+# your service user.
+#
+# The command is the release-layout channel symlink (bin/release/yarddog), so a
+# deploy's symlink flip takes effect on the next tick with no cron edit. On the
+# real host deploy/pi5-install.sh installs the monitor-only variant (soft line
+# only); the hard-reboot line stays commented until the host goes live.
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+
+# fields: minute hour day-of-month month day-of-week  user  command
+#
+# soft check twice an hour; the minutes are offset from :00/:30 so the 04:00
+# hard reboot never collides with a soft run.
+7,37 * * * *  root  /opt/yarddog/bin/release/yarddog >> /opt/yarddog/yarddog.log 2>&1
+
+# unconditional nightly reboot (hard mode ignores the cooldown).
+0 4 * * *     root  /opt/yarddog/bin/release/yarddog --hard-reboot >> /opt/yarddog/yarddog.log 2>&1

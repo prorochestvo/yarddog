@@ -1,0 +1,47 @@
+# Sample systemd unit for yarddogd, the yarddog query daemon.
+#
+# This is a template. On the real host, deploy/pi5-install.sh generates the
+# installed copy (user seil, paths under /opt/yarddog) and the CI/CD release
+# pipeline (.github/workflows/release.yml) restarts it on every v* tag. Use this
+# file only for a manual install on a differently-shaped host: review the
+# User/Group and paths, drop it into /etc/systemd/system/, and
+# `systemctl enable --now yarddogd`.
+#
+# ExecStart points at the release-layout channel symlink, never a concrete
+# VERSION_ID, so a deploy is "flip bin/release + restart".
+[Unit]
+Description=yarddog query daemon (read-only JSON API over the LAN)
+Documentation=https://github.com/prorochestvo/yarddog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/yarddog/.env
+ExecStart=/opt/yarddog/bin/release/yarddogd
+Restart=on-failure
+RestartSec=5s
+
+# run as the same user/group as the collector's cron job, so both processes
+# can read/write the shared SQLite file (and its WAL -wal/-shm siblings)
+# without a permission mismatch. Change to match your install.
+User=yarddog
+Group=yarddog
+
+# hardening: the daemon needs nothing beyond its env file, the shared SQLite
+# database under /opt/yarddog, and a LAN socket. ReadWritePaths must cover the
+# database's directory (SQLite writes -wal/-shm siblings beside it).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/yarddog
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
