@@ -1,0 +1,27 @@
+# yarddog collector — sample cron.d drop-in. Install as /etc/cron.d/yarddog
+# (root-owned, mode 0644). This schedules the short-lived connectivity check;
+# the query daemon (yarddogd) is a separate long-running service — see
+# deploy/yarddogd.service, it is NOT a cron job.
+#
+# Runs as root — the same identity as the daemon (deploy/yarddogd.service) — so
+# both read the root-only .env (secrets) and share the root-owned SQLite WAL
+# without a permission mismatch. This is deliberate, not a placeholder: secrets
+# stay reachable by root alone (release-layout skill's "two levers"). The
+# collector creates its flock (yarddog.lock) beside the database, so overlapping
+# ticks serialize rather than race.
+#
+# The command is the release-layout channel symlink (bin/release/yarddog), so a
+# deploy's symlink flip takes effect on the next tick with no cron edit.
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+
+# fields: minute hour day-of-month month day-of-week  user  command
+#
+# soft check every 5 minutes; a down verdict reboots at most once per
+# REBOOT_COOLDOWN (default 2h), and the flock serializes overlapping ticks.
+*/5 * * * *   root  /opt/yarddog/bin/release/yarddog >> /opt/yarddog/yarddog.log 2>&1
+
+# unconditional nightly reboot (hard mode ignores the cooldown); offset to :02 so
+# the */5 soft tick at :00 never collides with it.
+2 4 * * *     root  /opt/yarddog/bin/release/yarddog --hard-reboot >> /opt/yarddog/yarddog.log 2>&1

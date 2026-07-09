@@ -1,0 +1,362 @@
+# Release pipeline — runs on every v* tag push (and manual workflow_dispatch).
+# Lints + tests the tagged commit, cross-compiles both linux/arm64 binaries, and
+# deploys them onto the Pi. The Pi's SSH endpoint (SSH_HOSTNAME) sits behind
+# Cloudflare Access, so the runner tunnels via `cloudflared access ssh` as a
+# ProxyCommand, authenticated headlessly by a Cloudflare Access service token
+# (CF_ACCESS_CLIENT_ID/SECRET). cloudflared reads the token from the environment,
+# so it never lands in argv or a config file. The deploy user (github_aide) is
+# confined to REMOTE_DIR's artifacts/+bin/ and cannot read the root-only .env.
+#
+# "Deploy" is the house release-layout: upload both binaries into an immutable
+# per-VERSION_ID dir under $REMOTE_DIR/artifacts/, flip the bin/release symlink to
+# point at it, and `sudo systemctl restart yarddogd`. The collector (cron) re-execs
+# bin/release/yarddog on its next tick, so only the daemon is restarted. A liveness
+# gate (/ping) auto-rolls-back to the previous VERSION_ID if the new daemon fails to
+# come up; older artifacts are then pruned to the newest few. The one-time Pi layout
+# and the narrow sudoers restart grant are established by deploy/pi5-install.sh.
+#
+# workflow_dispatch takes no inputs: pick a v* tag in the ref dropdown to (re)deploy
+# it — the same semver + VERSION_ID logic applies; a non-tag ref fails the semver
+# gate fast.
+#
+# Concurrency group `deploy-pi5` is constant (not per-tag) so two simultaneous tag
+# pushes cannot race the same host. Tag pushes are deliberate and rare, so queuing
+# them costs nothing.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make lint
+      - run: make test
+      # compile-only guard for the darwin-only collector (metrics_darwin.go):
+      # this job's `make test` never compiles it (linux runner), so a
+      # darwin-only break must not reach a tagged release undetected.
+      - name: Sanity build (darwin/arm64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: darwin
+          GOARCH: arm64
+        run: go build ./...
+
+  deploy:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    # `PRIME` GH Environment gates this job on the required-reviewer rule and
+    # holds the SSH secrets/vars. Configure it in repo → Settings → Environments
+    # → PRIME before the first v* tag push.
+    environment: PRIME
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-pi5
+      cancel-in-progress: false
+    env:
+      # Cloudflare Access service token — headless auth for the SSH tunnel.
+      # cloudflared (the ssh ProxyCommand child) reads these from the environment,
+      # so the secret never lands in argv or a config file. Set them as PRIME
+      # secrets (CF_ACCESS_CLIENT_ID = "<id>.access", CF_ACCESS_CLIENT_SECRET).
+      TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+    steps:
+      - name: Validate tag is semver
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "ERROR: ref ${GITHUB_REF_NAME} is not a semver tag (expected vX.Y.Z or vX.Y.Z-prerelease)"
+            echo "  on workflow_dispatch, select a v* tag in the ref dropdown, not a branch"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute VERSION_ID
+        # VERSION_ID = <UTC timestamp>-r_<version>. date -u runs on the runner so
+        # the stamp is timezone-unambiguous; the leading channel letter (r =
+        # release) reads at a glance. <version> is the tag with its leading 'v'
+        # stripped. Computed before the build so the daemon binary can embed it
+        # (next step) and to name the immutable artifacts/<VERSION_ID> dir the
+        # deploy uploads into and flips bin/release to.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          VERSION_ID="$(date -u +%Y%m%d%H%M%S)-r_${version}"
+          echo "VERSION_ID=$VERSION_ID" >> "$GITHUB_ENV"
+
+      - name: Build binaries (linux/arm64)
+        # pure-Go, cgo-free cross-compile for the Pi. -trimpath + -s -w strip
+        # build paths and the symbol table for a smaller, reproducible artifact.
+        # The daemon additionally embeds VERSION_ID via -X so /health/check can
+        # report the release id as its server.version.
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags='-s -w' -o ./build/yarddog-arm64 ./cmd/yarddog
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION_ID}" -o ./build/yarddogd-arm64 ./cmd/yarddogd
+
+      - name: Compute binary SHA256s
+        run: |
+          set -euo pipefail
+          YARDDOG_SHA256=$(sha256sum ./build/yarddog-arm64 | awk '{print $1}')
+          YARDDOGD_SHA256=$(sha256sum ./build/yarddogd-arm64 | awk '{print $1}')
+          echo "YARDDOG_SHA256=$YARDDOG_SHA256" >> "$GITHUB_ENV"
+          echo "YARDDOGD_SHA256=$YARDDOGD_SHA256" >> "$GITHUB_ENV"
+
+      - name: Assert required env-scoped variables are set
+        # Secrets (SSH_PRIVATEKEY, CF_ACCESS_CLIENT_*) are intentionally NOT checked
+        # here: GHA masks secrets to "***", so an empty one is indistinguishable
+        # from a set one. The SSH / cloudflared steps fail fast if they are missing.
+        run: |
+          missing=0
+          for v in SSH_HOSTNAME SSH_USERNAME REMOTE_DIR; do
+            val_var="vars_${v}"
+            if [ -z "${!val_var:-}" ]; then
+              echo "Required variable '$v' is not set in the PRIME environment (or at repository level)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+        env:
+          vars_SSH_HOSTNAME: ${{ vars.SSH_HOSTNAME }}
+          vars_SSH_USERNAME: ${{ vars.SSH_USERNAME }}
+          vars_REMOTE_DIR: ${{ vars.REMOTE_DIR }}
+
+      - name: Install cloudflared (pinned, pre-2026.6.0)
+        # 2026.6.0 regressed `access ssh`: it ignores the service token and falls
+        # through to interactive browser auth, which hangs a headless runner. Pin
+        # the last known-good release until Cloudflare ships a fix.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.5.2/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
+
+      - name: Set up SSH client (Cloudflare Access tunnel)
+        # Write the deploy key + an ssh config whose ProxyCommand tunnels through
+        # Cloudflare Access via cloudflared. The tunnel knows the SSH target, so no
+        # port is set here. The Pi host key is accepted trust-on-first-use.
+        env:
+          SSH_PRIVATEKEY: ${{ secrets.SSH_PRIVATEKEY }}
+          SSH_HOSTNAME: ${{ vars.SSH_HOSTNAME }}
+          SSH_USERNAME: ${{ vars.SSH_USERNAME }}
+        run: |
+          set -euo pipefail
+          # install -m 600 creates the file with the right perms BEFORE any content
+          # lands in it, so the secret never sits at default umask during the write.
+          install -m 600 /dev/null /tmp/deploy_key
+          printf '%s\n' "$SSH_PRIVATEKEY" > /tmp/deploy_key
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat > ~/.ssh/config <<EOF
+          Host pi5
+            HostName ${SSH_HOSTNAME}
+            User ${SSH_USERNAME}
+            IdentityFile /tmp/deploy_key
+            IdentitiesOnly yes
+            ProxyCommand cloudflared access ssh --hostname %h
+            StrictHostKeyChecking accept-new
+            BatchMode yes
+            ConnectTimeout 30
+            ServerAliveInterval 15
+            ServerAliveCountMax 8
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload binaries into the artifact store on the Pi
+        # release-layout: each release lands in its own immutable, never-reused
+        # $REMOTE_DIR/artifacts/$VERSION_ID/ dir — created here, then scp renames
+        # yarddog-arm64 -> yarddog / yarddogd-arm64 -> yarddogd into it. $VERSION_ID
+        # + $REMOTE_DIR expand on the runner; the SSH host + tunnel come from
+        # ~/.ssh/config (the `pi5` alias). Nothing is flipped or restarted yet.
+        env:
+          REMOTE_DIR: ${{ vars.REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/deploy_trace.log") 2>&1
+          ssh pi5 "mkdir -p $REMOTE_DIR/artifacts/$VERSION_ID"
+          for pair in yarddog-arm64:yarddog yarddogd-arm64:yarddogd; do
+            local="${pair%%:*}"
+            remote="${pair##*:}"
+            scp "./build/$local" "pi5:$REMOTE_DIR/artifacts/$VERSION_ID/$remote"
+          done
+
+      - name: Promote on the Pi — verify, flip bin/release, restart, health-gate
+        # the single privileged, state-changing step. Verify both SHA256s in the
+        # artifact dir (integrity, not authenticity — binaries and hashes share the
+        # SSH channel), chmod +x, remember the current release for rollback, flip
+        # bin/release to the new VERSION_ID (atomic ln -sfn, RELATIVE target so a
+        # base-dir rename never dangles), and `sudo systemctl restart yarddogd`.
+        # Then a liveness gate: poll /ping (the daemon needs a moment to rebind);
+        # if it never answers, flip the symlink back to the previous VERSION_ID,
+        # restart, and fail the job. The deploy user (github_aide) is confined to
+        # artifacts/+bin/ and cannot read the root-only .env, so nothing here reads
+        # it: /ping is ungated (no token needed) and the loopback addr is fixed. The
+        # heredoc is QUOTED ('REMOTE'), so the body is literal; the runner values
+        # (REMOTE_DIR first) pass as positional args to `bash -s`. The restart is ||
+        # guarded so the gate + rollback always run even if systemctl exits non-zero.
+        env:
+          REMOTE_DIR: ${{ vars.REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/deploy_trace.log") 2>&1
+          timeout 5m ssh pi5 \
+            bash -s -- "$REMOTE_DIR" "$VERSION_ID" "$YARDDOG_SHA256" "$YARDDOGD_SHA256" <<'REMOTE'
+          set -euo pipefail
+          APP="$1"; VERSION_ID="$2"; YARDDOG_SHA256="$3"; YARDDOGD_SHA256="$4"
+          ART="$APP/artifacts/$VERSION_ID"
+          check() {
+            local f="$1" expected="$2" actual
+            actual=$(sha256sum "$f" | awk '{print $1}')
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: SHA256 mismatch for $f — uploaded binary is corrupted or truncated"
+              echo "  expected: $expected"
+              echo "  actual:   $actual"
+              return 1
+            fi
+            chmod +x "$f"
+            echo "verified $f ($actual)"
+          }
+          check "$ART/yarddog"  "$YARDDOG_SHA256"
+          check "$ART/yarddogd" "$YARDDOGD_SHA256"
+          # the deploy user cannot read the root-only .env, so the daemon addr is
+          # fixed here (it binds loopback) and the gate uses /ping (ungated — no
+          # token). /health/check is token-gated and the token lives in the
+          # root-only .env, so it is deliberately not probed from the deploy user.
+          ADDR=127.0.0.1:5000
+          PREV="$(readlink "$APP/bin/release" 2>/dev/null || true)"
+          ln -sfn "../artifacts/$VERSION_ID" "$APP/bin/release"
+          sudo /usr/bin/systemctl restart yarddogd || echo "warning: initial restart exited non-zero, continuing to health gate"
+          live=0
+          for _ in $(seq 1 10); do
+            if curl -fsS -o /dev/null --max-time 5 "http://$ADDR/ping"; then live=1; break; fi
+            sleep 1
+          done
+          if [ "$live" -ne 1 ]; then
+            echo "ERROR: yarddogd did not answer /ping at http://$ADDR after restart"
+            if [ -n "$PREV" ] && [ "$PREV" != "../artifacts/$VERSION_ID" ]; then
+              echo "rolling back bin/release -> $PREV"
+              ln -sfn "$PREV" "$APP/bin/release"
+              sudo /usr/bin/systemctl restart yarddogd || echo "warning: rollback restart exited non-zero"
+              echo "rolled back to $(basename "$PREV")"
+            else
+              echo "no previous release to roll back to"
+            fi
+            exit 1
+          fi
+          echo "released $VERSION_ID on $(hostname): /ping ok at http://$ADDR"
+          REMOTE
+
+      - name: Prune old artifacts on the Pi
+        # channel-aware cleanup: keep the newest KEEP artifact dirs, delete older
+        # ones that no bin/* channel symlink still resolves to (deleting a
+        # referenced VERSION_ID would dangle a live channel). Non-fatal — a prune
+        # hiccup must never fail an otherwise-good deploy, hence the trailing || echo
+        # and the remote `set -uo pipefail` (no -e) ending in `true`.
+        env:
+          REMOTE_DIR: ${{ vars.REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/deploy_trace.log") 2>&1
+          timeout 2m ssh pi5 \
+            bash -s -- "$REMOTE_DIR" <<'REMOTE' || echo "prune step non-fatal failure, ignored"
+          set -uo pipefail
+          APP="$1"
+          KEEP=5
+          in_use="$(for l in "$APP"/bin/*; do [ -e "$l" ] || continue; basename "$(readlink -f "$l")"; done | sort -u)"
+          ls -1dt "$APP"/artifacts/*/ 2>/dev/null | tail -n +$((KEEP+1)) | while read -r d; do
+            v="$(basename "$d")"
+            if printf '%s\n' "$in_use" | grep -qxF "$v"; then continue; fi
+            rm -rf "$d" && echo "pruned old artifact $v"
+          done
+          true
+          REMOTE
+
+      # do NOT add continue-on-error: true to any SSH step above — that would let
+      # job.status read `success` here even on a failed deploy.
+      - name: Workflow summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          TAG="${GITHUB_REF_NAME}"
+          HOST="${{ vars.SSH_HOSTNAME }}"
+          VID="${VERSION_ID:-unknown}"
+          if [ "$STATUS" = "success" ]; then
+            echo "release: ${TAG} deployed as ${VID} on ${HOST} — bin/release flipped, yarddogd restarted" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "release: ${TAG} deploy to ${HOST} failed (status=${STATUS})" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Telegram notify. ACTION_EMITER_TBOT_TOKEN (the CI emitter bot, distinct from
+      # the app-side yarddog bot) is read from env, never interpolated via ${{ … }}
+      # into the curl URL, so it is never echoed. parse_mode=HTML: #HASHTAG (repo
+      # name) keeps a shared chat filterable, the repo is bold, the run is a
+      # click-through link, and the failure reason is a <pre> block fed from the
+      # shared deploy trace. `|| true` keeps a Telegram outage from failing the job.
+      - name: Notify success
+        if: success()
+        env:
+          ACTION_EMITER_TBOT_TOKEN: ${{ secrets.ACTION_EMITER_TBOT_TOKEN }}
+          TELEGRAM_ROOT_CHAT_ID: ${{ vars.TELEGRAM_ROOT_CHAT_ID }}
+        run: |
+          [ -n "$ACTION_EMITER_TBOT_TOKEN" ] && [ -n "$TELEGRAM_ROOT_CHAT_ID" ] || exit 0
+          PROJECT_TAG=$(echo "${GITHUB_REPOSITORY##*/}" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_')
+          WF_REF="${GITHUB_WORKFLOW_REF%@*}"; WF_FILE="${WF_REF##*/}"
+          text=$(printf '#%s deploy <b>passed</b>\n<b>%s</b> <i>(%s)</i>\nref:  %s (%s)\nver:  %s\nrun:  <a href="%s/%s/actions/runs/%s">#%s</a>' \
+            "$PROJECT_TAG" "$GITHUB_REPOSITORY" "$WF_FILE" "$GITHUB_REF_NAME" "${GITHUB_SHA:0:7}" \
+            "${VERSION_ID:-unknown}" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ID")
+          curl -s -X POST "https://api.telegram.org/bot${ACTION_EMITER_TBOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_ROOT_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d parse_mode=HTML -d disable_web_page_preview=true >/dev/null || true
+
+      - name: Notify failure
+        if: failure()
+        env:
+          ACTION_EMITER_TBOT_TOKEN: ${{ secrets.ACTION_EMITER_TBOT_TOKEN }}
+          TELEGRAM_ROOT_CHAT_ID: ${{ vars.TELEGRAM_ROOT_CHAT_ID }}
+        run: |
+          [ -n "$ACTION_EMITER_TBOT_TOKEN" ] && [ -n "$TELEGRAM_ROOT_CHAT_ID" ] || exit 0
+          PROJECT_TAG=$(echo "${GITHUB_REPOSITORY##*/}" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_')
+          WF_REF="${GITHUB_WORKFLOW_REF%@*}"; WF_FILE="${WF_REF##*/}"
+          # surface the captured failure reason from the shared trace; the last
+          # error-ish lines explain the failure inline.
+          reason=""
+          if [ -f "$RUNNER_TEMP/deploy_trace.log" ]; then
+            reason=$(grep -iE 'error|denied|mismatch|not found|refused|timed out|no route|permission|rolled back|rolling back|unreachable' \
+              "$RUNNER_TEMP/deploy_trace.log" \
+              | tail -n 3 | cut -c1-300)
+          fi
+          text=$(printf '#%s deploy <b>failed</b>\n<b>%s</b> <i>(%s)</i>\nref:  %s (%s)\nrun:  <a href="%s/%s/actions/runs/%s">#%s</a>' \
+            "$PROJECT_TAG" "$GITHUB_REPOSITORY" "$WF_FILE" "$GITHUB_REF_NAME" "${GITHUB_SHA:0:7}" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ID")
+          if [ -n "$reason" ]; then
+            esc=$(printf '%s' "$reason" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            text=$(printf '%s\n<pre>%s</pre>' "$text" "$esc")
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${ACTION_EMITER_TBOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_ROOT_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d parse_mode=HTML -d disable_web_page_preview=true >/dev/null || true

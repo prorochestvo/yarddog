@@ -1,0 +1,55 @@
+# CI for the main branch — lints, runs tests, and does a production-shape
+# (linux/arm64) sanity build on every push to main and every PR targeting main.
+# No deploy: the release pipeline lives in release.yml and triggers on v* tags.
+name: ci-main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs supersede their own previous runs to keep the queue tidy during review.
+  # main pushes queue rather than cancel so a follow-up push does not abort the
+  # in-flight CI for the previous commit (which may be the one a reviewer is
+  # actively staring at).
+  group: ci-main-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make lint
+      - run: make test
+      # production-shape build: CGO off, linux/arm64 — exactly what release.yml
+      # ships to the Pi. Catches the "tests pass on the amd64 runner but the arm64
+      # cross-compile breaks" class of issue before a tag is ever cut. Both
+      # binaries share the same layer packages, so both are built here.
+      - name: Sanity build (linux/arm64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          go build -o ./build/yarddog-arm64 ./cmd/yarddog
+          go build -o ./build/yarddogd-arm64 ./cmd/yarddogd
+      # compile-only guard for the darwin-only collector (metrics_darwin.go):
+      # the linux runner's `go test` above never compiles it, so a darwin-only
+      # break would otherwise ship silently. `go build ./...` with no `-o`
+      # compiles every package without emitting a binary — exactly a compile
+      # check, no artifact to publish.
+      - name: Sanity build (darwin/arm64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: darwin
+          GOARCH: arm64
+        run: go build ./...

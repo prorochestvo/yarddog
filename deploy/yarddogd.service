@@ -1,0 +1,48 @@
+# Sample systemd unit for yarddogd, the yarddog query daemon.
+#
+# This is a template. On the real host, deploy/pi5-install.sh installs it and the
+# CI/CD release pipeline (.github/workflows/release.yml) restarts it on every v*
+# tag. The service runs as root so it can read the root-only .env (secrets) and
+# the root-owned database; the CI deploy user (github_aide) is confined to
+# artifacts/+bin/ and never reaches secrets — see the release-layout skill's
+# "two levers". Use this file for a manual install on a differently-shaped host.
+#
+# ExecStart points at the release-layout channel symlink, never a concrete
+# VERSION_ID, so a deploy is "flip bin/release + restart".
+[Unit]
+Description=yarddog query daemon (read-only JSON API over the LAN)
+Documentation=https://github.com/prorochestvo/yarddog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/yarddog/.env
+ExecStart=/opt/yarddog/bin/release/yarddogd
+Restart=on-failure
+RestartSec=5s
+
+# root: the daemon reads the root-only .env (secrets) and the root-owned SQLite
+# database (shared with the collector, which also runs as root via cron).
+# Containment is the confined CI deploy user (github_aide, artifacts/+bin/ only),
+# not de-rooting this service — see the release-layout skill's "Hardening".
+User=root
+Group=root
+
+# hardening: the daemon needs nothing beyond its env file, the shared SQLite
+# database under /opt/yarddog, and a LAN socket. ReadWritePaths must cover the
+# database's directory (SQLite writes -wal/-shm siblings beside it).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/yarddog
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
