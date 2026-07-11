@@ -198,7 +198,7 @@ func TestExecute(t *testing.T) {
 		}
 	})
 
-	t.Run("happy recovery path: message order and downtime", func(t *testing.T) {
+	t.Run("happy recovery path: only initiated+completed, transitions still recorded", func(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
@@ -223,10 +223,8 @@ func TestExecute(t *testing.T) {
 		}
 
 		wantOrder := []string{
-			"starting router reboot (reason: no internet)",
-			"router went down",
-			"router is up, waiting for internet",
-			"reboot completed, internet restored (downtime 4m)",
+			"initiated (reason: no internet)",
+			"completed, internet restored",
 		}
 		if len(env.nt.messages) != len(wantOrder) {
 			t.Fatalf("messages = %v, want %d messages in order %v", env.nt.messages, len(wantOrder), wantOrder)
@@ -281,8 +279,8 @@ func TestExecute(t *testing.T) {
 			gotSuffixes = append(gotSuffixes, strings.TrimPrefix(m, "#REBOOT "+env.settings.Label+" "))
 		}
 		wantOrder := []string{
-			"starting router reboot (reason: no internet)",
-			"reboot completed, internet restored (downtime 2m)",
+			"initiated (reason: no internet)",
+			"completed, internet restored",
 		}
 		if len(gotSuffixes) != len(wantOrder) {
 			t.Fatalf("messages = %v, want only %v (down/up suppressed)", gotSuffixes, wantOrder)

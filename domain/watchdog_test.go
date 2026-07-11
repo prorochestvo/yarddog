@@ -2,7 +2,6 @@ package domain
 
 import (
 	"testing"
-	"time"
 )
 
 func TestParseRouterKind(t *testing.T) {
@@ -52,18 +51,4 @@ func TestParseRouterKind(t *testing.T) {
 			t.Fatal(`ParseRouterKind("tapo") error = nil, want an error for an unrecognized kind`)
 		}
 	})
-}
-
-func TestDowntime(t *testing.T) {
-	t.Parallel()
-
-	rebootStartedAt := time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)
-	restoredAt := rebootStartedAt.Add(4*time.Minute + 10*time.Second)
-
-	got := Downtime(rebootStartedAt, restoredAt)
-
-	want := 4*time.Minute + 10*time.Second
-	if got != want {
-		t.Fatalf("Downtime() = %v, want %v", got, want)
-	}
 }

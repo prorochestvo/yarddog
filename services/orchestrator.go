@@ -118,13 +118,13 @@ func (r *runner) finishRebootFailed(ctx context.Context, runID int64, rebootErr 
 }
 
 // finishRecoverySuccess records the internet's return and sends the final
-// reboot-completed message. downtime is reboot_started_at -> now (design §5;
-// not router_down -> router_up and not the run's whole wall-clock), and the
-// end-of-loop flush (design §5 step 7) delivers any "starting"/"down"/"up"
-// message that couldn't be sent live while the internet was still down.
-func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, rebootStartedAt, now time.Time) int {
-	downtime := domain.Downtime(rebootStartedAt, now)
-	r.notify(ctx, fmt.Sprintf("reboot completed, internet restored (downtime %s)", humanDuration(downtime)))
+// reboot-completed message. The end-of-loop flush (design §5 step 7) delivers
+// the "initiated" message if it couldn't be sent live while the internet was
+// still down. Duration is intentionally omitted from the alert: it is
+// persisted (reboot_started_at -> internet_restored_at) and served by the
+// daemon query API, so the message stays brief (issue #1).
+func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, now time.Time) int {
+	r.notify(ctx, "completed, internet restored")
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
 	}
@@ -151,24 +151,24 @@ func (r *runner) finishRecoveryTimeout(ctx context.Context, runID int64, now tim
 	return domain.ExitRecoveryTimeout
 }
 
-// handleGatewayTransition emits the edge-triggered down/up messages (design
-// §5): a message fires only the first time the gateway's reachability flips,
-// tracked via *alive across ticks. If the router cycles between two polls
-// (the "fast reboot" case), gw.OK is already true again by the time it's next
-// observed, alive was never flipped to false, and no message fires at all —
-// only the final "reboot completed" message (finishRecoverySuccess) reports
-// the reboot happened.
+// handleGatewayTransition records the edge-triggered down/up timestamps (design
+// §5): RouterDownAt/RouterUpAt are written only the first time the gateway's
+// reachability flips, tracked via *alive across ticks. These transitions are no
+// longer announced over Telegram (issue #1: the reboot flow emits only the
+// "initiated" and "completed" messages) — only the timestamps are persisted,
+// still feeding the data model and the daemon query API. If the router cycles
+// between two polls (the "fast reboot" case), gw.OK is already true again by
+// the time it's next observed, alive was never flipped to false, and neither
+// timestamp is written.
 func (r *runner) handleGatewayTransition(ctx context.Context, runID int64, alive *bool, gw domain.TargetResult, now time.Time) {
 	switch {
 	case *alive && !gw.OK:
 		*alive = false
-		r.notify(ctx, "router went down")
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterDownAt: &now}); err != nil {
 			r.logf("update run %d: %v", runID, err)
 		}
 	case !*alive && gw.OK:
 		*alive = true
-		r.notify(ctx, "router is up, waiting for internet")
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterUpAt: &now}); err != nil {
 			r.logf("update run %d: %v", runID, err)
 		}
@@ -252,7 +252,7 @@ func (r *runner) rebootSequence(ctx context.Context, runID int64, reason string)
 		r.logf("update run %d: %v", runID, err)
 	}
 
-	r.notify(ctx, fmt.Sprintf("starting router reboot (reason: %s)", reason))
+	r.notify(ctx, fmt.Sprintf("initiated (reason: %s)", reason))
 
 	if err := r.rebooter.Reboot(ctx); err != nil {
 		return r.finishRebootFailed(ctx, runID, err)
@@ -287,7 +287,7 @@ func (r *runner) recoveryLoop(ctx context.Context, runID int64, rebootStartedAt 
 		r.persistChecks(ctx, runID, domain.PhaseRecovery, inet.Targets)
 
 		if !inet.Down {
-			return r.finishRecoverySuccess(ctx, runID, rebootStartedAt, now)
+			return r.finishRecoverySuccess(ctx, runID, now)
 		}
 		if now.Sub(rebootStartedAt) >= r.settings.RecoveryTimeout {
 			return r.finishRecoveryTimeout(ctx, runID, now)

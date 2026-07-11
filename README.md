@@ -20,9 +20,10 @@ reboot button but no reboot scheduler.
   is down, logs into the router web UI and triggers a reboot;
 - **hard mode** (`--hard-reboot`, nightly cron): reboots unconditionally;
 - after triggering a reboot it stays alive, polling the same targets every
-  minute and tracking the phases *router went down → router is up → internet
-  restored*;
-- announces every phase in Telegram;
+  minute and recording the phases *router went down → router is up → internet
+  restored* (timestamps persisted, served by the query daemon);
+- announces the reboot in Telegram with two messages — *initiated* and
+  *completed* — keeping the alert concise;
 - records every check, run and phase timestamp in a local SQLite database;
 - optionally captures a **host-telemetry snapshot** each run — CPU load, memory, disk,
   uptime, and (on Linux) temperature, fan RPM and per-interface network counters — each
@@ -37,20 +38,22 @@ reboot button but no reboot scheduler.
 ## How a reboot goes
 
 ```
-starting router reboot          <- telegram, before anything happens
+initiated                       <- telegram, before anything happens
 POST /login.cgi                 <- session cookies (sid/lsid)
 GET  /reboot.cgi                <- fresh per-request CSRF token
 POST /reboot.cgi?reboot         <- token in the body -> 200 "done reboot";
                                    a login-page redirect means rejected
 poll every 60s, up to 15m:
-    router went down            <- telegram, gateway stopped answering
-    router is up                <- telegram, gateway answers again
-    reboot completed,
-    internet restored (4m10s)   <- telegram, all checks green
+    router went down            <- recorded (router_down_at), no telegram
+    router is up                <- recorded (router_up_at), no telegram
+    completed,
+    internet restored           <- telegram, all checks green
 ```
 
-If the router restarts faster than the polling interval, the down/up messages
-are skipped and only the completion message is sent.
+The gateway down/up transitions are only recorded as timestamps, not announced;
+the reboot flow sends just the two messages. If the router restarts faster than
+the polling interval, the transitions are never observed and no timestamps are
+written.
 
 ## Deciding "the internet is down"
 
@@ -71,10 +74,8 @@ mode ignores the cooldown.
 Every message starts with a tag and a label:
 
 ```
-#REBOOT home starting router reboot (reason: no internet)
-#REBOOT home router went down
-#REBOOT home router is up, waiting for internet
-#REBOOT home reboot completed, internet restored (downtime 4m10s)
+#REBOOT home initiated (reason: no internet)
+#REBOOT home completed, internet restored
 #REBOOT home no internet, skipping reboot (cooldown: last reboot 40m ago)
 ```
 
