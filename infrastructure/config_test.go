@@ -64,6 +64,15 @@ func TestLoadConfig(t *testing.T) {
 		if cfg.MetricsDiskMount != defaultMetricsDiskMount {
 			t.Errorf("MetricsDiskMount = %q, want default %q", cfg.MetricsDiskMount, defaultMetricsDiskMount)
 		}
+		if len(cfg.PingHosts) != 0 {
+			t.Errorf("PingHosts = %v, want empty by default (feature off)", cfg.PingHosts)
+		}
+		if cfg.PingCount != 5 {
+			t.Errorf("PingCount = %d, want default 5", cfg.PingCount)
+		}
+		if cfg.PingTimeout != 4*time.Second {
+			t.Errorf("PingTimeout = %v, want default 4s", cfg.PingTimeout)
+		}
 
 		wantIPs := []string{"1.1.1.1:443", "8.8.8.8:53"}
 		if !reflect.DeepEqual(cfg.CheckIPs, wantIPs) {
@@ -287,6 +296,129 @@ func TestLoadConfig(t *testing.T) {
 		wantDomains := []string{"https://a.example/", "https://b.example/"}
 		if !reflect.DeepEqual(cfg.CheckDomains, wantDomains) {
 			t.Fatalf("CheckDomains = %v, want %v", cfg.CheckDomains, wantDomains)
+		}
+	})
+
+	t.Run("PING_HOSTS splits on comma and trims", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_HOSTS"] = " 1.1.1.1 , 8.8.8.8 "
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		want := []string{"1.1.1.1", "8.8.8.8"}
+		if !reflect.DeepEqual(cfg.PingHosts, want) {
+			t.Fatalf("PingHosts = %v, want %v", cfg.PingHosts, want)
+		}
+	})
+
+	t.Run("PING_COUNT below the floor is clamped to 4", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_COUNT"] = "3"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.PingCount != 4 {
+			t.Fatalf("PingCount = %d, want clamped to 4", cfg.PingCount)
+		}
+	})
+
+	t.Run("PING_COUNT above the ceiling is clamped to 7", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_COUNT"] = "10"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.PingCount != 7 {
+			t.Fatalf("PingCount = %d, want clamped to 7", cfg.PingCount)
+		}
+	})
+
+	t.Run("non-integer PING_COUNT returns an error", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_COUNT"] = "many"
+		path := writeConfigFixture(t, env)
+
+		_, err := LoadConfig(path)
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil, want error for non-integer PING_COUNT")
+		}
+	})
+
+	t.Run("sub-second PING_TIMEOUT is clamped up to 1s", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_TIMEOUT"] = "200ms"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.PingTimeout != time.Second {
+			t.Fatalf("PingTimeout = %v, want clamped up to 1s", cfg.PingTimeout)
+		}
+	})
+
+	t.Run("PING_TIMEOUT above the ceiling is clamped to 10s", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_TIMEOUT"] = "30s"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.PingTimeout != 10*time.Second {
+			t.Fatalf("PingTimeout = %v, want clamped down to 10s (below the collectPings batch backstop)", cfg.PingTimeout)
+		}
+	})
+
+	t.Run("a PING_HOSTS entry beginning with \"-\" is rejected (argument-injection guard)", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_HOSTS"] = "1.1.1.1,-evil.com"
+		path := writeConfigFixture(t, env)
+
+		_, err := LoadConfig(path)
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil, want error for a PING_HOSTS entry beginning with \"-\"")
+		}
+		if !strings.Contains(err.Error(), "PING_HOSTS") {
+			t.Fatalf("LoadConfig() error = %q, want it to mention PING_HOSTS", err)
+		}
+	})
+
+	t.Run("invalid PING_TIMEOUT returns an error", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["PING_TIMEOUT"] = "not-a-duration"
+		path := writeConfigFixture(t, env)
+
+		_, err := LoadConfig(path)
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil, want error for invalid PING_TIMEOUT")
 		}
 	})
 

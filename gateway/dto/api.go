@@ -87,6 +87,27 @@ type MetricsListResponse struct {
 	Metrics []MetricDTO `json:"metrics"`
 }
 
+// PingDTO is one pings row of the multi-run list (GET /api/v1/pings), so it
+// carries its own run_id/ts (issue #2). AvgMS is nil (JSON null) exactly when
+// OK is false — an unreachable host never carries a measured round trip.
+type PingDTO struct {
+	RunID    int64    `json:"run_id"`
+	TS       string   `json:"ts"`
+	Host     string   `json:"host"`
+	Sent     int      `json:"sent"`
+	Received int      `json:"received"`
+	AvgMS    *float64 `json:"avg_ms"`
+	OK       bool     `json:"ok"`
+	Error    string   `json:"error"`
+}
+
+// PingsListResponse is the body of GET /api/v1/pings: filtered ping history,
+// each row carrying its own RunID/TS since it may span many runs.
+// Unreachable rows are omitted unless ?include_unreachable=true.
+type PingsListResponse struct {
+	Pings []PingDTO `json:"pings"`
+}
+
 // RunDTO mirrors domain.Run. Every *At field is nil (JSON null) until that
 // phase transition has happened, matching the domain type's own semantics.
 type RunDTO struct {

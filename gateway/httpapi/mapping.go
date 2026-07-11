@@ -134,6 +134,38 @@ func metricRowDTOs(records []domain.MetricRecord, includeEmpty bool) []dto.Metri
 	return out
 }
 
+// pingDTO maps one domain.PingRecord onto its wire shape (issue #2). AvgMS
+// is nil (JSON null) exactly when the result is unreachable (OK false),
+// mirroring metricDTO's Value handling.
+func pingDTO(rec domain.PingRecord) dto.PingDTO {
+	p := dto.PingDTO{
+		RunID:    rec.RunID,
+		TS:       formatTime(rec.TS),
+		Host:     rec.Result.Host,
+		Sent:     rec.Result.Sent,
+		Received: rec.Result.Received,
+		OK:       rec.Result.OK,
+		Error:    rec.Result.Error,
+	}
+	if rec.Result.OK {
+		v := rec.Result.AvgMS
+		p.AvgMS = &v
+	}
+	return p
+}
+
+// pingDTOs maps a slice of domain.PingRecord to their wire DTOs, always
+// returning a non-nil (possibly empty) slice (see checkDTOs). Unreachable-row
+// filtering for the list happens in SQL (ListPings), so this maps every row
+// it is given.
+func pingDTOs(records []domain.PingRecord) []dto.PingDTO {
+	out := make([]dto.PingDTO, 0, len(records))
+	for _, r := range records {
+		out = append(out, pingDTO(r))
+	}
+	return out
+}
+
 // runDTO maps one domain.Run onto its wire shape: every nullable *At field
 // becomes a *string (RFC3339), nil staying nil.
 func runDTO(r domain.Run) dto.RunDTO {

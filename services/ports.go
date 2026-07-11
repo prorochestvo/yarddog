@@ -76,6 +76,21 @@ type MetricsRepository interface {
 	SaveMetrics(ctx context.Context, runID int64, ts time.Time, m domain.HostMetrics) error
 }
 
+// PingCollector takes one round of ICMP ping probes (issue #2). It never
+// returns an error: an unreachable host, DNS failure, or missing ping binary
+// is represented as an unavailable domain.PingResult instead of a Collect
+// failure, mirroring MetricsCollector's contract. infrastructure's
+// build-tagged linux/darwin collectors are the production implementations.
+type PingCollector interface {
+	Collect(ctx context.Context) []domain.PingResult
+}
+
+// PingRepository is the ping persistence the orchestrator consumes.
+// infrastructure.Store satisfies it.
+type PingRepository interface {
+	SavePings(ctx context.Context, runID int64, ts time.Time, results []domain.PingResult) error
+}
+
 // OutboxRepository is the tg_outbox persistence OutboxService consumes.
 // infrastructure.Store satisfies it.
 type OutboxRepository interface {
@@ -106,4 +121,5 @@ type Settings struct {
 	RecoveryTimeout  time.Duration
 	RebootEnabled    bool
 	MetricsEnabled   bool
+	PingEnabled      bool
 }

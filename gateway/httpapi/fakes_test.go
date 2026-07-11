@@ -68,6 +68,9 @@ type fakeRepo struct {
 	listMetrics    []domain.MetricRecord
 	listMetricsErr error
 
+	listPings    []domain.PingRecord
+	listPingsErr error
+
 	listRuns    []domain.Run
 	listRunsErr error
 
@@ -93,6 +96,10 @@ func (f *fakeRepo) ListChecksByRun(context.Context, int64) ([]domain.Check, erro
 
 func (f *fakeRepo) ListMetrics(context.Context, services.MetricsFilter) ([]domain.MetricRecord, error) {
 	return f.listMetrics, f.listMetricsErr
+}
+
+func (f *fakeRepo) ListPings(context.Context, services.PingFilter) ([]domain.PingRecord, error) {
+	return f.listPings, f.listPingsErr
 }
 
 func (f *fakeRepo) ListRuns(context.Context, int) ([]domain.Run, error) {

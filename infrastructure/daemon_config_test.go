@@ -375,7 +375,7 @@ func TestLoadDaemonConfig(t *testing.T) {
 		env := daemonRequiredEnv()
 		env["ROUTER_USER"] = "admin"
 		env["ROUTER_PASS"] = "secret"
-		env["CHECK_TIMEOUT"] = "5s"        // equals DAEMON_HEALTH_TIMEOUT default (5s)
+		env["CHECK_TIMEOUT"] = "5s" // equals DAEMON_HEALTH_TIMEOUT default (5s)
 		env["DAEMON_HEALTH_TIMEOUT"] = "5s"
 		path := writeConfigFixture(t, env)
 

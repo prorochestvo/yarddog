@@ -534,6 +534,50 @@ func TestStore_SaveMetrics(t *testing.T) {
 	})
 }
 
+func TestStore_SavePings(t *testing.T) {
+	t.Run("writes one row per result, reachable and unreachable round-trip via ListPingsByRun", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		runID, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, nil)
+		if err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+		ts := time.Now().UTC().Truncate(time.Second)
+
+		results := []domain.PingResult{
+			{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true},
+			{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"},
+		}
+
+		if err := s.SavePings(t.Context(), runID, ts, results); err != nil {
+			t.Fatalf("SavePings() error = %v", err)
+		}
+
+		got, err := s.ListPingsByRun(t.Context(), runID)
+		if err != nil {
+			t.Fatalf("ListPingsByRun() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("ListPingsByRun() = %d rows, want 2", len(got))
+		}
+
+		if got[0].Host != "1.1.1.1" || !got[0].OK || got[0].Sent != 5 || got[0].Received != 5 || got[0].AvgMS != 12.5 {
+			t.Fatalf("ListPingsByRun()[0] = %+v, want the reachable result", got[0])
+		}
+		if got[0].Error != "" {
+			t.Fatalf("ListPingsByRun()[0].Error = %q, want empty", got[0].Error)
+		}
+
+		if got[1].Host != "unreachable.example" || got[1].OK || got[1].Received != 0 || got[1].Error != "no route to host" {
+			t.Fatalf("ListPingsByRun()[1] = %+v, want the unreachable result", got[1])
+		}
+		if got[1].AvgMS != 0 {
+			t.Fatalf("ListPingsByRun()[1].AvgMS = %v, want 0 (an unreachable result persists avg_ms as SQL NULL)", got[1].AvgMS)
+		}
+	})
+}
+
 func TestStore_ListMetrics(t *testing.T) {
 	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
 		t.Parallel()
@@ -647,6 +691,123 @@ func TestStore_ListMetrics(t *testing.T) {
 		}
 		if got[0].Sample.Error != "unavailable" {
 			t.Fatalf("Sample.Error = %q, want %q", got[0].Sample.Error, "unavailable")
+		}
+	})
+}
+
+func TestStore_ListPings(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10})
+		if err != nil {
+			t.Fatalf("ListPings() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ListPings() = %d rows, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("IncludeUnreachable controls whether received=0 rows appear", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+		insertPingAt(t, s, base.Add(-1*time.Minute), "unreachable.example", 5, 0, 0, "no route to host")
+		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 12.5, "")
+
+		def, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10})
+		if err != nil {
+			t.Fatalf("ListPings(default) error = %v", err)
+		}
+		if len(def) != 1 || def[0].Result.Host != "1.1.1.1" {
+			t.Fatalf("ListPings(default) = %+v, want only the reachable row", def)
+		}
+
+		all, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10, IncludeUnreachable: true})
+		if err != nil {
+			t.Fatalf("ListPings(IncludeUnreachable) error = %v", err)
+		}
+		if len(all) != 2 {
+			t.Fatalf("ListPings(IncludeUnreachable) = %d rows, want 2 (the reachable and the unreachable)", len(all))
+		}
+	})
+
+	t.Run("Since, Host, and Limit each filter and combine, newest first", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+
+		insertPingAt(t, s, base.Add(-3*time.Hour), "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, base.Add(-2*time.Hour), "8.8.8.8", 5, 5, 20, "")
+		insertPingAt(t, s, base.Add(-1*time.Hour), "1.1.1.1", 5, 5, 30, "")
+		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 40, "")
+
+		t.Run("Since excludes older rows", func(t *testing.T) {
+			got, err := s.ListPings(t.Context(), services.PingFilter{Since: base.Add(-90 * time.Minute), Limit: 10})
+			if err != nil {
+				t.Fatalf("ListPings() error = %v", err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("ListPings(Since=-90m) = %d rows, want 2 (the -1h and now samples)", len(got))
+			}
+		})
+
+		t.Run("Host narrows to one host", func(t *testing.T) {
+			got, err := s.ListPings(t.Context(), services.PingFilter{Host: "8.8.8.8", Limit: 10})
+			if err != nil {
+				t.Fatalf("ListPings() error = %v", err)
+			}
+			if len(got) != 1 || got[0].Result.Host != "8.8.8.8" {
+				t.Fatalf("ListPings(Host=8.8.8.8) = %+v, want exactly the one 8.8.8.8 ping", got)
+			}
+		})
+
+		t.Run("Limit caps the result and Since+Host combine, newest first", func(t *testing.T) {
+			got, err := s.ListPings(t.Context(), services.PingFilter{
+				Since: base.Add(-150 * time.Minute),
+				Host:  "1.1.1.1",
+				Limit: 1,
+			})
+			if err != nil {
+				t.Fatalf("ListPings() error = %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("ListPings(combined, limit=1) = %d rows, want 1", len(got))
+			}
+			// two 1.1.1.1 pings fall in range (-1h and now); newest first picks "now".
+			if got[0].Result.AvgMS != 40 {
+				t.Fatalf("ListPings(combined)[0].Result.AvgMS = %v, want the newest matching sample 40", got[0].Result.AvgMS)
+			}
+		})
+	})
+
+	t.Run("an unreachable result reads back as OK=false, AvgMS=0, with its Error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		insertPingAt(t, s, time.Now(), "unreachable.example", 5, 0, 0, "no route to host")
+
+		// IncludeUnreachable: this asserts an unreachable result round-trips, which
+		// the default (received>0) filter would now drop before we could inspect it.
+		got, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10, IncludeUnreachable: true})
+		if err != nil {
+			t.Fatalf("ListPings() error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("ListPings() = %d rows, want 1", len(got))
+		}
+		if got[0].Result.OK {
+			t.Fatal("Result.OK = true, want false for an unreachable result")
+		}
+		if got[0].Result.AvgMS != 0 {
+			t.Fatalf("Result.AvgMS = %v, want 0 (SQL NULL for an unreachable result)", got[0].Result.AvgMS)
+		}
+		if got[0].Result.Error != "no route to host" {
+			t.Fatalf("Result.Error = %q, want %q", got[0].Result.Error, "no route to host")
 		}
 	})
 }
@@ -962,6 +1123,45 @@ func TestStore_PruneMetrics(t *testing.T) {
 	})
 }
 
+func TestStore_PrunePings(t *testing.T) {
+	t.Run("retention N deletes rows older than N days and keeps newer ones", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		now := time.Now().UTC()
+
+		oldRunID := insertPingAt(t, s, now.Add(-100*24*time.Hour), "1.1.1.1", 5, 5, 10, "")
+		recentRunID := insertPingAt(t, s, now.Add(-1*time.Hour), "1.1.1.1", 5, 5, 20, "")
+
+		if err := s.PrunePings(t.Context(), now, 90); err != nil {
+			t.Fatalf("PrunePings() error = %v", err)
+		}
+
+		if remaining, err := s.ListPingsByRun(t.Context(), oldRunID); err != nil || len(remaining) != 0 {
+			t.Fatalf("ListPingsByRun(old run) = %v (err = %v), want 0 rows after prune", remaining, err)
+		}
+		if remaining, err := s.ListPingsByRun(t.Context(), recentRunID); err != nil || len(remaining) != 1 {
+			t.Fatalf("ListPingsByRun(recent run) = %v (err = %v), want 1 row kept", remaining, err)
+		}
+	})
+
+	t.Run("retention zero keeps everything", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		now := time.Now().UTC()
+		runID := insertPingAt(t, s, now.Add(-1000*24*time.Hour), "1.1.1.1", 5, 5, 10, "")
+
+		if err := s.PrunePings(t.Context(), now, 0); err != nil {
+			t.Fatalf("PrunePings() error = %v", err)
+		}
+
+		if remaining, err := s.ListPingsByRun(t.Context(), runID); err != nil || len(remaining) != 1 {
+			t.Fatalf("ListPingsByRun() = %v (err = %v), want 1 row kept when RETENTION_DAYS=0", remaining, err)
+		}
+	})
+}
+
 func TestStore_RunByID(t *testing.T) {
 	t.Run("an existing id is found", func(t *testing.T) {
 		t.Parallel()
@@ -1134,6 +1334,27 @@ func insertMetricAt(t *testing.T, s *Store, ts time.Time, collector domain.Colle
 	}
 	if err := s.SaveMetrics(t.Context(), runID, ts, m); err != nil {
 		t.Fatalf("SaveMetrics() error = %v", err)
+	}
+
+	return runID
+}
+
+// insertPingAt is a test helper for TestStore_ListPings/TestStore_PrunePings:
+// it inserts a fresh run and saves a single ping result for it at ts,
+// returning the new run's id. errStr is stored verbatim (empty means no
+// error); ok is derived from received>0, mirroring SavePings/ListPings'
+// own contract.
+func insertPingAt(t *testing.T, s *Store, ts time.Time, host string, sent, received int, avgMS float64, errStr string) int64 {
+	t.Helper()
+
+	runID, err := s.InsertRun(t.Context(), ts, domain.ModeSoft, nil)
+	if err != nil {
+		t.Fatalf("InsertRun() error = %v", err)
+	}
+
+	result := domain.PingResult{Host: host, Sent: sent, Received: received, AvgMS: avgMS, OK: received > 0, Error: errStr}
+	if err := s.SavePings(t.Context(), runID, ts, []domain.PingResult{result}); err != nil {
+		t.Fatalf("SavePings() error = %v", err)
 	}
 
 	return runID

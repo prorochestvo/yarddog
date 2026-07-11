@@ -18,7 +18,7 @@ func TestExecute(t *testing.T) {
 		env := newTestEnv(t)
 		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, Latency: 5 * time.Millisecond}}}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -64,7 +64,7 @@ func TestExecute(t *testing.T) {
 		env.repo.lastRebootStartedAt = env.clk.now.Add(-40 * time.Minute)
 		env.repo.lastRebootOK = true
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitSkippedCooldown {
 			t.Fatalf("Execute() = %d, want ExitSkippedCooldown", code)
@@ -107,7 +107,7 @@ func TestExecute(t *testing.T) {
 		// against :memory: in infrastructure/store_test.go.
 		env.repo.lastRebootErr = errors.New(`parse time "not-a-timestamp": parsing time "not-a-timestamp" as "2006-01-02T15:04:05Z07:00": cannot parse "not-a-timestamp" as "2006"`)
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitSkippedCooldown {
 			t.Fatalf("Execute() = %d, want ExitSkippedCooldown (fail closed on a broken cooldown query)", code)
@@ -147,7 +147,7 @@ func TestExecute(t *testing.T) {
 		}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -176,7 +176,7 @@ func TestExecute(t *testing.T) {
 		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeHard)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeHard)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -198,7 +198,7 @@ func TestExecute(t *testing.T) {
 		}
 	})
 
-	t.Run("happy recovery path: message order and downtime", func(t *testing.T) {
+	t.Run("happy recovery path: only initiated+completed, transitions still recorded", func(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
@@ -216,17 +216,15 @@ func TestExecute(t *testing.T) {
 			{Target: "gw", Kind: domain.CheckKindGateway, OK: true},  // tick 4: still up
 		}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
 		}
 
 		wantOrder := []string{
-			"starting router reboot (reason: no internet)",
-			"router went down",
-			"router is up, waiting for internet",
-			"reboot completed, internet restored (downtime 4m)",
+			"initiated (reason: no internet)",
+			"completed, internet restored",
 		}
 		if len(env.nt.messages) != len(wantOrder) {
 			t.Fatalf("messages = %v, want %d messages in order %v", env.nt.messages, len(wantOrder), wantOrder)
@@ -270,7 +268,7 @@ func TestExecute(t *testing.T) {
 		// gateway never observed down: the router cycled between polls.
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -281,8 +279,8 @@ func TestExecute(t *testing.T) {
 			gotSuffixes = append(gotSuffixes, strings.TrimPrefix(m, "#REBOOT "+env.settings.Label+" "))
 		}
 		wantOrder := []string{
-			"starting router reboot (reason: no internet)",
-			"reboot completed, internet restored (downtime 2m)",
+			"initiated (reason: no internet)",
+			"completed, internet restored",
 		}
 		if len(gotSuffixes) != len(wantOrder) {
 			t.Fatalf("messages = %v, want only %v (down/up suppressed)", gotSuffixes, wantOrder)
@@ -311,7 +309,7 @@ func TestExecute(t *testing.T) {
 		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: false}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitRecoveryTimeout {
 			t.Fatalf("Execute() = %d, want ExitRecoveryTimeout", code)
@@ -339,7 +337,7 @@ func TestExecute(t *testing.T) {
 		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
 		env.rb.err = errRebootFailed
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitRebootFailed {
 			t.Fatalf("Execute() = %d, want ExitRebootFailed", code)
@@ -370,7 +368,7 @@ func TestExecute(t *testing.T) {
 		env.settings.RebootEnabled = false
 		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK (monitor-only never fails the reboot path)", code)
@@ -404,7 +402,7 @@ func TestExecute(t *testing.T) {
 		env := newTestEnv(t)
 		env.settings.RebootEnabled = false
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeHard)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeHard)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -439,7 +437,7 @@ func TestExecute(t *testing.T) {
 		env.settings.RebootEnabled = false
 		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -468,7 +466,7 @@ func TestExecute(t *testing.T) {
 		}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK", code)
@@ -488,7 +486,7 @@ func TestExecute(t *testing.T) {
 		env.mr.err = errors.New("disk full")
 		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
-		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.chk, env.rb, env.nt, env.mc, env.clk, domain.ModeSoft)
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
 		if code != domain.ExitOK {
 			t.Fatalf("Execute() = %d, want ExitOK (a SaveMetrics failure must never change the exit code)", code)
@@ -517,12 +515,15 @@ func TestExecute(t *testing.T) {
 			settings:       env.settings,
 			repo:           env.repo,
 			metricsRepo:    env.mr,
+			pingRepo:       env.pr,
 			checker:        env.chk,
 			rebooter:       env.rb,
 			notifier:       env.nt,
 			metrics:        blockingMetricsCollector{},
+			pings:          env.pc,
 			clock:          env.clk,
 			metricsTimeout: 20 * time.Millisecond,
+			pingTimeout:    defaultPingTimeout,
 		}
 
 		start := time.Now()
@@ -547,6 +548,141 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("metrics saves = %+v, want none (the collector never returned within the timeout)", env.mr.calls)
 		}
 	})
+
+	t.Run("ping enabled: persists a round in both soft and hard flow", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("soft", func(t *testing.T) {
+			t.Parallel()
+
+			env := newTestEnv(t)
+			env.pc.results = []domain.PingResult{{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
+			env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+
+			code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+			if code != domain.ExitOK {
+				t.Fatalf("Execute() = %d, want ExitOK", code)
+			}
+			if env.pc.calls != 1 {
+				t.Fatalf("ping collector calls = %d, want exactly 1", env.pc.calls)
+			}
+			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != 1 {
+				t.Fatalf("ping saves = %+v, want exactly one save for run 1", env.pr.calls)
+			}
+		})
+
+		t.Run("hard", func(t *testing.T) {
+			t.Parallel()
+
+			env := newTestEnv(t)
+			env.pc.results = []domain.PingResult{{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
+			env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+			env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
+
+			code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeHard)
+
+			if code != domain.ExitOK {
+				t.Fatalf("Execute() = %d, want ExitOK", code)
+			}
+			if env.pc.calls != 1 {
+				t.Fatalf("ping collector calls = %d, want exactly 1", env.pc.calls)
+			}
+			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != 1 {
+				t.Fatalf("ping saves = %+v, want exactly one save for run 1", env.pr.calls)
+			}
+		})
+	})
+
+	t.Run("ping disabled: collector never runs and nothing is saved", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.PingEnabled = false
+		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK", code)
+		}
+		if env.pc.calls != 0 {
+			t.Fatalf("ping collector calls = %d, want 0 (PingEnabled=false)", env.pc.calls)
+		}
+		if len(env.pr.calls) != 0 {
+			t.Fatalf("ping saves = %+v, want none", env.pr.calls)
+		}
+	})
+
+	t.Run("ping save failure is logged and swallowed: outcome and exit code unaffected", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.pr.err = errors.New("disk full")
+		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK (a SavePings failure must never change the exit code)", code)
+		}
+
+		run := env.repo.run(t, 1)
+		if run.Outcome != domain.OutcomeOK {
+			t.Fatalf("Outcome = %q, want %q (a SavePings failure must never change the run's outcome)", run.Outcome, domain.OutcomeOK)
+		}
+		if env.pc.calls != 1 {
+			t.Fatalf("ping collector calls = %d, want 1 (the collector itself still ran)", env.pc.calls)
+		}
+	})
+
+	t.Run("a hung ping collector cannot block the run past the ping timeout", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+
+		// Built directly rather than through Execute (which has no way to
+		// inject a shorter-than-production pingTimeout): r.run is the same
+		// code path Execute would take, just with a bound the test doesn't
+		// have to wait out for real (mirrors the hung-metrics-collector test).
+		r := &runner{
+			settings:       env.settings,
+			repo:           env.repo,
+			metricsRepo:    env.mr,
+			pingRepo:       env.pr,
+			checker:        env.chk,
+			rebooter:       env.rb,
+			notifier:       env.nt,
+			metrics:        env.mc,
+			pings:          blockingPingCollector{},
+			clock:          env.clk,
+			metricsTimeout: defaultMetricsTimeout,
+			pingTimeout:    20 * time.Millisecond,
+		}
+
+		start := time.Now()
+		code := r.run(t.Context(), domain.ModeSoft)
+		elapsed := time.Since(start)
+
+		if code != domain.ExitOK {
+			t.Fatalf("run() = %d, want ExitOK (a hung collector must never change the run's outcome)", code)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("run() took %s, want it bounded by pingTimeout (20ms), not a collector hang", elapsed)
+		}
+
+		run := env.repo.run(t, 1)
+		if run.Outcome != domain.OutcomeOK {
+			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeOK)
+		}
+		if run.FinishedAt == nil {
+			t.Fatal("FinishedAt is nil, want set (the run still reached its normal terminal state)")
+		}
+		if len(env.pr.calls) != 0 {
+			t.Fatalf("ping saves = %+v, want none (the collector never returned within the timeout)", env.pr.calls)
+		}
+	})
 }
 
 // errRebootFailed is a stand-in for gateway/router's real reboot errors;
@@ -561,15 +697,17 @@ type testEnv struct {
 	settings Settings
 	repo     *fakeRunRepo
 	mr       *fakeMetricsRepo
+	pr       *fakePingRepo
 	chk      *fakeChecker
 	rb       *fakeRebooter
 	nt       *fakeNotifier
 	mc       *fakeMetricsCollector
+	pc       *fakePingCollector
 	clk      *fakeClock
 }
 
 // newTestEnv builds a testEnv with sane defaults (2h cooldown, 60s recovery
-// interval, 15m recovery timeout, reboot and metrics both enabled — the
+// interval, 15m recovery timeout, reboot, metrics, and ping all enabled — the
 // design's own defaults) that a subtest can override before calling Execute.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
@@ -582,13 +720,16 @@ func newTestEnv(t *testing.T) *testEnv {
 			RecoveryTimeout:  15 * time.Minute,
 			RebootEnabled:    true,
 			MetricsEnabled:   true,
+			PingEnabled:      true,
 		},
 		repo: newFakeRunRepo(),
 		mr:   &fakeMetricsRepo{},
+		pr:   &fakePingRepo{},
 		chk:  &fakeChecker{},
 		rb:   &fakeRebooter{},
 		nt:   &fakeNotifier{},
 		mc:   &fakeMetricsCollector{},
+		pc:   &fakePingCollector{},
 		clk:  &fakeClock{now: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)},
 	}
 }

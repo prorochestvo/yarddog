@@ -190,6 +190,217 @@ func TestParseMetricsFilter(t *testing.T) {
 	})
 }
 
+func TestParsePingsFilter(t *testing.T) {
+	t.Run("every param set parses correctly", func(t *testing.T) {
+		t.Parallel()
+
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&host=1.1.1.1&limit=5&include_unreachable=true")
+		if err != nil {
+			t.Fatalf("ParseQuery: %v", err)
+		}
+
+		f, err := parsePingsFilter(q)
+		if err != nil {
+			t.Fatalf("parsePingsFilter() error = %v", err)
+		}
+		wantSince := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+		if !f.Since.Equal(wantSince) {
+			t.Errorf("Since = %v, want %v", f.Since, wantSince)
+		}
+		if f.Host != "1.1.1.1" {
+			t.Errorf("Host = %q, want %q", f.Host, "1.1.1.1")
+		}
+		if f.Limit != 5 {
+			t.Errorf("Limit = %d, want 5", f.Limit)
+		}
+		if !f.IncludeUnreachable {
+			t.Errorf("IncludeUnreachable = false, want true")
+		}
+	})
+
+	t.Run("every param absent is the zero filter", func(t *testing.T) {
+		t.Parallel()
+
+		f, err := parsePingsFilter(url.Values{})
+		if err != nil {
+			t.Fatalf("parsePingsFilter() error = %v", err)
+		}
+		if !f.Since.IsZero() || f.Host != "" || f.Limit != 0 || f.IncludeUnreachable {
+			t.Fatalf("parsePingsFilter(empty) = %+v, want the zero value", f)
+		}
+	})
+
+	t.Run("an unparseable include_unreachable errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("include_unreachable=maybe")
+		if _, err := parsePingsFilter(q); err == nil {
+			t.Fatal("parsePingsFilter() error = nil, want error for an invalid include_unreachable")
+		}
+	})
+
+	t.Run("an unparseable since errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("since=not-a-date")
+		if _, err := parsePingsFilter(q); err == nil {
+			t.Fatal("parsePingsFilter() error = nil, want error for an invalid since")
+		}
+	})
+
+	t.Run("an unparseable limit errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("limit=abc")
+		if _, err := parsePingsFilter(q); err == nil {
+			t.Fatal("parsePingsFilter() error = nil, want error for an invalid limit")
+		}
+	})
+}
+
+func TestServer_handlePings(t *testing.T) {
+	t.Run("empty result is 200 with an empty array, not 404", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if !strings.Contains(rec.Body.String(), `"pings":[]`) {
+			t.Fatalf("body = %s, want an empty array, not null", rec.Body.String())
+		}
+	})
+
+	t.Run("returns newest-first pings", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+		repo := &fakeRepo{listPings: []domain.PingRecord{
+			{RunID: 2, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
+			{RunID: 1, TS: ts.Add(-time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 20, OK: true}},
+		}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		var body dto.PingsListResponse
+		decodeJSON(t, rec, &body)
+		if len(body.Pings) != 2 || body.Pings[0].RunID != 2 || body.Pings[1].RunID != 1 {
+			t.Fatalf("body.Pings = %+v, want run 2 before run 1 (newest first)", body.Pings)
+		}
+	})
+
+	t.Run("?host= is parsed and forwarded", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: 1, Result: domain.PingResult{Host: "8.8.8.8", OK: true, Received: 1}}}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?host=8.8.8.8", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var body dto.PingsListResponse
+		decodeJSON(t, rec, &body)
+		if len(body.Pings) != 1 || body.Pings[0].Host != "8.8.8.8" {
+			t.Fatalf("body.Pings = %+v, want the one 8.8.8.8 row", body.Pings)
+		}
+	})
+
+	t.Run("?include_unreachable=true includes null-avg rows", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeRepo{listPings: []domain.PingRecord{
+			{RunID: 1, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
+		}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?include_unreachable=true", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		var body dto.PingsListResponse
+		decodeJSON(t, rec, &body)
+		if len(body.Pings) != 1 || body.Pings[0].AvgMS != nil {
+			t.Fatalf("body.Pings = %+v, want one row with a null avg_ms", body.Pings)
+		}
+	})
+
+	t.Run("?limit= is parsed and forwarded", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: 1, Result: domain.PingResult{Host: "1.1.1.1", OK: true, Received: 1}}}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?limit=1", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("requires the token like every other gated route", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings", "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("bad since is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?since=not-a-date", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("bad limit is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?limit=not-a-number", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("bad include_unreachable is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?include_unreachable=maybe", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("a repo error is 500 with a generic body", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{listPingsErr: errors.New("boom")}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings", "tok")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+}
+
 func TestServer_handleHealth(t *testing.T) {
 	t.Run("all probes healthy is 200 status:true", func(t *testing.T) {
 		t.Parallel()

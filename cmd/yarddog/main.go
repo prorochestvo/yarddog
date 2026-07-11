@@ -94,7 +94,7 @@ func run() int {
 		}
 	}()
 
-	chk, rb, nt, mc, err := wire(cfg, st)
+	chk, rb, nt, mc, pc, err := wire(cfg, st)
 	if err != nil {
 		log.Printf("yarddog: %v", err)
 		return domain.ExitConfigError
@@ -106,6 +106,9 @@ func run() int {
 	}
 	if err := st.PruneMetrics(ctx, clk.Now(), cfg.RetentionDays); err != nil {
 		log.Printf("yarddog: prune metrics: %v", err)
+	}
+	if err := st.PrunePings(ctx, clk.Now(), cfg.RetentionDays); err != nil {
+		log.Printf("yarddog: prune pings: %v", err)
 	}
 	if err := nt.Flush(ctx); err != nil {
 		log.Printf("yarddog: startup outbox flush: %v", err)
@@ -123,9 +126,10 @@ func run() int {
 		RecoveryTimeout:  cfg.RecoveryTimeout,
 		RebootEnabled:    cfg.RebootEnabled,
 		MetricsEnabled:   cfg.MetricsEnabled,
+		PingEnabled:      len(cfg.PingHosts) > 0,
 	}
 
-	return services.Execute(ctx, settings, st, st, chk, rb, nt, mc, clk, mode)
+	return services.Execute(ctx, settings, st, st, st, chk, rb, nt, mc, pc, clk, mode)
 }
 
 // defaultEnvPath and fallbackEnvPath are config-independent constants: the
@@ -195,18 +199,18 @@ func resolveEnvPath(flagPath string) string {
 	return fallbackEnvPath
 }
 
-// wire constructs the real checker/rebooter/notifier/metrics-collector
-// implementations services.Execute needs. Any failure here (a malformed
-// DSN, router address, or ROUTER_KIND) is a configuration problem
+// wire constructs the real checker/rebooter/notifier/metrics-collector/
+// ping-collector implementations services.Execute needs. Any failure here
+// (a malformed DSN, router address, or ROUTER_KIND) is a configuration problem
 // discovered only once cfg's fields are actually parsed by their consumers,
 // so the caller treats it exactly like a LoadConfig failure. It is not a
 // shared bootstrap package — just a private helper inside this composition
 // root (CLAUDE.md: a second binary would inline its own startup, not
 // import this one).
-func wire(cfg *infrastructure.Config, st *infrastructure.Store) (*infrastructure.Checker, services.Rebooter, *services.OutboxService, services.MetricsCollector, error) {
+func wire(cfg *infrastructure.Config, st *infrastructure.Store) (*infrastructure.Checker, services.Rebooter, *services.OutboxService, services.MetricsCollector, services.PingCollector, error) {
 	chk, err := infrastructure.NewChecker(cfg.CheckIPs, cfg.CheckDomains, cfg.RouterAddr, cfg.CheckTimeout)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("build checker: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("build checker: %w", err)
 	}
 
 	rb, err := router.New(cfg.RouterKind, router.RouterConfig{
@@ -216,16 +220,17 @@ func wire(cfg *infrastructure.Config, st *infrastructure.Store) (*infrastructure
 		Timeout: cfg.CheckTimeout,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("build router driver: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("build router driver: %w", err)
 	}
 
 	client, err := telegram.NewClient(cfg.TelegramBotDSN)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("build telegram client: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("build telegram client: %w", err)
 	}
 
 	nt := services.NewOutboxService(st, client)
 	mc := infrastructure.NewMetricsCollector(cfg.MetricsSettings, cfg.MetricsDiskMount)
+	pc := infrastructure.NewPingCollector(cfg.PingHosts, cfg.PingCount, cfg.PingTimeout)
 
-	return chk, rb, nt, mc, nil
+	return chk, rb, nt, mc, pc, nil
 }

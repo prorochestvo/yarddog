@@ -118,6 +118,27 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto.PingResponse{Status: "ok"})
 }
 
+// handlePings answers GET /api/v1/pings: filtered ping history, 200 with an
+// empty array when nothing matches (issue #2, mirrors handleMetrics — an
+// empty list here is a valid answer, not a 404).
+func (s *Server) handlePings(w http.ResponseWriter, r *http.Request) {
+	filter, err := parsePingsFilter(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	records, err := s.query.Pings(r.Context(), filter)
+	if err != nil {
+		writeError500(w, "list pings", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, dto.PingsListResponse{
+		Pings: pingDTOs(records),
+	})
+}
+
 // handleRunByID answers GET /api/v1/runs/{id}: the run plus every checks
 // row recorded against it; 400 for a non-numeric id, 404 for an unknown one.
 func (s *Server) handleRunByID(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +254,39 @@ func parseMetricsFilter(q url.Values) (services.MetricsFilter, error) {
 		return services.MetricsFilter{}, err
 	}
 	f.IncludeEmpty = includeEmpty
+
+	return f, nil
+}
+
+// parsePingsFilter builds a services.PingFilter from the request's query
+// params (issue #2): since (RFC3339), host, limit (int), and
+// include_unreachable (bool) are all optional. An unparseable value is
+// reported as an error the handler turns into a 400, never silently ignored
+// or coerced into "no filter".
+func parsePingsFilter(q url.Values) (services.PingFilter, error) {
+	var f services.PingFilter
+
+	if raw := q.Get("since"); raw != "" {
+		since, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return services.PingFilter{}, fmt.Errorf("invalid since %q: not RFC3339", raw)
+		}
+		f.Since = since
+	}
+
+	f.Host = q.Get("host")
+
+	limit, err := parseIntParam(q, "limit", 0)
+	if err != nil {
+		return services.PingFilter{}, err
+	}
+	f.Limit = limit
+
+	includeUnreachable, err := parseBoolParam(q, "include_unreachable")
+	if err != nil {
+		return services.PingFilter{}, err
+	}
+	f.IncludeUnreachable = includeUnreachable
 
 	return f, nil
 }

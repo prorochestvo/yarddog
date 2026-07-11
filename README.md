@@ -20,9 +20,10 @@ reboot button but no reboot scheduler.
   is down, logs into the router web UI and triggers a reboot;
 - **hard mode** (`--hard-reboot`, nightly cron): reboots unconditionally;
 - after triggering a reboot it stays alive, polling the same targets every
-  minute and tracking the phases *router went down → router is up → internet
-  restored*;
-- announces every phase in Telegram;
+  minute and recording the phases *router went down → router is up → internet
+  restored* (timestamps persisted, served by the query daemon);
+- announces the reboot in Telegram with two messages — *initiated* and
+  *completed* — keeping the alert concise;
 - records every check, run and phase timestamp in a local SQLite database;
 - optionally captures a **host-telemetry snapshot** each run — CPU load, memory, disk,
   uptime, and (on Linux) temperature, fan RPM and per-interface network counters — each
@@ -37,20 +38,22 @@ reboot button but no reboot scheduler.
 ## How a reboot goes
 
 ```
-starting router reboot          <- telegram, before anything happens
+initiated                       <- telegram, before anything happens
 POST /login.cgi                 <- session cookies (sid/lsid)
 GET  /reboot.cgi                <- fresh per-request CSRF token
 POST /reboot.cgi?reboot         <- token in the body -> 200 "done reboot";
                                    a login-page redirect means rejected
 poll every 60s, up to 15m:
-    router went down            <- telegram, gateway stopped answering
-    router is up                <- telegram, gateway answers again
-    reboot completed,
-    internet restored (4m10s)   <- telegram, all checks green
+    router went down            <- recorded (router_down_at), no telegram
+    router is up                <- recorded (router_up_at), no telegram
+    completed,
+    internet restored           <- telegram, all checks green
 ```
 
-If the router restarts faster than the polling interval, the down/up messages
-are skipped and only the completion message is sent.
+The gateway down/up transitions are only recorded as timestamps, not announced;
+the reboot flow sends just the two messages. If the router restarts faster than
+the polling interval, the transitions are never observed and no timestamps are
+written.
 
 ## Deciding "the internet is down"
 
@@ -71,10 +74,8 @@ mode ignores the cooldown.
 Every message starts with a tag and a label:
 
 ```
-#REBOOT home starting router reboot (reason: no internet)
-#REBOOT home router went down
-#REBOOT home router is up, waiting for internet
-#REBOOT home reboot completed, internet restored (downtime 4m10s)
+#REBOOT home initiated (reason: no internet)
+#REBOOT home completed, internet restored
 #REBOOT home no internet, skipping reboot (cooldown: last reboot 40m ago)
 ```
 
@@ -165,6 +166,9 @@ real environment.
 | `YARDDOG_METRICS_UPTIME` | no | `true` | uptime |
 | `YARDDOG_METRICS_NETWORK` | no | `true` | per-interface rx/tx bytes (Linux only) |
 | `YARDDOG_METRICS_DISK_MOUNT` | no | `/` | filesystem the disk collector stats |
+| `YARDDOG_PING_HOSTS` | no | *(empty, feature off)* | csv of bare hosts (no port) to average-ping each run; prefer IP literals so a ping never depends on DNS, which may itself be down during an outage |
+| `YARDDOG_PING_COUNT` | no | `5` | pings sent per host, clamped to `[4, 7]` |
+| `YARDDOG_PING_TIMEOUT` | no | `4s` | overall per-host ping deadline, clamped to `[1s, 10s]` |
 
 ## Scheduling
 
@@ -234,12 +238,17 @@ internet.
 | `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
 | `GET /api/v1/metrics/latest` | token | every metric of the newest run that has any (`404` if none) |
 | `GET /api/v1/metrics?since=&collector=&limit=` | token | metrics history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=` | token | ping history, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` bad id, `404` unknown) |
 
 `since` is RFC3339 UTC; `collector` is one of
 `temperature`/`fans`/`cpu`/`memory`/`disk`/`uptime`/`network`; `limit` is capped
-server-side (runs 500, metrics 1000). `/health/check` probes the SQLite handle
+server-side (runs 500, metrics 1000, pings 1000). `/api/v1/pings` rows carry
+`{run_id, ts, host, sent, received, avg_ms, ok, error}`; `avg_ms` is `null`
+unless `ok` (a host with zero replies has no round trip to average).
+`include_unreachable=true` keeps those null-avg rows, which the default
+response omits. `/health/check` probes the SQLite handle
 (`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
 than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
 it is token-gated because its body names internal dependencies.

@@ -102,6 +102,27 @@ func LoadConfig(envPath string) (*Config, error) {
 
 	cfg.MetricsDiskMount = getOrDefault(get, "METRICS_DISK_MOUNT", defaultMetricsDiskMount)
 
+	cfg.PingHosts = splitCSV(getOrDefault(get, "PING_HOSTS", defaultPingHosts))
+	for _, host := range cfg.PingHosts {
+		if strings.HasPrefix(host, "-") {
+			return nil, fmt.Errorf("invalid %s: host %q must not begin with \"-\" (argument-injection guard)", envPrefix+"PING_HOSTS", host)
+		}
+	}
+
+	rawPingCount := getOrDefault(get, "PING_COUNT", defaultPingCount)
+	pingCount, err := strconv.Atoi(rawPingCount)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"PING_COUNT", rawPingCount, err)
+	}
+	cfg.PingCount = clampPingCount(pingCount)
+
+	rawPingTimeout := getOrDefault(get, "PING_TIMEOUT", defaultPingTimeout)
+	pingTimeout, err := time.ParseDuration(rawPingTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"PING_TIMEOUT", rawPingTimeout, err)
+	}
+	cfg.PingTimeout = clampPingTimeout(pingTimeout)
+
 	return cfg, nil
 }
 
@@ -125,6 +146,9 @@ type Config struct {
 	MetricsEnabled   bool
 	MetricsSettings  domain.MetricsSettings
 	MetricsDiskMount string
+	PingHosts        []string
+	PingCount        int
+	PingTimeout      time.Duration
 }
 
 const (
@@ -138,7 +162,53 @@ const (
 	defaultRebootCooldown   = "2h"
 	defaultRetentionDays    = "90"
 	defaultMetricsDiskMount = "/"
+	defaultPingHosts        = ""
+	defaultPingCount        = "5"
+	defaultPingTimeout      = "4s"
+
+	// minPingCount and maxPingCount bound PING_COUNT (issue #2): too few
+	// probes make the average noisy, too many turn a per-run collector into
+	// a multi-second network burst against every configured host.
+	minPingCount = 4
+	maxPingCount = 7
+
+	// minPingTimeout and maxPingTimeout bound PING_TIMEOUT (issue #2). The
+	// per-host deadline is passed to ping as an integer-second -w/-t flag, so
+	// a sub-second value must floor to 1s or ping runs with no deadline at
+	// all. The ceiling keeps the per-host deadline safely nested inside the
+	// orchestrator's whole-batch collectPings backstop (defaultPingTimeout,
+	// 15s): a value above it would be silently killed by the batch deadline
+	// every run, making the operator's setting a no-op.
+	minPingTimeout = 1 * time.Second
+	maxPingTimeout = 10 * time.Second
 )
+
+// clampPingCount bounds PING_COUNT to [minPingCount, maxPingCount], silently
+// correcting an out-of-range operator value rather than failing startup over
+// it (matching QueryService.clampLimit's "clamp, don't error" philosophy for
+// a value that is worth correcting, not worth refusing to start over).
+func clampPingCount(n int) int {
+	if n < minPingCount {
+		return minPingCount
+	}
+	if n > maxPingCount {
+		return maxPingCount
+	}
+	return n
+}
+
+// clampPingTimeout bounds PING_TIMEOUT to [minPingTimeout, maxPingTimeout],
+// silently correcting an out-of-range value rather than refusing to start
+// (matching clampPingCount's "clamp, don't error" philosophy).
+func clampPingTimeout(d time.Duration) time.Duration {
+	if d < minPingTimeout {
+		return minPingTimeout
+	}
+	if d > maxPingTimeout {
+		return maxPingTimeout
+	}
+	return d
+}
 
 // getBool looks up key via get and parses it as a bool (strconv.ParseBool:
 // "true/false/1/0/t/f", case-insensitive), or returns def if the key

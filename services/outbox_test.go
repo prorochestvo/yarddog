@@ -16,7 +16,7 @@ func TestOutboxService_Notify(t *testing.T) {
 		sender := &fakeSender{}
 		svc := NewOutboxService(repo, sender)
 
-		text := "starting router reboot (reason: no internet)"
+		text := "initiated (reason: no internet)"
 		if err := svc.Notify(t.Context(), text); err != nil {
 			t.Fatalf("Notify: %v", err)
 		}
@@ -41,7 +41,7 @@ func TestOutboxService_Notify(t *testing.T) {
 		sender := &fakeSender{err: errors.New("telegram: send message: status 500")}
 		svc := NewOutboxService(repo, sender)
 
-		if err := svc.Notify(t.Context(), "router went down"); err != nil {
+		if err := svc.Notify(t.Context(), "completed, internet restored"); err != nil {
 			t.Fatalf("Notify: %v", err)
 		}
 
@@ -72,7 +72,7 @@ func TestOutboxService_Notify(t *testing.T) {
 		sender := &fakeSender{err: errors.New(redactedErr)}
 		svc := NewOutboxService(repo, sender)
 
-		if err := svc.Notify(t.Context(), "router went down"); err != nil {
+		if err := svc.Notify(t.Context(), "completed, internet restored"); err != nil {
 			t.Fatalf("Notify: %v", err)
 		}
 
@@ -100,7 +100,7 @@ func TestOutboxService_Flush(t *testing.T) {
 		svc := NewOutboxService(repo, sender)
 
 		queuedAt := time.Date(2026, 7, 6, 4, 2, 0, 0, time.UTC)
-		if _, err := repo.EnqueueOutboxMessage(t.Context(), queuedAt, "starting router reboot (reason: no internet)"); err != nil {
+		if _, err := repo.EnqueueOutboxMessage(t.Context(), queuedAt, "initiated (reason: no internet)"); err != nil {
 			t.Fatalf("EnqueueOutboxMessage: %v", err)
 		}
 
@@ -108,7 +108,7 @@ func TestOutboxService_Flush(t *testing.T) {
 			t.Fatalf("Flush: %v", err)
 		}
 
-		want := "starting router reboot (reason: no internet) [queued 04:02]"
+		want := "initiated (reason: no internet) [queued 04:02]"
 		if len(sender.sent) != 1 || sender.sent[0] != want {
 			t.Fatalf("flushed text = %v, want [%q]", sender.sent, want)
 		}

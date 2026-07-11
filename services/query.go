@@ -20,6 +20,20 @@ type MetricsFilter struct {
 	IncludeEmpty bool
 }
 
+// PingFilter narrows HistoryRepository.ListPings (issue #2), mirroring
+// MetricsFilter. Since's zero value means "no lower bound"; Host's zero
+// value ("") means "every host"; Limit<=0 means "use QueryService's
+// default", and QueryService.Pings clamps whatever it receives to a hard
+// maximum. IncludeUnreachable false (the default) drops rows with no
+// received replies (received=0) in SQL so LIMIT counts only returned rows;
+// true keeps them (?include_unreachable=true).
+type PingFilter struct {
+	Since              time.Time
+	Host               string
+	Limit              int
+	IncludeUnreachable bool
+}
+
 // HistoryRepository is the read-only persistence port the query daemon
 // consumes (plans/004-query-daemon.md); infrastructure.Store satisfies it.
 // Every "not found" case is reported through a bool return, never a sentinel
@@ -28,6 +42,7 @@ type HistoryRepository interface {
 	LatestHost(ctx context.Context) (domain.HostRecord, bool, error)
 	LatestMetrics(ctx context.Context) ([]domain.MetricRecord, error)
 	ListMetrics(ctx context.Context, f MetricsFilter) ([]domain.MetricRecord, error)
+	ListPings(ctx context.Context, f PingFilter) ([]domain.PingRecord, error)
 	ListRuns(ctx context.Context, limit int) ([]domain.Run, error)
 	RunByID(ctx context.Context, id int64) (domain.Run, bool, error)
 	ListChecksByRun(ctx context.Context, runID int64) ([]domain.Check, error)
@@ -66,6 +81,13 @@ func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.M
 	return q.repo.ListMetrics(ctx, f)
 }
 
+// Pings returns ping history matching f, with f.Limit clamped to
+// [1, maxPingsLimit] (defaultPingsLimit when f.Limit<=0).
+func (q *QueryService) Pings(ctx context.Context, f PingFilter) ([]domain.PingRecord, error) {
+	f.Limit = clampLimit(f.Limit, defaultPingsLimit, maxPingsLimit)
+	return q.repo.ListPings(ctx, f)
+}
+
 // Run returns run id together with every checks row recorded against it.
 // found is false when no such run exists, in which case checks is always nil
 // and ListChecksByRun is never called — there is nothing to look up.
@@ -91,6 +113,9 @@ const (
 
 	defaultMetricsLimit = 100
 	maxMetricsLimit     = 1000
+
+	defaultPingsLimit = 100
+	maxPingsLimit     = 1000
 )
 
 // clampLimit resolves a caller-supplied limit to a safe range: limit<=0

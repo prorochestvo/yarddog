@@ -61,6 +61,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/host", s.handleLatestHost)
 	mux.HandleFunc("GET /api/v1/metrics/latest", s.handleLatestMetrics)
 	mux.HandleFunc("GET /api/v1/metrics", s.handleMetrics)
+	mux.HandleFunc("GET /api/v1/pings", s.handlePings)
 	mux.HandleFunc("GET /api/v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.handleRunByID)
 }

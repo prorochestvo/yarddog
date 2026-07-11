@@ -264,6 +264,81 @@ func TestMetricRowDTOs(t *testing.T) {
 	})
 }
 
+func TestPingDTO(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+
+	t.Run("a reachable result carries its avg_ms", func(t *testing.T) {
+		t.Parallel()
+
+		rec := domain.PingRecord{RunID: 128, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
+
+		got := pingDTO(rec)
+
+		if got.AvgMS == nil || *got.AvgMS != 12.5 {
+			t.Fatalf("pingDTO().AvgMS = %v, want 12.5", got.AvgMS)
+		}
+		if got.Host != "1.1.1.1" || got.Sent != 5 || got.Received != 5 || !got.OK {
+			t.Fatalf("pingDTO() = %+v, unexpected mapping", got)
+		}
+	})
+
+	t.Run("an unreachable result has a nil avg_ms even though the domain struct's AvgMS field is its zero value", func(t *testing.T) {
+		t.Parallel()
+
+		rec := domain.PingRecord{RunID: 128, TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}}
+
+		got := pingDTO(rec)
+
+		if got.AvgMS != nil {
+			t.Fatalf("pingDTO().AvgMS = %v, want nil for an unreachable result", *got.AvgMS)
+		}
+		if got.Error != "no route to host" {
+			t.Fatalf("pingDTO().Error = %q, want %q", got.Error, "no route to host")
+		}
+	})
+}
+
+func TestPingDTOs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a nil input still returns a non-nil empty slice", func(t *testing.T) {
+		t.Parallel()
+
+		got := pingDTOs(nil)
+
+		if got == nil {
+			t.Fatal("pingDTOs(nil) = nil, want a non-nil empty slice (must marshal as [] not null)")
+		}
+		if len(got) != 0 {
+			t.Fatalf("pingDTOs(nil) = %+v, want empty", got)
+		}
+	})
+
+	t.Run("maps every element in order", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+		records := []domain.PingRecord{
+			{RunID: 1, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
+			{RunID: 1, TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
+		}
+
+		got := pingDTOs(records)
+
+		if len(got) != 2 || got[0].Host != "1.1.1.1" || got[1].Host != "unreachable.example" {
+			t.Fatalf("pingDTOs() = %+v, want both hosts in order", got)
+		}
+		if got[0].AvgMS == nil || *got[0].AvgMS != 10 {
+			t.Fatalf("pingDTOs()[0].AvgMS = %v, want 10", got[0].AvgMS)
+		}
+		if got[1].AvgMS != nil {
+			t.Fatalf("pingDTOs()[1].AvgMS = %v, want nil (unreachable)", *got[1].AvgMS)
+		}
+	})
+}
+
 func TestRunDTO(t *testing.T) {
 	t.Parallel()
 

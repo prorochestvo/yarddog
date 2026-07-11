@@ -3,7 +3,6 @@ package domain
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 // ExitOK, ExitConfigError, ExitLockHeld, ExitRebootFailed, ExitRecoveryTimeout,
@@ -54,11 +53,4 @@ func ParseRouterKind(s string) (RouterKind, error) {
 	default:
 		return "", fmt.Errorf("unknown ROUTER_KIND %q", s)
 	}
-}
-
-// Downtime returns the duration between a reboot's start and the internet's
-// restoration (design §5: reboot_started_at -> now, not router_down ->
-// router_up and not the run's whole wall-clock).
-func Downtime(rebootStartedAt, restoredAt time.Time) time.Duration {
-	return restoredAt.Sub(rebootStartedAt)
 }

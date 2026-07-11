@@ -18,6 +18,9 @@ var (
 	_ MetricsCollector  = (*fakeMetricsCollector)(nil)
 	_ MetricsCollector  = blockingMetricsCollector{}
 	_ MetricsRepository = (*fakeMetricsRepo)(nil)
+	_ PingCollector     = (*fakePingCollector)(nil)
+	_ PingCollector     = blockingPingCollector{}
+	_ PingRepository    = (*fakePingRepo)(nil)
 	_ OutboxRepository  = (*fakeOutboxRepo)(nil)
 	_ Sender            = (*fakeSender)(nil)
 )
@@ -220,6 +223,52 @@ type metricsSave struct {
 
 func (f *fakeMetricsRepo) SaveMetrics(_ context.Context, runID int64, ts time.Time, m domain.HostMetrics) error {
 	f.calls = append(f.calls, metricsSave{runID: runID, ts: ts, m: m})
+	return f.err
+}
+
+// fakePingCollector returns results from every Collect call and counts them,
+// so orchestrator tests can assert the collector ran (or didn't) and with
+// what payload, without any real ping exec — mirrors fakeMetricsCollector.
+type fakePingCollector struct {
+	results []domain.PingResult
+	calls   int
+}
+
+func (f *fakePingCollector) Collect(context.Context) []domain.PingResult {
+	f.calls++
+	return f.results
+}
+
+// blockingPingCollector simulates a wedged ping exec (e.g. a DNS resolver
+// that never answers): Collect blocks until ctx is cancelled, mirroring
+// blockingMetricsCollector — it proves collectPings's own goroutine+timeout
+// is the guarantee against a stall, not cooperation from the collector.
+type blockingPingCollector struct{}
+
+func (blockingPingCollector) Collect(ctx context.Context) []domain.PingResult {
+	<-ctx.Done()
+	return nil
+}
+
+// fakePingRepo records every SavePings call in order, so orchestrator tests
+// can assert exactly one round was saved per run with the expected
+// runID/ts/payload; err lets a test force a save failure to verify it is
+// only logged, never surfaced as a changed outcome — mirrors fakeMetricsRepo.
+type fakePingRepo struct {
+	err error
+
+	calls []pingsSave
+}
+
+// pingsSave is one recorded fakePingRepo.SavePings call.
+type pingsSave struct {
+	runID int64
+	ts    time.Time
+	rs    []domain.PingResult
+}
+
+func (f *fakePingRepo) SavePings(_ context.Context, runID int64, ts time.Time, rs []domain.PingResult) error {
+	f.calls = append(f.calls, pingsSave{runID: runID, ts: ts, rs: rs})
 	return f.err
 }
 

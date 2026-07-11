@@ -145,6 +145,57 @@ func TestQueryService_Metrics(t *testing.T) {
 	})
 }
 
+func TestQueryService_Pings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		limit     int
+		wantLimit int
+	}{
+		{"zero uses the default", 0, defaultPingsLimit},
+		{"negative uses the default", -1, defaultPingsLimit},
+		{"over the max is clamped", 5000, maxPingsLimit},
+		{"in range passes through", 250, 250},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &fakeHistoryRepository{}
+			q := NewQueryService(repo)
+			since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+			_, err := q.Pings(t.Context(), PingFilter{Since: since, Host: "1.1.1.1", Limit: tt.limit})
+			if err != nil {
+				t.Fatalf("Pings() error = %v", err)
+			}
+			if repo.listPingsFilter.Limit != tt.wantLimit {
+				t.Fatalf("repo received Limit = %d, want %d", repo.listPingsFilter.Limit, tt.wantLimit)
+			}
+			if !repo.listPingsFilter.Since.Equal(since) {
+				t.Fatalf("repo received Since = %v, want %v (untouched)", repo.listPingsFilter.Since, since)
+			}
+			if repo.listPingsFilter.Host != "1.1.1.1" {
+				t.Fatalf("repo received Host = %q, want %q (untouched)", repo.listPingsFilter.Host, "1.1.1.1")
+			}
+		})
+	}
+
+	t.Run("a repo error propagates", func(t *testing.T) {
+		t.Parallel()
+
+		wantErr := errors.New("db exploded")
+		repo := &fakeHistoryRepository{listPingsErr: wantErr}
+		q := NewQueryService(repo)
+
+		_, err := q.Pings(t.Context(), PingFilter{})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Pings() error = %v, want %v", err, wantErr)
+		}
+	})
+}
+
 func TestQueryService_Run(t *testing.T) {
 	t.Run("found run returns its checks", func(t *testing.T) {
 		t.Parallel()
@@ -302,6 +353,10 @@ type fakeHistoryRepository struct {
 	listMetricsErr    error
 	listMetricsFilter MetricsFilter
 
+	listPingsResult []domain.PingRecord
+	listPingsErr    error
+	listPingsFilter PingFilter
+
 	listRunsResult []domain.Run
 	listRunsErr    error
 	listRunsLimit  int
@@ -331,6 +386,11 @@ func (f *fakeHistoryRepository) ListChecksByRun(context.Context, int64) ([]domai
 func (f *fakeHistoryRepository) ListMetrics(_ context.Context, filter MetricsFilter) ([]domain.MetricRecord, error) {
 	f.listMetricsFilter = filter
 	return f.listMetricsResult, f.listMetricsErr
+}
+
+func (f *fakeHistoryRepository) ListPings(_ context.Context, filter PingFilter) ([]domain.PingRecord, error) {
+	f.listPingsFilter = filter
+	return f.listPingsResult, f.listPingsErr
 }
 
 func (f *fakeHistoryRepository) ListRuns(_ context.Context, limit int) ([]domain.Run, error) {

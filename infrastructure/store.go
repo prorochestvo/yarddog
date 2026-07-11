@@ -68,11 +68,12 @@ func OpenStore(ctx context.Context, path string, maxOpenConns int) (*Store, erro
 }
 
 // Store is the SQLite-backed persistence layer for runs, checks, host
-// telemetry, and the Telegram outbox (design §9; plans/003-host-telemetry.md).
-// It implements services.RunRepository, services.MetricsRepository, and
-// services.OutboxRepository; main passes the one *Store into
-// services.Execute as the first two and into services.NewOutboxService as
-// the third.
+// telemetry, pings, and the Telegram outbox (design §9;
+// plans/003-host-telemetry.md; issue #2). It implements
+// services.RunRepository, services.MetricsRepository, services.PingRepository,
+// and services.OutboxRepository; main passes the one *Store into
+// services.Execute for the run/metrics/ping repositories and into
+// services.NewOutboxService as the outbox.
 type Store struct {
 	db *sql.DB
 }
@@ -80,6 +81,7 @@ type Store struct {
 var (
 	_ services.RunRepository     = (*Store)(nil)
 	_ services.MetricsRepository = (*Store)(nil)
+	_ services.PingRepository    = (*Store)(nil)
 	_ services.OutboxRepository  = (*Store)(nil)
 	_ services.HistoryRepository = (*Store)(nil)
 	_ services.HealthProbe       = (*Store)(nil)
@@ -433,6 +435,87 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.Met
 	return out, nil
 }
 
+// ListPings returns ping history matching f, newest first, bounded by
+// f.Limit (a parameterized LIMIT — never string-concatenated, Risk R8).
+// f.Since's zero value omits the "ts >= ?" clause; f.Host's zero value omits
+// the "host = ?" clause; f.IncludeUnreachable false additionally drops
+// received=0 rows in SQL so LIMIT counts only returned rows.
+func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.PingRecord, error) {
+	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s FROM %s`,
+		colPingsRunID, colPingsTS, colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError, tablePings)
+
+	var (
+		conds []string
+		args  []any
+	)
+	if !f.Since.IsZero() {
+		conds = append(conds, colPingsTS+" >= ?")
+		args = append(args, formatTime(f.Since))
+	}
+	if f.Host != "" {
+		conds = append(conds, colPingsHost+" = ?")
+		args = append(args, f.Host)
+	}
+	if !f.IncludeUnreachable {
+		// drop unreachable rows in SQL so LIMIT counts only returned rows.
+		conds = append(conds, colPingsReceived+" > 0")
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += fmt.Sprintf(" ORDER BY %s DESC LIMIT ?", colPingsID)
+	args = append(args, f.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list pings: %w", err)
+	}
+	defer rows.Close()
+
+	out, err := scanPingRecords(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list pings: %w", err)
+	}
+	return out, nil
+}
+
+// ListPingsByRun returns every pings row for runID, ordered by id, mirroring
+// ListMetricsByRun. Off-port: it exists so tests can read back what
+// SavePings persisted.
+func (s *Store) ListPingsByRun(ctx context.Context, runID int64) ([]domain.PingResult, error) {
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s, %s, %s, %s, %s FROM %s WHERE %s = ? ORDER BY %s ASC`,
+			colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError,
+			tablePings, colPingsRunID, colPingsID),
+		runID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list pings for run %d: %w", runID, err)
+	}
+	defer rows.Close()
+
+	var out []domain.PingResult
+	for rows.Next() {
+		var (
+			r      domain.PingResult
+			avgMS  sql.NullFloat64
+			errStr sql.NullString
+		)
+		if err := rows.Scan(&r.Host, &r.Sent, &r.Received, &avgMS, &errStr); err != nil {
+			return nil, fmt.Errorf("list pings for run %d: scan: %w", runID, err)
+		}
+		r.AvgMS = avgMS.Float64
+		r.OK = r.Received > 0
+		r.Error = errStr.String
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pings for run %d: %w", runID, err)
+	}
+
+	return out, nil
+}
+
 // ListRuns returns the newest limit runs (highest id first). limit is bound
 // as a parameterized LIMIT — never string-concatenated (Risk R8: an
 // unbounded read could scan the whole table).
@@ -584,6 +667,26 @@ func (s *Store) PruneMetrics(ctx context.Context, now time.Time, retentionDays i
 	return nil
 }
 
+// PrunePings deletes pings rows older than retentionDays, mirroring
+// PruneChecks (retentionDays<=0 means "keep forever", a no-op). Off-port:
+// main calls it directly on the concrete *Store at startup, next to
+// PruneChecks/PruneMetrics.
+func (s *Store) PrunePings(ctx context.Context, now time.Time, retentionDays int) error {
+	if retentionDays <= 0 {
+		return nil
+	}
+
+	cutoff := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
+	_, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tablePings, colPingsTS),
+		formatTime(cutoff),
+	)
+	if err != nil {
+		return fmt.Errorf("prune pings older than %d days: %w", retentionDays, err)
+	}
+	return nil
+}
+
 // RunByID reads back runs row id in full, translating GetRun's sql.ErrNoRows
 // into a plain found bool (services.HistoryRepository's "not found" contract,
 // so services never needs to import database/sql). Any other GetRun error
@@ -639,6 +742,34 @@ func (s *Store) SaveMetrics(ctx context.Context, runID int64, ts time.Time, m do
 	return nil
 }
 
+// SavePings writes one round of ping probes for runID, one row per result,
+// all in a single transaction so a partial round never persists (mirrors
+// SaveMetrics). avg_ms is SQL NULL when the result is unavailable (OK
+// false), so an unreachable host's zero AvgMS is never mistaken for a
+// measured 0ms round trip.
+func (s *Store) SavePings(ctx context.Context, runID int64, ts time.Time, results []domain.PingResult) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("save pings for run %d: begin: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit (sanctioned discard, error-recovery path)
+
+	for _, r := range results {
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				tablePings, colPingsRunID, colPingsTS, colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError),
+			runID, formatTime(ts), r.Host, r.Sent, r.Received, nullFloat(r.AvgMS, r.OK), nullString(r.Error),
+		); err != nil {
+			return fmt.Errorf("save pings for run %d: host %s: %w", runID, r.Host, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("save pings for run %d: commit: %w", runID, err)
+	}
+	return nil
+}
+
 // UpdateRun applies every non-nil field of u to the runs row id. Callers
 // build a domain.RunUpdate with only the fields that changed at a given
 // phase transition (e.g. just RouterDownAt) and leave the rest nil.
@@ -662,6 +793,7 @@ const (
 	tableOutbox  = "tg_outbox"
 	tableMetrics = "metrics"
 	tableHost    = "host"
+	tablePings   = "pings"
 
 	colRunsID                 = "id"
 	colRunsStartedAt          = "started_at"
@@ -714,6 +846,18 @@ const (
 	colHostHostname = "hostname"
 	colHostOS       = "os"
 	colHostArch     = "arch"
+
+	colPingsID       = "id"
+	colPingsRunID    = "run_id"
+	colPingsTS       = "ts"
+	colPingsHost     = "host"
+	colPingsSent     = "sent"
+	colPingsReceived = "received"
+	colPingsAvgMS    = "avg_ms"
+	colPingsError    = "error"
+
+	idxPingsRun = "idx_pings_run"
+	idxPingsTS  = "idx_pings_ts"
 
 	// timeFormat is RFC3339 in UTC (design §9). Every timestamp column is
 	// stored in this fixed-width format so retention pruning can compare
@@ -857,6 +1001,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`, tableHost,
 			colHostRunID, tableRuns, colRunsID, colHostTS, colHostHostname, colHostOS, colHostArch,
 		),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s INTEGER PRIMARY KEY AUTOINCREMENT,
+			%s INTEGER NOT NULL REFERENCES %s(%s),
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s INTEGER NOT NULL,
+			%s INTEGER NOT NULL,
+			%s REAL,
+			%s TEXT
+		)`, tablePings,
+			colPingsID, colPingsRunID, tableRuns, colRunsID, colPingsTS, colPingsHost,
+			colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError,
+		),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxPingsRun, tablePings, colPingsRunID),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxPingsTS, tablePings, colPingsTS),
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -1003,6 +1162,41 @@ func scanMetricRecords(rows *sql.Rows) ([]domain.MetricRecord, error) {
 		rec.Sample.Value = value.Float64
 		rec.Sample.OK = ok != 0
 		rec.Sample.Error = errStr.String
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// scanPingRecords scans the (run_id, ts, host, sent, received, avg_ms,
+// error) column set ListPings uses into domain.PingRecord values, mirroring
+// scanMetricRecords: OK is derived as received>0 rather than stored, and
+// avg_ms's nullability distinguishes an unreachable host from a genuine
+// 0ms round trip.
+func scanPingRecords(rows *sql.Rows) ([]domain.PingRecord, error) {
+	var out []domain.PingRecord
+	for rows.Next() {
+		var (
+			rec    domain.PingRecord
+			ts     string
+			avgMS  sql.NullFloat64
+			errStr sql.NullString
+		)
+		if err := rows.Scan(&rec.RunID, &ts, &rec.Result.Host, &rec.Result.Sent, &rec.Result.Received, &avgMS, &errStr); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+
+		parsed, err := parseTime(ts)
+		if err != nil {
+			return nil, err
+		}
+		rec.TS = parsed
+		rec.Result.AvgMS = avgMS.Float64
+		rec.Result.OK = rec.Result.Received > 0
+		rec.Result.Error = errStr.String
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {

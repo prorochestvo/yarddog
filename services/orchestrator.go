@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prorochestvo/yarddog/domain"
@@ -23,8 +24,21 @@ import (
 // strictly best-effort and never influences the exit code below, and
 // collectMetrics bounds mc.Collect by defaultMetricsTimeout so a wedged
 // sensor read can never delay the reboot decision either.
-func Execute(ctx context.Context, settings Settings, repo RunRepository, metricsRepo MetricsRepository, chk Checker, rb Rebooter, nt Notifier, mc MetricsCollector, clk Clock, mode string) int {
-	r := &runner{settings: settings, repo: repo, metricsRepo: metricsRepo, checker: chk, rebooter: rb, notifier: nt, metrics: mc, clock: clk, metricsTimeout: defaultMetricsTimeout}
+func Execute(ctx context.Context, settings Settings, repo RunRepository, metricsRepo MetricsRepository, pingRepo PingRepository, chk Checker, rb Rebooter, nt Notifier, mc MetricsCollector, pc PingCollector, clk Clock, mode string) int {
+	r := &runner{
+		settings:       settings,
+		repo:           repo,
+		metricsRepo:    metricsRepo,
+		pingRepo:       pingRepo,
+		checker:        chk,
+		rebooter:       rb,
+		notifier:       nt,
+		metrics:        mc,
+		pings:          pc,
+		clock:          clk,
+		metricsTimeout: defaultMetricsTimeout,
+		pingTimeout:    defaultPingTimeout,
+	}
 	return r.run(ctx, mode)
 }
 
@@ -34,12 +48,15 @@ type runner struct {
 	settings       Settings
 	repo           RunRepository
 	metricsRepo    MetricsRepository
+	pingRepo       PingRepository
 	checker        Checker
 	rebooter       Rebooter
 	notifier       Notifier
 	metrics        MetricsCollector
+	pings          PingCollector
 	clock          Clock
 	metricsTimeout time.Duration
+	pingTimeout    time.Duration
 }
 
 // collectMetrics takes and persists one telemetry snapshot for runID, unless
@@ -80,6 +97,64 @@ func (r *runner) collectMetrics(ctx context.Context, runID int64) {
 	}
 }
 
+// collectPings takes and persists one round of ping probes for runID, unless
+// PING_ENABLED (settings.PingEnabled, derived from PING_HOSTS being
+// non-empty) is off — mirroring collectMetrics exactly (issue #2). It runs
+// pc.Collect in its own goroutine, bounded by pingTimeout and guarded by
+// recover(): a wedged ping exec can leave that goroutine parked forever, but
+// collectPings itself always returns within the timeout so the run still
+// reaches its reboot decision, and a collector panic is logged instead of
+// crashing the process. A SavePings failure is only logged too: ping
+// telemetry is strictly best-effort and must never change a run's outcome
+// or exit code.
+func (r *runner) collectPings(ctx context.Context, runID int64) {
+	if !r.settings.PingEnabled {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, r.pingTimeout)
+	defer cancel()
+
+	results := make(chan []domain.PingResult, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				r.logf("ping collector panicked for run %d: %v", runID, p)
+			}
+		}()
+		results <- r.pings.Collect(ctx)
+	}()
+
+	select {
+	case rs := <-results:
+		if err := r.pingRepo.SavePings(ctx, runID, r.clock.Now(), rs); err != nil {
+			r.logf("save pings for run %d: %v", runID, err)
+		}
+	case <-ctx.Done():
+		r.logf("collect pings for run %d: %v (a hung ping collector must never block the reboot decision)", runID, ctx.Err())
+	}
+}
+
+// collectTelemetry takes the run's two best-effort snapshots — host metrics
+// and ping RTTs — concurrently. Both are independently bounded and
+// recover-guarded and neither can change the run's outcome, so running them in
+// parallel keeps the pre-reboot delay at max(metricsTimeout, pingTimeout)
+// rather than their sum: on an outage (exactly when a reboot is imminent) that
+// latency is added downtime, so it must not stack.
+func (r *runner) collectTelemetry(ctx context.Context, runID int64) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.collectMetrics(ctx, runID)
+	}()
+	go func() {
+		defer wg.Done()
+		r.collectPings(ctx, runID)
+	}()
+	wg.Wait()
+}
+
 // finishRebootDisabled records a run that would otherwise have rebooted but
 // REBOOT_ENABLED is off (plans/003-host-telemetry.md: monitor-only mode).
 // Exit stays domain.ExitOK: the reboot path was never entered, so none of
@@ -118,13 +193,13 @@ func (r *runner) finishRebootFailed(ctx context.Context, runID int64, rebootErr 
 }
 
 // finishRecoverySuccess records the internet's return and sends the final
-// reboot-completed message. downtime is reboot_started_at -> now (design §5;
-// not router_down -> router_up and not the run's whole wall-clock), and the
-// end-of-loop flush (design §5 step 7) delivers any "starting"/"down"/"up"
-// message that couldn't be sent live while the internet was still down.
-func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, rebootStartedAt, now time.Time) int {
-	downtime := domain.Downtime(rebootStartedAt, now)
-	r.notify(ctx, fmt.Sprintf("reboot completed, internet restored (downtime %s)", humanDuration(downtime)))
+// reboot-completed message. The end-of-loop flush (design §5 step 7) delivers
+// the "initiated" message if it couldn't be sent live while the internet was
+// still down. Duration is intentionally omitted from the alert: it is
+// persisted (reboot_started_at -> internet_restored_at) and served by the
+// daemon query API, so the message stays brief (issue #1).
+func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, now time.Time) int {
+	r.notify(ctx, "completed, internet restored")
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
 	}
@@ -151,24 +226,24 @@ func (r *runner) finishRecoveryTimeout(ctx context.Context, runID int64, now tim
 	return domain.ExitRecoveryTimeout
 }
 
-// handleGatewayTransition emits the edge-triggered down/up messages (design
-// §5): a message fires only the first time the gateway's reachability flips,
-// tracked via *alive across ticks. If the router cycles between two polls
-// (the "fast reboot" case), gw.OK is already true again by the time it's next
-// observed, alive was never flipped to false, and no message fires at all —
-// only the final "reboot completed" message (finishRecoverySuccess) reports
-// the reboot happened.
+// handleGatewayTransition records the edge-triggered down/up timestamps (design
+// §5): RouterDownAt/RouterUpAt are written only the first time the gateway's
+// reachability flips, tracked via *alive across ticks. These transitions are no
+// longer announced over Telegram (issue #1: the reboot flow emits only the
+// "initiated" and "completed" messages) — only the timestamps are persisted,
+// still feeding the data model and the daemon query API. If the router cycles
+// between two polls (the "fast reboot" case), gw.OK is already true again by
+// the time it's next observed, alive was never flipped to false, and neither
+// timestamp is written.
 func (r *runner) handleGatewayTransition(ctx context.Context, runID int64, alive *bool, gw domain.TargetResult, now time.Time) {
 	switch {
 	case *alive && !gw.OK:
 		*alive = false
-		r.notify(ctx, "router went down")
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterDownAt: &now}); err != nil {
 			r.logf("update run %d: %v", runID, err)
 		}
 	case !*alive && gw.OK:
 		*alive = true
-		r.notify(ctx, "router is up, waiting for internet")
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterUpAt: &now}); err != nil {
 			r.logf("update run %d: %v", runID, err)
 		}
@@ -185,7 +260,7 @@ func (r *runner) hardFlow(ctx context.Context, startedAt time.Time) int {
 		r.logf("insert run: %v", err)
 		return domain.ExitConfigError
 	}
-	r.collectMetrics(ctx, runID)
+	r.collectTelemetry(ctx, runID)
 
 	if !r.settings.RebootEnabled {
 		return r.finishRebootDisabled(ctx, runID, "reboot disabled (monitor-only): skipping scheduled hard reboot")
@@ -252,7 +327,7 @@ func (r *runner) rebootSequence(ctx context.Context, runID int64, reason string)
 		r.logf("update run %d: %v", runID, err)
 	}
 
-	r.notify(ctx, fmt.Sprintf("starting router reboot (reason: %s)", reason))
+	r.notify(ctx, fmt.Sprintf("initiated (reason: %s)", reason))
 
 	if err := r.rebooter.Reboot(ctx); err != nil {
 		return r.finishRebootFailed(ctx, runID, err)
@@ -287,7 +362,7 @@ func (r *runner) recoveryLoop(ctx context.Context, runID int64, rebootStartedAt 
 		r.persistChecks(ctx, runID, domain.PhaseRecovery, inet.Targets)
 
 		if !inet.Down {
-			return r.finishRecoverySuccess(ctx, runID, rebootStartedAt, now)
+			return r.finishRecoverySuccess(ctx, runID, now)
 		}
 		if now.Sub(rebootStartedAt) >= r.settings.RecoveryTimeout {
 			return r.finishRecoveryTimeout(ctx, runID, now)
@@ -353,7 +428,7 @@ func (r *runner) softFlow(ctx context.Context, startedAt time.Time) int {
 		return domain.ExitConfigError
 	}
 	r.persistChecks(ctx, runID, domain.PhaseInitial, result.Targets)
-	r.collectMetrics(ctx, runID)
+	r.collectTelemetry(ctx, runID)
 
 	if internetOK {
 		outcome := domain.OutcomeOK
@@ -387,6 +462,15 @@ func (r *runner) softFlow(ctx context.Context, startedAt time.Time) int {
 // (host-telemetry P0 fix). It seeds runner.metricsTimeout in Execute; a test
 // shrinks that field directly instead of waiting out the real bound.
 const defaultMetricsTimeout = 10 * time.Second
+
+// defaultPingTimeout bounds one collectPings call (collector + save),
+// mirroring defaultMetricsTimeout: a wedged ping exec can never stall the run
+// ahead of the reboot decision (issue #2). It seeds runner.pingTimeout in
+// Execute; a test shrinks that field directly instead of waiting out the
+// real bound. It is longer than defaultMetricsTimeout since a ping round
+// against several hosts, each with its own multi-second -w/-t deadline, is
+// inherently slower than a local sensor read.
+const defaultPingTimeout = 15 * time.Second
 
 // humanDuration renders d rounded to the second as compact units with no
 // trailing zero component ("4m10s", "40m", "2h"), matching the message
