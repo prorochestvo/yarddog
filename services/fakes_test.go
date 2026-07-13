@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -98,18 +99,22 @@ func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 // newFakeRunRepo returns an empty fakeRunRepo ready to accept its first
 // InsertRun.
 func newFakeRunRepo() *fakeRunRepo {
-	return &fakeRunRepo{runs: make(map[int64]*domain.Run)}
+	return &fakeRunRepo{runs: make(map[string]*domain.Run)}
 }
 
 // fakeRunRepo is a dumb, settable in-memory stand-in for RunRepository
 // (Risk R2): GetLastRebootStartedAt never derives its answer from inserted
 // rows — a test sets lastRebootStartedAt/lastRebootOK/lastRebootErr directly
 // — and UpdateRun only ever applies non-nil RunUpdate fields onto the
-// in-memory row, never re-implementing any store SQL. The real cooldown
-// query is exercised for real against SQLite in
-// infrastructure/store_test.go.
+// in-memory row, never re-implementing any store SQL. ids are a simple
+// incrementing counter formatted as a string rather than a real UUIDv7
+// (issue #4): the fake only needs a unique, deterministic id per insert, not
+// the real generator's time-ordering or monotonic-counter guarantees, which
+// are exercised for real in infrastructure/uuid_test.go and
+// infrastructure/store_test.go. The real cooldown query is exercised for
+// real against SQLite in infrastructure/store_test.go.
 type fakeRunRepo struct {
-	runs   map[int64]*domain.Run
+	runs   map[string]*domain.Run
 	nextID int64
 
 	lastRebootStartedAt time.Time
@@ -128,28 +133,29 @@ func (f *fakeRunRepo) InsertCheck(_ context.Context, _ domain.Check) error {
 	return nil
 }
 
-func (f *fakeRunRepo) InsertRun(_ context.Context, startedAt time.Time, mode string, internetOK *bool) (int64, error) {
+func (f *fakeRunRepo) InsertRun(_ context.Context, startedAt time.Time, mode string, internetOK *bool) (string, error) {
 	f.nextID++
-	f.runs[f.nextID] = &domain.Run{ID: f.nextID, StartedAt: startedAt, Mode: mode, InternetOK: internetOK, Action: domain.ActionNone}
-	return f.nextID, nil
+	id := strconv.FormatInt(f.nextID, 10)
+	f.runs[id] = &domain.Run{ID: id, StartedAt: startedAt, Mode: mode, InternetOK: internetOK, Action: domain.ActionNone}
+	return id, nil
 }
 
 // run returns a copy of the in-memory row id for readback assertions,
 // failing the test if it was never inserted.
-func (f *fakeRunRepo) run(t *testing.T, id int64) domain.Run {
+func (f *fakeRunRepo) run(t *testing.T, id string) domain.Run {
 	t.Helper()
 
 	run, ok := f.runs[id]
 	if !ok {
-		t.Fatalf("fakeRunRepo: no run %d", id)
+		t.Fatalf("fakeRunRepo: no run %s", id)
 	}
 	return *run
 }
 
-func (f *fakeRunRepo) UpdateRun(_ context.Context, id int64, u domain.RunUpdate) error {
+func (f *fakeRunRepo) UpdateRun(_ context.Context, id string, u domain.RunUpdate) error {
 	run, ok := f.runs[id]
 	if !ok {
-		return fmt.Errorf("fakeRunRepo: no run %d", id)
+		return fmt.Errorf("fakeRunRepo: no run %s", id)
 	}
 
 	if u.Action != nil {
@@ -216,12 +222,12 @@ type fakeMetricsRepo struct {
 
 // metricsSave is one recorded fakeMetricsRepo.SaveMetrics call.
 type metricsSave struct {
-	runID int64
+	runID string
 	ts    time.Time
 	m     domain.HostMetrics
 }
 
-func (f *fakeMetricsRepo) SaveMetrics(_ context.Context, runID int64, ts time.Time, m domain.HostMetrics) error {
+func (f *fakeMetricsRepo) SaveMetrics(_ context.Context, runID string, ts time.Time, m domain.HostMetrics) error {
 	f.calls = append(f.calls, metricsSave{runID: runID, ts: ts, m: m})
 	return f.err
 }
@@ -262,12 +268,12 @@ type fakePingRepo struct {
 
 // pingsSave is one recorded fakePingRepo.SavePings call.
 type pingsSave struct {
-	runID int64
+	runID string
 	ts    time.Time
 	rs    []domain.PingResult
 }
 
-func (f *fakePingRepo) SavePings(_ context.Context, runID int64, ts time.Time, rs []domain.PingResult) error {
+func (f *fakePingRepo) SavePings(_ context.Context, runID string, ts time.Time, rs []domain.PingResult) error {
 	f.calls = append(f.calls, pingsSave{runID: runID, ts: ts, rs: rs})
 	return f.err
 }

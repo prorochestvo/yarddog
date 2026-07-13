@@ -140,11 +140,14 @@ func (s *Server) handlePings(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRunByID answers GET /api/v1/runs/{id}: the run plus every checks
-// row recorded against it; 400 for a non-numeric id, 404 for an unknown one.
+// row recorded against it; 400 for an empty id, 404 for an unknown one. id
+// is an opaque UUIDv7 string (issue #4) — there is no numeric format to
+// validate beyond emptiness, so an arbitrary non-matching string simply
+// resolves to 404 rather than 400.
 func (s *Server) handleRunByID(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid run id")
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing run id")
 		return
 	}
 
@@ -221,9 +224,10 @@ func parseIntParam(q url.Values, key string, def int) (int, error) {
 
 // parseMetricsFilter builds a services.MetricsFilter from the request's
 // query params: since (RFC3339), collector (one of domain's seven), and
-// limit (int) are all optional. An unparseable value is reported as an
-// error the handler turns into a 400, never silently ignored or coerced
-// into "no filter".
+// limit (int) are all optional. archive (bool, issue #4) opts into spanning
+// the metrics_archive twin; omitted or false stays hot-only. An unparseable
+// value is reported as an error the handler turns into a 400, never
+// silently ignored or coerced into "no filter".
 func parseMetricsFilter(q url.Values) (services.MetricsFilter, error) {
 	var f services.MetricsFilter
 
@@ -255,14 +259,21 @@ func parseMetricsFilter(q url.Values) (services.MetricsFilter, error) {
 	}
 	f.IncludeEmpty = includeEmpty
 
+	includeArchive, err := parseBoolParam(q, "archive")
+	if err != nil {
+		return services.MetricsFilter{}, err
+	}
+	f.IncludeArchive = includeArchive
+
 	return f, nil
 }
 
 // parsePingsFilter builds a services.PingFilter from the request's query
 // params (issue #2): since (RFC3339), host, limit (int), and
-// include_unreachable (bool) are all optional. An unparseable value is
-// reported as an error the handler turns into a 400, never silently ignored
-// or coerced into "no filter".
+// include_unreachable (bool) are all optional. archive (bool, issue #4)
+// opts into spanning the pings_archive twin; omitted or false stays
+// hot-only. An unparseable value is reported as an error the handler turns
+// into a 400, never silently ignored or coerced into "no filter".
 func parsePingsFilter(q url.Values) (services.PingFilter, error) {
 	var f services.PingFilter
 
@@ -287,6 +298,12 @@ func parsePingsFilter(q url.Values) (services.PingFilter, error) {
 		return services.PingFilter{}, err
 	}
 	f.IncludeUnreachable = includeUnreachable
+
+	includeArchive, err := parseBoolParam(q, "archive")
+	if err != nil {
+		return services.PingFilter{}, err
+	}
+	f.IncludeArchive = includeArchive
 
 	return f, nil
 }

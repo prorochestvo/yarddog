@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/prorochestvo/yarddog/domain"
 	"github.com/prorochestvo/yarddog/gateway/router"
@@ -100,15 +101,22 @@ func run() int {
 		return domain.ExitConfigError
 	}
 
+	// roll-over and prune are cheap, run-boundary maintenance that bounds the
+	// hot read path (issue #4); they run ahead of the time-critical
+	// connectivity check, sharing one now. All three maintenance calls in
+	// this function are best-effort — logged, never fatal — so a hiccup
+	// never aborts the watchdog's real job.
 	clk := infrastructure.SystemClock{}
-	if err := st.PruneChecks(ctx, clk.Now(), cfg.RetentionDays); err != nil {
-		log.Printf("yarddog: prune checks: %v", err)
+	now := clk.Now()
+	if moved, err := st.RolloverToArchive(ctx, now, cfg.HotWindowDays); err != nil {
+		log.Printf("yarddog: rollover to archive: %v", err)
+	} else if moved > 0 {
+		log.Printf("yarddog: rollover to archive: moved %d run(s)", moved)
 	}
-	if err := st.PruneMetrics(ctx, clk.Now(), cfg.RetentionDays); err != nil {
-		log.Printf("yarddog: prune metrics: %v", err)
-	}
-	if err := st.PrunePings(ctx, clk.Now(), cfg.RetentionDays); err != nil {
-		log.Printf("yarddog: prune pings: %v", err)
+	if pruned, err := st.PruneArchive(ctx, now, cfg.RetentionDays); err != nil {
+		log.Printf("yarddog: prune archive: %v", err)
+	} else if pruned > 0 {
+		log.Printf("yarddog: prune archive: pruned %d run(s)", pruned)
 	}
 	if err := nt.Flush(ctx); err != nil {
 		log.Printf("yarddog: startup outbox flush: %v", err)
@@ -129,7 +137,21 @@ func run() int {
 		PingEnabled:      len(cfg.PingHosts) > 0,
 	}
 
-	return services.Execute(ctx, settings, st, st, st, chk, rb, nt, mc, pc, clk, mode)
+	code := services.Execute(ctx, settings, st, st, st, chk, rb, nt, mc, pc, clk, mode)
+
+	// MaybeVacuum runs only after the connectivity check/reboot decision is
+	// settled: a full VACUUM (issue #4: measured ~0.6s on an 81MB DB, worse
+	// on a Pi's SD/eMMC storage) must never sit in front of that decision.
+	// A fresh now here (rather than the startup one above) is more honest
+	// against the weekly cadence, though a stale one would be harmless too.
+	vacuumStart := clk.Now()
+	if ran, err := st.MaybeVacuum(ctx, vacuumStart); err != nil {
+		log.Printf("yarddog: vacuum: %v", err)
+	} else if ran {
+		log.Printf("yarddog: vacuum: completed in %s", clk.Now().Sub(vacuumStart).Round(time.Millisecond))
+	}
+
+	return code
 }
 
 // defaultEnvPath and fallbackEnvPath are config-independent constants: the

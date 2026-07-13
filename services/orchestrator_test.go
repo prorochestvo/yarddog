@@ -30,7 +30,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("messages sent = %v, want none", env.nt.messages)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Mode != domain.ModeSoft {
 			t.Fatalf("Mode = %q, want %q", run.Mode, domain.ModeSoft)
 		}
@@ -50,7 +50,7 @@ func TestExecute(t *testing.T) {
 		if env.mc.calls != 1 {
 			t.Fatalf("metrics collector calls = %d, want exactly 1", env.mc.calls)
 		}
-		if len(env.mr.calls) != 1 || env.mr.calls[0].runID != 1 {
+		if len(env.mr.calls) != 1 || env.mr.calls[0].runID != "1" {
 			t.Fatalf("metrics saves = %+v, want exactly one save for run 1", env.mr.calls)
 		}
 	})
@@ -80,7 +80,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("message = %q, want %q", env.nt.messages[0], want)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionSkippedCooldown {
 			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionSkippedCooldown)
 		}
@@ -122,7 +122,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("message = %q, want it to report the cooldown state as unknown", env.nt.messages[0])
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionSkippedCooldown {
 			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionSkippedCooldown)
 		}
@@ -159,7 +159,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("first message = %v, want it to carry reason \"no internet\"", env.nt.messages)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionReboot {
 			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionReboot)
 		}
@@ -185,7 +185,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("checker.Check calls = %d, want exactly 1 (the recovery tick, no initial check)", env.chk.checkCalls)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.InternetOK != nil {
 			t.Fatalf("InternetOK = %v, want nil (hard mode makes no initial check)", run.InternetOK)
 		}
@@ -193,7 +193,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("first message = %v, want it to carry reason \"scheduled hard reboot\"", env.nt.messages)
 		}
 
-		if env.mc.calls != 1 || len(env.mr.calls) != 1 || env.mr.calls[0].runID != 1 {
+		if env.mc.calls != 1 || len(env.mr.calls) != 1 || env.mr.calls[0].runID != "1" {
 			t.Fatalf("metrics collector calls = %d, saves = %+v, want exactly one save for run 1", env.mc.calls, env.mr.calls)
 		}
 	})
@@ -236,7 +236,7 @@ func TestExecute(t *testing.T) {
 			}
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeOK {
 			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeOK)
 		}
@@ -291,7 +291,7 @@ func TestExecute(t *testing.T) {
 			}
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.RouterDownAt != nil {
 			t.Fatalf("RouterDownAt = %v, want nil (transition never observed)", run.RouterDownAt)
 		}
@@ -321,7 +321,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("last message = %q, want %q", last, want)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeTimeout {
 			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeTimeout)
 		}
@@ -352,7 +352,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("last message = %q, want %q", last, want)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeRebootFailed {
 			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeRebootFailed)
 		}
@@ -381,7 +381,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("messages = %v, want exactly [%q]", env.nt.messages, want)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionSkippedDisabled {
 			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionSkippedDisabled)
 		}
@@ -418,7 +418,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("messages = %v, want exactly [%q]", env.nt.messages, want)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionSkippedDisabled {
 			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionSkippedDisabled)
 		}
@@ -446,7 +446,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("messages sent = %v, want none (reboot-disabled only diverges when a reboot would have happened)", env.nt.messages)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Action != domain.ActionNone {
 			t.Fatalf("Action = %q, want %q (byte-for-byte a normal up run)", run.Action, domain.ActionNone)
 		}
@@ -492,7 +492,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("Execute() = %d, want ExitOK (a SaveMetrics failure must never change the exit code)", code)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeOK {
 			t.Fatalf("Outcome = %q, want %q (a SaveMetrics failure must never change the run's outcome)", run.Outcome, domain.OutcomeOK)
 		}
@@ -537,7 +537,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("run() took %s, want it bounded by metricsTimeout (20ms), not a collector hang", elapsed)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeOK {
 			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeOK)
 		}
@@ -567,7 +567,7 @@ func TestExecute(t *testing.T) {
 			if env.pc.calls != 1 {
 				t.Fatalf("ping collector calls = %d, want exactly 1", env.pc.calls)
 			}
-			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != 1 {
+			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != "1" {
 				t.Fatalf("ping saves = %+v, want exactly one save for run 1", env.pr.calls)
 			}
 		})
@@ -588,7 +588,7 @@ func TestExecute(t *testing.T) {
 			if env.pc.calls != 1 {
 				t.Fatalf("ping collector calls = %d, want exactly 1", env.pc.calls)
 			}
-			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != 1 {
+			if len(env.pr.calls) != 1 || env.pr.calls[0].runID != "1" {
 				t.Fatalf("ping saves = %+v, want exactly one save for run 1", env.pr.calls)
 			}
 		})
@@ -627,7 +627,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("Execute() = %d, want ExitOK (a SavePings failure must never change the exit code)", code)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeOK {
 			t.Fatalf("Outcome = %q, want %q (a SavePings failure must never change the run's outcome)", run.Outcome, domain.OutcomeOK)
 		}
@@ -672,7 +672,7 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("run() took %s, want it bounded by pingTimeout (20ms), not a collector hang", elapsed)
 		}
 
-		run := env.repo.run(t, 1)
+		run := env.repo.run(t, "1")
 		if run.Outcome != domain.OutcomeOK {
 			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeOK)
 		}

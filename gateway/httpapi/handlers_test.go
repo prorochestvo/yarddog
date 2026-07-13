@@ -117,7 +117,7 @@ func TestParseMetricsFilter(t *testing.T) {
 	t.Run("every param set parses correctly", func(t *testing.T) {
 		t.Parallel()
 
-		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&collector=cpu&limit=5&include_empty=true")
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&collector=cpu&limit=5&include_empty=true&archive=true")
 		if err != nil {
 			t.Fatalf("ParseQuery: %v", err)
 		}
@@ -139,6 +139,9 @@ func TestParseMetricsFilter(t *testing.T) {
 		if !f.IncludeEmpty {
 			t.Errorf("IncludeEmpty = false, want true")
 		}
+		if !f.IncludeArchive {
+			t.Errorf("IncludeArchive = false, want true")
+		}
 	})
 
 	t.Run("every param absent is the zero filter", func(t *testing.T) {
@@ -148,7 +151,7 @@ func TestParseMetricsFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseMetricsFilter() error = %v", err)
 		}
-		if !f.Since.IsZero() || f.Collector != "" || f.Limit != 0 || f.IncludeEmpty {
+		if !f.Since.IsZero() || f.Collector != "" || f.Limit != 0 || f.IncludeEmpty || f.IncludeArchive {
 			t.Fatalf("parseMetricsFilter(empty) = %+v, want the zero value", f)
 		}
 	})
@@ -159,6 +162,15 @@ func TestParseMetricsFilter(t *testing.T) {
 		q, _ := url.ParseQuery("include_empty=maybe")
 		if _, err := parseMetricsFilter(q); err == nil {
 			t.Fatal("parseMetricsFilter() error = nil, want error for an invalid include_empty")
+		}
+	})
+
+	t.Run("an unparseable archive errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("archive=maybe")
+		if _, err := parseMetricsFilter(q); err == nil {
+			t.Fatal("parseMetricsFilter() error = nil, want error for an invalid archive")
 		}
 	})
 
@@ -194,7 +206,7 @@ func TestParsePingsFilter(t *testing.T) {
 	t.Run("every param set parses correctly", func(t *testing.T) {
 		t.Parallel()
 
-		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&host=1.1.1.1&limit=5&include_unreachable=true")
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&host=1.1.1.1&limit=5&include_unreachable=true&archive=true")
 		if err != nil {
 			t.Fatalf("ParseQuery: %v", err)
 		}
@@ -216,6 +228,9 @@ func TestParsePingsFilter(t *testing.T) {
 		if !f.IncludeUnreachable {
 			t.Errorf("IncludeUnreachable = false, want true")
 		}
+		if !f.IncludeArchive {
+			t.Errorf("IncludeArchive = false, want true")
+		}
 	})
 
 	t.Run("every param absent is the zero filter", func(t *testing.T) {
@@ -225,7 +240,7 @@ func TestParsePingsFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parsePingsFilter() error = %v", err)
 		}
-		if !f.Since.IsZero() || f.Host != "" || f.Limit != 0 || f.IncludeUnreachable {
+		if !f.Since.IsZero() || f.Host != "" || f.Limit != 0 || f.IncludeUnreachable || f.IncludeArchive {
 			t.Fatalf("parsePingsFilter(empty) = %+v, want the zero value", f)
 		}
 	})
@@ -236,6 +251,15 @@ func TestParsePingsFilter(t *testing.T) {
 		q, _ := url.ParseQuery("include_unreachable=maybe")
 		if _, err := parsePingsFilter(q); err == nil {
 			t.Fatal("parsePingsFilter() error = nil, want error for an invalid include_unreachable")
+		}
+	})
+
+	t.Run("an unparseable archive errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("archive=maybe")
+		if _, err := parsePingsFilter(q); err == nil {
+			t.Fatal("parsePingsFilter() error = nil, want error for an invalid archive")
 		}
 	})
 
@@ -278,8 +302,8 @@ func TestServer_handlePings(t *testing.T) {
 
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{listPings: []domain.PingRecord{
-			{RunID: 2, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
-			{RunID: 1, TS: ts.Add(-time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 20, OK: true}},
+			{RunID: "2", TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
+			{RunID: "1", TS: ts.Add(-time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 20, OK: true}},
 		}}
 		srv := newTestServer(repo, "tok")
 
@@ -290,7 +314,7 @@ func TestServer_handlePings(t *testing.T) {
 
 		var body dto.PingsListResponse
 		decodeJSON(t, rec, &body)
-		if len(body.Pings) != 2 || body.Pings[0].RunID != 2 || body.Pings[1].RunID != 1 {
+		if len(body.Pings) != 2 || body.Pings[0].RunID != "2" || body.Pings[1].RunID != "1" {
 			t.Fatalf("body.Pings = %+v, want run 2 before run 1 (newest first)", body.Pings)
 		}
 	})
@@ -298,7 +322,7 @@ func TestServer_handlePings(t *testing.T) {
 	t.Run("?host= is parsed and forwarded", func(t *testing.T) {
 		t.Parallel()
 
-		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: 1, Result: domain.PingResult{Host: "8.8.8.8", OK: true, Received: 1}}}}
+		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: "1", Result: domain.PingResult{Host: "8.8.8.8", OK: true, Received: 1}}}}
 		srv := newTestServer(repo, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?host=8.8.8.8", "tok")
@@ -317,7 +341,7 @@ func TestServer_handlePings(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeRepo{listPings: []domain.PingRecord{
-			{RunID: 1, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
+			{RunID: "1", Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
 		}}
 		srv := newTestServer(repo, "tok")
 
@@ -336,7 +360,7 @@ func TestServer_handlePings(t *testing.T) {
 	t.Run("?limit= is parsed and forwarded", func(t *testing.T) {
 		t.Parallel()
 
-		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: 1, Result: domain.PingResult{Host: "1.1.1.1", OK: true, Received: 1}}}}
+		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: "1", Result: domain.PingResult{Host: "1.1.1.1", OK: true, Received: 1}}}}
 		srv := newTestServer(repo, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?limit=1", "tok")
@@ -384,6 +408,29 @@ func TestServer_handlePings(t *testing.T) {
 		srv := newTestServer(&fakeRepo{}, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?include_unreachable=maybe", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("?archive=true is parsed and forwarded", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: "1", Result: domain.PingResult{Host: "1.1.1.1", OK: true, Received: 1}}}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?archive=true", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("bad archive is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?archive=maybe", "tok")
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
@@ -467,7 +514,7 @@ func TestServer_handleLatestHost(t *testing.T) {
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{
 			latestHostOK: true,
-			latestHost:   domain.HostRecord{RunID: 128, TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}},
+			latestHost:   domain.HostRecord{RunID: "128", TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}},
 		}
 		srv := newTestServer(repo, "tok")
 
@@ -478,7 +525,7 @@ func TestServer_handleLatestHost(t *testing.T) {
 
 		var body dto.HostResponse
 		decodeJSON(t, rec, &body)
-		want := dto.HostResponse{RunID: 128, TS: "2026-07-07T04:07:00Z", Hostname: "pi5", OS: "linux", Arch: "arm64"}
+		want := dto.HostResponse{RunID: "128", TS: "2026-07-07T04:07:00Z", Hostname: "pi5", OS: "linux", Arch: "arm64"}
 		if body != want {
 			t.Fatalf("body = %+v, want %+v", body, want)
 		}
@@ -526,10 +573,10 @@ func TestServer_handleLatestMetrics(t *testing.T) {
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{
 			latestMetrics: []domain.MetricRecord{
-				{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
+				{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
 			},
 			latestHostOK: true,
-			latestHost:   domain.HostRecord{RunID: 128, TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "Ubuntu 26.04 LTS", Arch: "arm64"}},
+			latestHost:   domain.HostRecord{RunID: "128", TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "Ubuntu 26.04 LTS", Arch: "arm64"}},
 		}
 		srv := newTestServer(repo, "tok")
 
@@ -543,8 +590,8 @@ func TestServer_handleLatestMetrics(t *testing.T) {
 		if len(body.Metrics) != 1 {
 			t.Fatalf("body = %+v, want 1 metric", body)
 		}
-		if body.RunID != 128 || body.TS != "2026-07-07T04:07:00Z" {
-			t.Fatalf("body.RunID/TS = %d/%s, want 128/2026-07-07T04:07:00Z", body.RunID, body.TS)
+		if body.RunID != "128" || body.TS != "2026-07-07T04:07:00Z" {
+			t.Fatalf("body.RunID/TS = %s/%s, want 128/2026-07-07T04:07:00Z", body.RunID, body.TS)
 		}
 		if body.Host.Hostname != "pi5" || body.Host.OS != "Ubuntu 26.04 LTS" || body.Host.Arch != "arm64" {
 			t.Fatalf("body.Host = %+v, want {pi5 Ubuntu 26.04 LTS arm64}", body.Host)
@@ -557,11 +604,11 @@ func TestServer_handleLatestMetrics(t *testing.T) {
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{
 			latestMetrics: []domain.MetricRecord{
-				{RunID: 200, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
-				{RunID: 200, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}},
+				{RunID: "200", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
+				{RunID: "200", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}},
 			},
 			latestHostOK: true,
-			latestHost:   domain.HostRecord{RunID: 200, TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "Ubuntu 26.04 LTS", Arch: "arm64"}},
+			latestHost:   domain.HostRecord{RunID: "200", TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "Ubuntu 26.04 LTS", Arch: "arm64"}},
 		}
 		srv := newTestServer(repo, "tok")
 
@@ -617,7 +664,7 @@ func TestServer_handleLatestMetrics(t *testing.T) {
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{
 			latestMetrics: []domain.MetricRecord{
-				{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorUptime, Name: "uptime", Value: 3600, Unit: "seconds", OK: true}},
+				{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorUptime, Name: "uptime", Value: 3600, Unit: "seconds", OK: true}},
 			},
 			latestHostErr: errors.New("sql: no such table: host"),
 		}
@@ -648,7 +695,7 @@ func TestServer_handleMetrics(t *testing.T) {
 	t.Run("filters are parsed and forwarded to the query service", func(t *testing.T) {
 		t.Parallel()
 
-		repo := &fakeRepo{listMetrics: []domain.MetricRecord{{RunID: 1}}}
+		repo := &fakeRepo{listMetrics: []domain.MetricRecord{{RunID: "1"}}}
 		srv := newTestServer(repo, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?since=2026-07-01T00:00:00Z&collector=cpu&limit=5", "tok")
@@ -707,6 +754,29 @@ func TestServer_handleMetrics(t *testing.T) {
 		}
 	})
 
+	t.Run("?archive=true is parsed and forwarded", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeRepo{listMetrics: []domain.MetricRecord{{RunID: "1"}}}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?archive=true", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("bad archive is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?archive=maybe", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
 	t.Run("a repo error is 500 with a generic body", func(t *testing.T) {
 		t.Parallel()
 
@@ -726,9 +796,9 @@ func TestServer_handleRunByID(t *testing.T) {
 		startedAt := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		repo := &fakeRepo{
 			runByIDOK: true,
-			runByID:   domain.Run{ID: 128, StartedAt: startedAt, Mode: domain.ModeSoft, Outcome: domain.OutcomeOK},
+			runByID:   domain.Run{ID: "128", StartedAt: startedAt, Mode: domain.ModeSoft, Outcome: domain.OutcomeOK},
 			listChecks: []domain.Check{
-				{RunID: 128, TS: startedAt, Phase: domain.PhaseInitial, Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true},
+				{RunID: "128", TS: startedAt, Phase: domain.PhaseInitial, Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true},
 			},
 		}
 		srv := newTestServer(repo, "tok")
@@ -740,8 +810,8 @@ func TestServer_handleRunByID(t *testing.T) {
 
 		var body dto.RunDetailResponse
 		decodeJSON(t, rec, &body)
-		if body.Run.ID != 128 {
-			t.Fatalf("Run.ID = %d, want 128", body.Run.ID)
+		if body.Run.ID != "128" {
+			t.Fatalf("Run.ID = %q, want %q", body.Run.ID, "128")
 		}
 		if len(body.Checks) != 1 || body.Checks[0].Target != "1.1.1.1:443" {
 			t.Fatalf("Checks = %+v, want the one ip check", body.Checks)
@@ -765,14 +835,42 @@ func TestServer_handleRunByID(t *testing.T) {
 		}
 	})
 
-	t.Run("non-numeric id is 400", func(t *testing.T) {
+	t.Run("an arbitrary non-matching id shape is still just a 404, not a 400", func(t *testing.T) {
+		t.Parallel()
+
+		// id is an opaque UUIDv7 string (issue #4): there is no numeric format
+		// left to reject, so a string that would once have failed
+		// strconv.ParseInt now resolves like any other unmatched id.
+		srv := newTestServer(&fakeRepo{runByIDOK: false}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/runs/not-a-uuid", "tok")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("empty id is 400", func(t *testing.T) {
 		t.Parallel()
 
 		srv := newTestServer(&fakeRepo{}, "tok")
 
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/runs/not-a-number", "tok")
+		// handleRunByID's own defensive check, exercised directly: a real
+		// request can never reach it with an empty {id} in practice, since
+		// the registered ".../{id}" mux pattern requires a non-empty segment.
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/", nil)
+		req.SetPathValue("id", "")
+		rec := httptest.NewRecorder()
+
+		srv.handleRunByID(rec, req)
+
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+
+		var body dto.ErrorResponse
+		decodeJSON(t, rec, &body)
+		if body.Error != "missing run id" {
+			t.Fatalf("Error = %q, want %q", body.Error, "missing run id")
 		}
 	})
 
@@ -807,7 +905,7 @@ func TestServer_handleRuns(t *testing.T) {
 		t.Parallel()
 
 		startedAt := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
-		repo := &fakeRepo{listRuns: []domain.Run{{ID: 1, StartedAt: startedAt, Mode: domain.ModeSoft, Action: domain.ActionNone, Outcome: domain.OutcomeOK}}}
+		repo := &fakeRepo{listRuns: []domain.Run{{ID: "1", StartedAt: startedAt, Mode: domain.ModeSoft, Action: domain.ActionNone, Outcome: domain.OutcomeOK}}}
 		srv := newTestServer(repo, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/runs?limit=10", "tok")
@@ -820,7 +918,7 @@ func TestServer_handleRuns(t *testing.T) {
 		if len(body.Runs) != 1 {
 			t.Fatalf("body = %+v, want 1 run", body)
 		}
-		if body.Runs[0].ID != 1 || body.Runs[0].StartedAt != "2026-07-07T04:07:00Z" {
+		if body.Runs[0].ID != "1" || body.Runs[0].StartedAt != "2026-07-07T04:07:00Z" {
 			t.Fatalf("Runs[0] = %+v, want id=1 started_at=2026-07-07T04:07:00Z", body.Runs[0])
 		}
 	})

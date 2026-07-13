@@ -53,10 +53,12 @@ type Clock interface {
 }
 
 // RunRepository is the run/check persistence the orchestrator consumes.
-// infrastructure.Store satisfies it.
+// infrastructure.Store satisfies it. InsertRun's returned id and UpdateRun's
+// id parameter are opaque UUIDv7 strings (issue #4) that the orchestrator
+// only ever threads through, never inspects.
 type RunRepository interface {
-	InsertRun(ctx context.Context, startedAt time.Time, mode string, internetOK *bool) (int64, error)
-	UpdateRun(ctx context.Context, id int64, u domain.RunUpdate) error
+	InsertRun(ctx context.Context, startedAt time.Time, mode string, internetOK *bool) (string, error)
+	UpdateRun(ctx context.Context, id string, u domain.RunUpdate) error
 	InsertCheck(ctx context.Context, c domain.Check) error
 	GetLastRebootStartedAt(ctx context.Context) (time.Time, bool, error)
 }
@@ -71,9 +73,10 @@ type MetricsCollector interface {
 }
 
 // MetricsRepository is the metrics/host persistence the orchestrator
-// consumes. infrastructure.Store satisfies it.
+// consumes. infrastructure.Store satisfies it. runID is the opaque UUIDv7
+// string InsertRun returned (issue #4).
 type MetricsRepository interface {
-	SaveMetrics(ctx context.Context, runID int64, ts time.Time, m domain.HostMetrics) error
+	SaveMetrics(ctx context.Context, runID string, ts time.Time, m domain.HostMetrics) error
 }
 
 // PingCollector takes one round of ICMP ping probes (issue #2). It never
@@ -86,12 +89,13 @@ type PingCollector interface {
 }
 
 // PingRepository is the ping persistence the orchestrator consumes.
-// infrastructure.Store satisfies it.
+// infrastructure.Store satisfies it. runID is the opaque UUIDv7 string
+// InsertRun returned (issue #4).
 type PingRepository interface {
-	SavePings(ctx context.Context, runID int64, ts time.Time, results []domain.PingResult) error
+	SavePings(ctx context.Context, runID string, ts time.Time, results []domain.PingResult) error
 }
 
-// OutboxRepository is the tg_outbox persistence OutboxService consumes.
+// OutboxRepository is the tbot_queue persistence OutboxService consumes.
 // infrastructure.Store satisfies it.
 type OutboxRepository interface {
 	EnqueueOutboxMessage(ctx context.Context, createdAt time.Time, text string) (int64, error)

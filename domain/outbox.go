@@ -2,7 +2,7 @@ package domain
 
 import "time"
 
-// OutboxMessage is one row of the tg_outbox table, as returned by
+// OutboxMessage is one row of the tbot_queue table, as returned by
 // OutboxRepository.ListUnsentOutboxMessages.
 type OutboxMessage struct {
 	ID        int64

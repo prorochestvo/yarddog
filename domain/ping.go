@@ -19,9 +19,10 @@ type PingResult struct {
 }
 
 // PingRecord is a persisted pings table row: PingResult plus the run it was
-// captured on, analogous to how MetricRecord wraps MetricSample.
+// captured on, analogous to how MetricRecord wraps MetricSample. RunID is
+// the owning run's UUIDv7 string id (issue #4).
 type PingRecord struct {
-	RunID  int64
+	RunID  string
 	TS     time.Time
 	Result PingResult
 }

@@ -69,7 +69,7 @@ type runner struct {
 // panic is logged instead of crashing the process. A SaveMetrics failure is
 // only logged too: telemetry is strictly best-effort and must never change a
 // run's outcome or exit code.
-func (r *runner) collectMetrics(ctx context.Context, runID int64) {
+func (r *runner) collectMetrics(ctx context.Context, runID string) {
 	if !r.settings.MetricsEnabled {
 		return
 	}
@@ -81,7 +81,7 @@ func (r *runner) collectMetrics(ctx context.Context, runID int64) {
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				r.logf("metrics collector panicked for run %d: %v", runID, p)
+				r.logf("metrics collector panicked for run %s: %v", runID, p)
 			}
 		}()
 		snapshots <- r.metrics.Collect(ctx)
@@ -90,10 +90,10 @@ func (r *runner) collectMetrics(ctx context.Context, runID int64) {
 	select {
 	case snapshot := <-snapshots:
 		if err := r.metricsRepo.SaveMetrics(ctx, runID, r.clock.Now(), snapshot); err != nil {
-			r.logf("save metrics for run %d: %v", runID, err)
+			r.logf("save metrics for run %s: %v", runID, err)
 		}
 	case <-ctx.Done():
-		r.logf("collect metrics for run %d: %v (a hung collector must never block the reboot decision)", runID, ctx.Err())
+		r.logf("collect metrics for run %s: %v (a hung collector must never block the reboot decision)", runID, ctx.Err())
 	}
 }
 
@@ -107,7 +107,7 @@ func (r *runner) collectMetrics(ctx context.Context, runID int64) {
 // crashing the process. A SavePings failure is only logged too: ping
 // telemetry is strictly best-effort and must never change a run's outcome
 // or exit code.
-func (r *runner) collectPings(ctx context.Context, runID int64) {
+func (r *runner) collectPings(ctx context.Context, runID string) {
 	if !r.settings.PingEnabled {
 		return
 	}
@@ -119,7 +119,7 @@ func (r *runner) collectPings(ctx context.Context, runID int64) {
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				r.logf("ping collector panicked for run %d: %v", runID, p)
+				r.logf("ping collector panicked for run %s: %v", runID, p)
 			}
 		}()
 		results <- r.pings.Collect(ctx)
@@ -128,10 +128,10 @@ func (r *runner) collectPings(ctx context.Context, runID int64) {
 	select {
 	case rs := <-results:
 		if err := r.pingRepo.SavePings(ctx, runID, r.clock.Now(), rs); err != nil {
-			r.logf("save pings for run %d: %v", runID, err)
+			r.logf("save pings for run %s: %v", runID, err)
 		}
 	case <-ctx.Done():
-		r.logf("collect pings for run %d: %v (a hung ping collector must never block the reboot decision)", runID, ctx.Err())
+		r.logf("collect pings for run %s: %v (a hung ping collector must never block the reboot decision)", runID, ctx.Err())
 	}
 }
 
@@ -141,7 +141,7 @@ func (r *runner) collectPings(ctx context.Context, runID int64) {
 // parallel keeps the pre-reboot delay at max(metricsTimeout, pingTimeout)
 // rather than their sum: on an outage (exactly when a reboot is imminent) that
 // latency is added downtime, so it must not stack.
-func (r *runner) collectTelemetry(ctx context.Context, runID int64) {
+func (r *runner) collectTelemetry(ctx context.Context, runID string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -162,7 +162,7 @@ func (r *runner) collectTelemetry(ctx context.Context, runID int64) {
 // msg and the reboot_disabled outcome instead. notifier.Flush still runs: a
 // hard-mode monitor pass may have live internet and queued messages worth
 // draining even though this run itself never touches the router.
-func (r *runner) finishRebootDisabled(ctx context.Context, runID int64, msg string) int {
+func (r *runner) finishRebootDisabled(ctx context.Context, runID, msg string) int {
 	r.notify(ctx, msg)
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
@@ -172,7 +172,7 @@ func (r *runner) finishRebootDisabled(ctx context.Context, runID int64, msg stri
 	outcome := domain.OutcomeRebootDisabled
 	finishedAt := r.clock.Now()
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Action: &action, Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitOK
 }
@@ -180,14 +180,14 @@ func (r *runner) finishRebootDisabled(ctx context.Context, runID int64, msg stri
 // finishRebootFailed records rebooter.Reboot's error as the run's terminal
 // outcome (design §14: every reboot failure — bad login or an unconfirmed
 // reboot — maps to the same outcome regardless of which error caused it).
-func (r *runner) finishRebootFailed(ctx context.Context, runID int64, rebootErr error) int {
+func (r *runner) finishRebootFailed(ctx context.Context, runID string, rebootErr error) int {
 	r.notify(ctx, fmt.Sprintf("reboot failed: %v", rebootErr))
 
 	outcome := domain.OutcomeRebootFailed
 	errStr := rebootErr.Error()
 	finishedAt := r.clock.Now()
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, Error: &errStr, FinishedAt: &finishedAt}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitRebootFailed
 }
@@ -198,7 +198,7 @@ func (r *runner) finishRebootFailed(ctx context.Context, runID int64, rebootErr 
 // still down. Duration is intentionally omitted from the alert: it is
 // persisted (reboot_started_at -> internet_restored_at) and served by the
 // daemon query API, so the message stays brief (issue #1).
-func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, now time.Time) int {
+func (r *runner) finishRecoverySuccess(ctx context.Context, runID string, now time.Time) int {
 	r.notify(ctx, "completed, internet restored")
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
@@ -206,14 +206,14 @@ func (r *runner) finishRecoverySuccess(ctx context.Context, runID int64, now tim
 
 	outcome := domain.OutcomeOK
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{InternetRestoredAt: &now, Outcome: &outcome, FinishedAt: &now}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitOK
 }
 
 // finishRecoveryTimeout gives up after RECOVERY_TIMEOUT with the internet
 // still down (design §5 step 6).
-func (r *runner) finishRecoveryTimeout(ctx context.Context, runID int64, now time.Time) int {
+func (r *runner) finishRecoveryTimeout(ctx context.Context, runID string, now time.Time) int {
 	r.notify(ctx, fmt.Sprintf("internet still down after %s, giving up", humanDuration(r.settings.RecoveryTimeout)))
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
@@ -221,7 +221,7 @@ func (r *runner) finishRecoveryTimeout(ctx context.Context, runID int64, now tim
 
 	outcome := domain.OutcomeTimeout
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, FinishedAt: &now}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitRecoveryTimeout
 }
@@ -235,17 +235,17 @@ func (r *runner) finishRecoveryTimeout(ctx context.Context, runID int64, now tim
 // between two polls (the "fast reboot" case), gw.OK is already true again by
 // the time it's next observed, alive was never flipped to false, and neither
 // timestamp is written.
-func (r *runner) handleGatewayTransition(ctx context.Context, runID int64, alive *bool, gw domain.TargetResult, now time.Time) {
+func (r *runner) handleGatewayTransition(ctx context.Context, runID string, alive *bool, gw domain.TargetResult, now time.Time) {
 	switch {
 	case *alive && !gw.OK:
 		*alive = false
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterDownAt: &now}); err != nil {
-			r.logf("update run %d: %v", runID, err)
+			r.logf("update run %s: %v", runID, err)
 		}
 	case !*alive && gw.OK:
 		*alive = true
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RouterUpAt: &now}); err != nil {
-			r.logf("update run %d: %v", runID, err)
+			r.logf("update run %s: %v", runID, err)
 		}
 	}
 }
@@ -289,7 +289,7 @@ func (r *runner) notify(ctx context.Context, text string) {
 }
 
 // persistCheck writes one probed target as a checks row (design §9).
-func (r *runner) persistCheck(ctx context.Context, runID int64, phase string, tr domain.TargetResult) {
+func (r *runner) persistCheck(ctx context.Context, runID, phase string, tr domain.TargetResult) {
 	latencyMS := tr.Latency.Milliseconds()
 	c := domain.Check{
 		RunID:     runID,
@@ -302,12 +302,12 @@ func (r *runner) persistCheck(ctx context.Context, runID int64, phase string, tr
 		Error:     tr.Error,
 	}
 	if err := r.repo.InsertCheck(ctx, c); err != nil {
-		r.logf("insert check for run %d target %s: %v", runID, tr.Target, err)
+		r.logf("insert check for run %s target %s: %v", runID, tr.Target, err)
 	}
 }
 
 // persistChecks writes every probed target in trs as a checks row.
-func (r *runner) persistChecks(ctx context.Context, runID int64, phase string, trs []domain.TargetResult) {
+func (r *runner) persistChecks(ctx context.Context, runID, phase string, trs []domain.TargetResult) {
 	for _, tr := range trs {
 		r.persistCheck(ctx, runID, phase, tr)
 	}
@@ -317,14 +317,14 @@ func (r *runner) persistChecks(ctx context.Context, runID int64, phase string, t
 // §5): flush the outbox, announce the reboot, request it, then hand off to
 // the recovery loop. A rebooter.Reboot failure ends the run immediately —
 // there is nothing to recover from without a reboot having happened.
-func (r *runner) rebootSequence(ctx context.Context, runID int64, reason string) int {
+func (r *runner) rebootSequence(ctx context.Context, runID, reason string) int {
 	if err := r.notifier.Flush(ctx); err != nil {
 		r.logf("flush outbox: %v", err)
 	}
 
 	action := domain.ActionReboot
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Action: &action}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 
 	r.notify(ctx, fmt.Sprintf("initiated (reason: %s)", reason))
@@ -335,7 +335,7 @@ func (r *runner) rebootSequence(ctx context.Context, runID int64, reason string)
 
 	rebootStartedAt := r.clock.Now()
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{RebootStartedAt: &rebootStartedAt}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 
 	return r.recoveryLoop(ctx, runID, rebootStartedAt)
@@ -347,7 +347,7 @@ func (r *runner) rebootSequence(ctx context.Context, runID int64, reason string)
 // talking to the router — it was reachable a moment ago — so the first
 // transition handleGatewayTransition can observe is "went down", never a
 // spurious "is up" on the very first tick.
-func (r *runner) recoveryLoop(ctx context.Context, runID int64, rebootStartedAt time.Time) int {
+func (r *runner) recoveryLoop(ctx context.Context, runID string, rebootStartedAt time.Time) int {
 	alive := true
 
 	for {
@@ -383,14 +383,14 @@ func (r *runner) run(ctx context.Context, mode string) int {
 // skipCooldown records a reboot skipped because the last one is still within
 // REBOOT_COOLDOWN (design §6) — rebooting through a provider-side outage
 // would otherwise cycle the router every run for no benefit.
-func (r *runner) skipCooldown(ctx context.Context, runID int64, age time.Duration) int {
+func (r *runner) skipCooldown(ctx context.Context, runID string, age time.Duration) int {
 	r.notify(ctx, fmt.Sprintf("no internet, skipping reboot (cooldown: last reboot %s ago)", humanDuration(age)))
 
 	action := domain.ActionSkippedCooldown
 	outcome := domain.OutcomeSkipped
 	finishedAt := r.clock.Now()
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Action: &action, Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitSkippedCooldown
 }
@@ -402,7 +402,7 @@ func (r *runner) skipCooldown(ctx context.Context, runID int64, age time.Duratio
 // active" rather than silently bypassed. queryErr is a plain store error
 // (no router/Telegram secrets pass through this query) so it is safe to
 // include verbatim in the Telegram message and the run's error column.
-func (r *runner) skipCooldownUnknown(ctx context.Context, runID int64, queryErr error) int {
+func (r *runner) skipCooldownUnknown(ctx context.Context, runID string, queryErr error) int {
 	r.notify(ctx, fmt.Sprintf("no internet, skipping reboot (cooldown state unknown: %v)", queryErr))
 
 	action := domain.ActionSkippedCooldown
@@ -410,7 +410,7 @@ func (r *runner) skipCooldownUnknown(ctx context.Context, runID int64, queryErr 
 	errStr := queryErr.Error()
 	finishedAt := r.clock.Now()
 	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Action: &action, Outcome: &outcome, Error: &errStr, FinishedAt: &finishedAt}); err != nil {
-		r.logf("update run %d: %v", runID, err)
+		r.logf("update run %s: %v", runID, err)
 	}
 	return domain.ExitSkippedCooldown
 }
@@ -434,7 +434,7 @@ func (r *runner) softFlow(ctx context.Context, startedAt time.Time) int {
 		outcome := domain.OutcomeOK
 		finishedAt := r.clock.Now()
 		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
-			r.logf("update run %d: %v", runID, err)
+			r.logf("update run %s: %v", runID, err)
 		}
 		return domain.ExitOK
 	}

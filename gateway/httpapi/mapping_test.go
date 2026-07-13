@@ -16,7 +16,7 @@ func TestCheckDTO(t *testing.T) {
 	t.Run("maps every field including latency", func(t *testing.T) {
 		t.Parallel()
 
-		c := domain.Check{RunID: 128, TS: ts, Phase: domain.PhaseInitial, Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, LatencyMS: &latency}
+		c := domain.Check{RunID: "128", TS: ts, Phase: domain.PhaseInitial, Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, LatencyMS: &latency}
 
 		got := checkDTO(c)
 
@@ -32,7 +32,7 @@ func TestCheckDTO(t *testing.T) {
 	t.Run("nil latency stays nil", func(t *testing.T) {
 		t.Parallel()
 
-		got := checkDTO(domain.Check{RunID: 1, TS: ts, Error: "timeout"})
+		got := checkDTO(domain.Check{RunID: "1", TS: ts, Error: "timeout"})
 
 		if got.LatencyMS != nil {
 			t.Fatalf("checkDTO().LatencyMS = %v, want nil", got.LatencyMS)
@@ -49,7 +49,7 @@ func TestCheckDTOs(t *testing.T) {
 	t.Run("maps every element in order", func(t *testing.T) {
 		t.Parallel()
 
-		checks := []domain.Check{{RunID: 1, Target: "a"}, {RunID: 1, Target: "b"}}
+		checks := []domain.Check{{RunID: "1", Target: "a"}, {RunID: "1", Target: "b"}}
 
 		got := checkDTOs(checks)
 
@@ -125,11 +125,11 @@ func TestHostDTO(t *testing.T) {
 	t.Parallel()
 
 	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
-	rec := domain.HostRecord{RunID: 128, TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}}
+	rec := domain.HostRecord{RunID: "128", TS: ts, Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}}
 
 	got := hostDTO(rec)
 
-	if got.RunID != 128 || got.TS != "2026-07-07T04:07:00Z" || got.Hostname != "pi5" || got.OS != "linux" || got.Arch != "arm64" {
+	if got.RunID != "128" || got.TS != "2026-07-07T04:07:00Z" || got.Hostname != "pi5" || got.OS != "linux" || got.Arch != "arm64" {
 		t.Fatalf("hostDTO() = %+v, unexpected mapping", got)
 	}
 }
@@ -152,7 +152,7 @@ func TestMetricDTO(t *testing.T) {
 	t.Run("an ok sample carries its value", func(t *testing.T) {
 		t.Parallel()
 
-		rec := domain.MetricRecord{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}}
+		rec := domain.MetricRecord{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}}
 
 		got := metricDTO(rec)
 
@@ -167,7 +167,7 @@ func TestMetricDTO(t *testing.T) {
 	t.Run("an unavailable sample has a nil value even though the domain struct's Value field is its zero value", func(t *testing.T) {
 		t.Parallel()
 
-		rec := domain.MetricRecord{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}}
+		rec := domain.MetricRecord{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}}
 
 		got := metricDTO(rec)
 
@@ -202,7 +202,7 @@ func TestMetricRowDTO(t *testing.T) {
 	t.Run("an ok sample carries its value and no run_id/ts field", func(t *testing.T) {
 		t.Parallel()
 
-		rec := domain.MetricRecord{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}}
+		rec := domain.MetricRecord{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}}
 
 		got := metricRowDTO(rec)
 
@@ -217,7 +217,7 @@ func TestMetricRowDTO(t *testing.T) {
 	t.Run("an unavailable sample has a nil value", func(t *testing.T) {
 		t.Parallel()
 
-		got := metricRowDTO(domain.MetricRecord{RunID: 128, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}})
+		got := metricRowDTO(domain.MetricRecord{RunID: "128", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}})
 
 		if got.Value != nil {
 			t.Fatalf("metricRowDTO().Value = %v, want nil for an unavailable sample", *got.Value)
@@ -233,8 +233,8 @@ func TestMetricRowDTOs(t *testing.T) {
 
 	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 	records := []domain.MetricRecord{
-		{RunID: 1, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
-		{RunID: 1, TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}},
+		{RunID: "1", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorTemperature, Name: "cpu-thermal", Value: 52.35, Unit: "celsius", OK: true}},
+		{RunID: "1", TS: ts, Sample: domain.MetricSample{Collector: domain.CollectorFans, Name: "fans", OK: false, Error: "no fan sensors present"}},
 	}
 
 	t.Run("drops unavailable rows by default", func(t *testing.T) {
@@ -272,7 +272,7 @@ func TestPingDTO(t *testing.T) {
 	t.Run("a reachable result carries its avg_ms", func(t *testing.T) {
 		t.Parallel()
 
-		rec := domain.PingRecord{RunID: 128, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
+		rec := domain.PingRecord{RunID: "128", TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
 
 		got := pingDTO(rec)
 
@@ -287,7 +287,7 @@ func TestPingDTO(t *testing.T) {
 	t.Run("an unreachable result has a nil avg_ms even though the domain struct's AvgMS field is its zero value", func(t *testing.T) {
 		t.Parallel()
 
-		rec := domain.PingRecord{RunID: 128, TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}}
+		rec := domain.PingRecord{RunID: "128", TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}}
 
 		got := pingDTO(rec)
 
@@ -321,8 +321,8 @@ func TestPingDTOs(t *testing.T) {
 
 		ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
 		records := []domain.PingRecord{
-			{RunID: 1, TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
-			{RunID: 1, TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
+			{RunID: "1", TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 10, OK: true}},
+			{RunID: "1", TS: ts, Result: domain.PingResult{Host: "unreachable.example", Sent: 5, Received: 0, OK: false, Error: "no route to host"}},
 		}
 
 		got := pingDTOs(records)
@@ -347,7 +347,7 @@ func TestRunDTO(t *testing.T) {
 	t.Run("every optional field nil stays nil", func(t *testing.T) {
 		t.Parallel()
 
-		r := domain.Run{ID: 128, StartedAt: startedAt, Mode: domain.ModeHard, Action: domain.ActionNone}
+		r := domain.Run{ID: "128", StartedAt: startedAt, Mode: domain.ModeHard, Action: domain.ActionNone}
 
 		got := runDTO(r)
 
@@ -366,7 +366,7 @@ func TestRunDTO(t *testing.T) {
 		internetOK := true
 		finishedAt := startedAt.Add(3 * time.Second)
 		r := domain.Run{
-			ID: 128, StartedAt: startedAt, Mode: domain.ModeSoft, InternetOK: &internetOK,
+			ID: "128", StartedAt: startedAt, Mode: domain.ModeSoft, InternetOK: &internetOK,
 			Action: domain.ActionReboot, RebootStartedAt: &startedAt, FinishedAt: &finishedAt,
 			Outcome: domain.OutcomeOK,
 		}
@@ -404,11 +404,11 @@ func TestRunDTOs(t *testing.T) {
 	t.Run("maps every element in order", func(t *testing.T) {
 		t.Parallel()
 
-		runs := []domain.Run{{ID: 1}, {ID: 2}}
+		runs := []domain.Run{{ID: "1"}, {ID: "2"}}
 
 		got := runDTOs(runs)
 
-		if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
+		if len(got) != 2 || got[0].ID != "1" || got[1].ID != "2" {
 			t.Fatalf("runDTOs() = %+v, want ids [1, 2] in order", got)
 		}
 	})

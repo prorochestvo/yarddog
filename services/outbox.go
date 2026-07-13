@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// NewOutboxService builds an OutboxService over repo (the tg_outbox queue)
+// NewOutboxService builds an OutboxService over repo (the tbot_queue table)
 // and sender (the raw transport). It implements Notifier for the
 // orchestrator: every message is persisted before a send is attempted
 // (design §8.3), so a crash between "enqueue" and "send" never loses it.
@@ -15,7 +15,7 @@ func NewOutboxService(repo OutboxRepository, sender Sender) *OutboxService {
 }
 
 // OutboxService implements Notifier over the reliable-delivery outbox
-// pattern (design §8.3): a message is always written to tg_outbox before a
+// pattern (design §8.3): a message is always written to tbot_queue before a
 // send is attempted, since in soft mode the reboot begins with no internet
 // and the message that matters most ("starting reboot") cannot be delivered
 // live.
@@ -26,7 +26,7 @@ type OutboxService struct {
 
 var _ Notifier = (*OutboxService)(nil)
 
-// Flush drains every unsent tg_outbox row, oldest first, and attempts
+// Flush drains every unsent tbot_queue row, oldest first, and attempts
 // delivery (design §8.3). A row queued earlier is delivered with its
 // original queued time appended (`[queued HH:MM]`, derived from the row's
 // created_at, not the flush time) so a human sees when the event actually

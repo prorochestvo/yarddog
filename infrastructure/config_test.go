@@ -163,6 +163,70 @@ func TestLoadConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("HOT_WINDOW_DAYS default is 30", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeConfigFixture(t, requiredOnlyEnv())
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.HotWindowDays != 30 {
+			t.Fatalf("HotWindowDays = %d, want default 30", cfg.HotWindowDays)
+		}
+	})
+
+	t.Run("HOT_WINDOW_DAYS zero or negative clamps to 1", func(t *testing.T) {
+		t.Parallel()
+
+		for _, raw := range []string{"0", "-5"} {
+			env := requiredOnlyEnv()
+			env["HOT_WINDOW_DAYS"] = raw
+			path := writeConfigFixture(t, env)
+
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+			if cfg.HotWindowDays != 1 {
+				t.Fatalf("HotWindowDays (raw=%q) = %d, want clamped to 1", raw, cfg.HotWindowDays)
+			}
+		}
+	})
+
+	t.Run("HOT_WINDOW_DAYS above the ceiling clamps to maxHotWindowDays", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["HOT_WINDOW_DAYS"] = "999999999"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.HotWindowDays != maxHotWindowDays {
+			t.Fatalf("HotWindowDays = %d, want clamped to maxHotWindowDays (%d) — issue #4 FIX 7 guards against `days * 24 * time.Hour` overflowing int64", cfg.HotWindowDays, maxHotWindowDays)
+		}
+	})
+
+	t.Run("invalid HOT_WINDOW_DAYS returns an error naming it", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["HOT_WINDOW_DAYS"] = "forever"
+		path := writeConfigFixture(t, env)
+
+		_, err := LoadConfig(path)
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil, want error for invalid HOT_WINDOW_DAYS")
+		}
+		if !strings.Contains(err.Error(), "HOT_WINDOW_DAYS") {
+			t.Fatalf("LoadConfig() error = %q, want it to mention HOT_WINDOW_DAYS", err)
+		}
+	})
+
 	t.Run("explicit ROUTER_KIND is parsed onto Config", func(t *testing.T) {
 		t.Parallel()
 
@@ -205,6 +269,22 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if cfg.RetentionDays != 0 {
 			t.Fatalf("RetentionDays = %d, want 0", cfg.RetentionDays)
+		}
+	})
+
+	t.Run("RETENTION_DAYS above the ceiling clamps to maxRetentionDays", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["RETENTION_DAYS"] = "999999999"
+		path := writeConfigFixture(t, env)
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.RetentionDays != maxRetentionDays {
+			t.Fatalf("RetentionDays = %d, want clamped to maxRetentionDays (%d) — issue #4 FIX 7 guards against `days * 24 * time.Hour` overflowing int64", cfg.RetentionDays, maxRetentionDays)
 		}
 	})
 

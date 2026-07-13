@@ -70,12 +70,27 @@ func LoadConfig(envPath string) (*Config, error) {
 		*d.dst = parsed
 	}
 
+	// RetentionDays now governs the *archive* tier only (issue #4): a run
+	// stays hot for HotWindowDays regardless of this value, and
+	// RolloverToArchive/PruneArchive are what actually apply it, deleting
+	// archived runs older than this many days. 0 keeps the archive forever,
+	// as before.
 	rawRetention := getOrDefault(get, "RETENTION_DAYS", defaultRetentionDays)
 	retention, err := strconv.Atoi(rawRetention)
 	if err != nil {
 		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"RETENTION_DAYS", rawRetention, err)
 	}
-	cfg.RetentionDays = retention
+	cfg.RetentionDays = clampRetentionDays(retention)
+
+	// HotWindowDays bounds the fast working set (issue #4): a run stays hot
+	// while its started_at is younger than this many days; RolloverToArchive
+	// moves anything older into the *_archive tables at collector startup.
+	rawHotWindow := getOrDefault(get, "HOT_WINDOW_DAYS", defaultHotWindowDays)
+	hotWindow, err := strconv.Atoi(rawHotWindow)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"HOT_WINDOW_DAYS", rawHotWindow, err)
+	}
+	cfg.HotWindowDays = clampHotWindowDays(hotWindow)
 
 	bools := []struct {
 		key string
@@ -142,6 +157,7 @@ type Config struct {
 	RecoveryTimeout  time.Duration
 	RebootCooldown   time.Duration
 	RetentionDays    int
+	HotWindowDays    int
 	RebootEnabled    bool
 	MetricsEnabled   bool
 	MetricsSettings  domain.MetricsSettings
@@ -161,10 +177,27 @@ const (
 	defaultRecoveryTimeout  = "15m"
 	defaultRebootCooldown   = "2h"
 	defaultRetentionDays    = "90"
+	defaultHotWindowDays    = "30"
 	defaultMetricsDiskMount = "/"
 	defaultPingHosts        = ""
 	defaultPingCount        = "5"
 	defaultPingTimeout      = "4s"
+
+	// minHotWindowDays floors HOT_WINDOW_DAYS (issue #4): there is no
+	// "disable roll-over" mode — unbounded hot growth is the bug this knob
+	// fixes — so the floor is 1, not 0. maxHotWindowDays and maxRetentionDays
+	// (issue #4 FIX 7) ceiling HOT_WINDOW_DAYS/RETENTION_DAYS well under the
+	// ~106751-day point at which `time.Duration(days) * 24 * time.Hour`
+	// silently overflows int64 and wraps negative — turning "keep almost
+	// everything" into a cutoff in the far future that would instead delete
+	// everything on the next RolloverToArchive/PruneArchive. 100000 days
+	// (~274 years) is already an absurd "keep forever" value in practice,
+	// so the ceiling costs a legitimate operator nothing. RETENTION_DAYS has
+	// no matching floor: <=0 is its documented "keep forever" sentinel
+	// (PruneArchive), not an operator mistake to correct upward.
+	minHotWindowDays = 1
+	maxHotWindowDays = 100000
+	maxRetentionDays = 100000
 
 	// minPingCount and maxPingCount bound PING_COUNT (issue #2): too few
 	// probes make the average noisy, too many turn a per-run collector into
@@ -182,6 +215,34 @@ const (
 	minPingTimeout = 1 * time.Second
 	maxPingTimeout = 10 * time.Second
 )
+
+// clampHotWindowDays floors HOT_WINDOW_DAYS at minHotWindowDays (1) rather
+// than failing startup over an operator's 0 or negative value — matching
+// clampPingCount's "clamp, don't error" philosophy — and ceilings it at
+// maxHotWindowDays (issue #4 FIX 7) to keep the day count well clear of the
+// point where a downstream `* 24 * time.Hour` conversion would overflow
+// int64.
+func clampHotWindowDays(n int) int {
+	if n < minHotWindowDays {
+		return minHotWindowDays
+	}
+	if n > maxHotWindowDays {
+		return maxHotWindowDays
+	}
+	return n
+}
+
+// clampRetentionDays ceilings RETENTION_DAYS at maxRetentionDays (issue #4
+// FIX 7), the same overflow guard as clampHotWindowDays. Unlike
+// HOT_WINDOW_DAYS there is no floor: <=0 is RETENTION_DAYS's documented
+// "keep the archive forever" sentinel (PruneArchive), a valid operator
+// choice rather than a value to correct upward.
+func clampRetentionDays(n int) int {
+	if n > maxRetentionDays {
+		return maxRetentionDays
+	}
+	return n
+}
 
 // clampPingCount bounds PING_COUNT to [minPingCount, maxPingCount], silently
 // correcting an out-of-range operator value rather than failing startup over
