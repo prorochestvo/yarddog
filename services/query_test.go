@@ -17,7 +17,7 @@ func TestQueryService_LatestHost(t *testing.T) {
 	t.Run("delegates straight through", func(t *testing.T) {
 		t.Parallel()
 
-		want := domain.HostRecord{RunID: 5, Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}}
+		want := domain.HostRecord{RunID: "5", Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}}
 		repo := &fakeHistoryRepository{latestHostResult: want, latestHostOK: true}
 		q := NewQueryService(repo)
 
@@ -68,7 +68,7 @@ func TestQueryService_LatestMetrics(t *testing.T) {
 	t.Run("delegates straight through", func(t *testing.T) {
 		t.Parallel()
 
-		repo := &fakeHistoryRepository{latestMetricsResult: []domain.MetricRecord{{RunID: 5}}}
+		repo := &fakeHistoryRepository{latestMetricsResult: []domain.MetricRecord{{RunID: "5"}}}
 		q := NewQueryService(repo)
 
 		got, err := q.LatestMetrics(t.Context())
@@ -143,6 +143,22 @@ func TestQueryService_Metrics(t *testing.T) {
 			t.Fatalf("Metrics() error = %v, want %v", err, wantErr)
 		}
 	})
+
+	t.Run("IncludeArchive is forwarded untouched", func(t *testing.T) {
+		t.Parallel()
+
+		for _, want := range []bool{true, false} {
+			repo := &fakeHistoryRepository{}
+			q := NewQueryService(repo)
+
+			if _, err := q.Metrics(t.Context(), MetricsFilter{IncludeArchive: want}); err != nil {
+				t.Fatalf("Metrics() error = %v", err)
+			}
+			if repo.listMetricsFilter.IncludeArchive != want {
+				t.Fatalf("repo received IncludeArchive = %v, want %v (forwarded untouched)", repo.listMetricsFilter.IncludeArchive, want)
+			}
+		}
+	})
 }
 
 func TestQueryService_Pings(t *testing.T) {
@@ -194,6 +210,22 @@ func TestQueryService_Pings(t *testing.T) {
 			t.Fatalf("Pings() error = %v, want %v", err, wantErr)
 		}
 	})
+
+	t.Run("IncludeArchive is forwarded untouched", func(t *testing.T) {
+		t.Parallel()
+
+		for _, want := range []bool{true, false} {
+			repo := &fakeHistoryRepository{}
+			q := NewQueryService(repo)
+
+			if _, err := q.Pings(t.Context(), PingFilter{IncludeArchive: want}); err != nil {
+				t.Fatalf("Pings() error = %v", err)
+			}
+			if repo.listPingsFilter.IncludeArchive != want {
+				t.Fatalf("repo received IncludeArchive = %v, want %v (forwarded untouched)", repo.listPingsFilter.IncludeArchive, want)
+			}
+		}
+	})
 }
 
 func TestQueryService_Run(t *testing.T) {
@@ -201,21 +233,21 @@ func TestQueryService_Run(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeHistoryRepository{
-			runByIDResult:    domain.Run{ID: 7},
+			runByIDResult:    domain.Run{ID: "7"},
 			runByIDOK:        true,
-			listChecksResult: []domain.Check{{RunID: 7, Target: "1.1.1.1:443"}},
+			listChecksResult: []domain.Check{{RunID: "7", Target: "1.1.1.1:443"}},
 		}
 		q := NewQueryService(repo)
 
-		run, checks, found, err := q.Run(t.Context(), 7)
+		run, checks, found, err := q.Run(t.Context(), "7")
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
 		if !found {
 			t.Fatal("Run() found = false, want true")
 		}
-		if run.ID != 7 {
-			t.Fatalf("Run() run.ID = %d, want 7", run.ID)
+		if run.ID != "7" {
+			t.Fatalf("Run() run.ID = %q, want %q", run.ID, "7")
 		}
 		if len(checks) != 1 {
 			t.Fatalf("Run() checks = %d rows, want 1", len(checks))
@@ -231,7 +263,7 @@ func TestQueryService_Run(t *testing.T) {
 		repo := &fakeHistoryRepository{runByIDOK: false}
 		q := NewQueryService(repo)
 
-		_, checks, found, err := q.Run(t.Context(), 999)
+		_, checks, found, err := q.Run(t.Context(), "999")
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -253,7 +285,7 @@ func TestQueryService_Run(t *testing.T) {
 		repo := &fakeHistoryRepository{runByIDErr: wantErr}
 		q := NewQueryService(repo)
 
-		_, checks, found, err := q.Run(t.Context(), 1)
+		_, checks, found, err := q.Run(t.Context(), "1")
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("Run() error = %v, want %v", err, wantErr)
 		}
@@ -273,13 +305,13 @@ func TestQueryService_Run(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{
-			runByIDResult: domain.Run{ID: 7},
+			runByIDResult: domain.Run{ID: "7"},
 			runByIDOK:     true,
 			listChecksErr: wantErr,
 		}
 		q := NewQueryService(repo)
 
-		_, _, found, err := q.Run(t.Context(), 7)
+		_, _, found, err := q.Run(t.Context(), "7")
 		if !found {
 			t.Fatal("Run() found = false, want true (the run itself was found; only its checks errored)")
 		}
@@ -306,7 +338,7 @@ func TestQueryService_Runs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			repo := &fakeHistoryRepository{listRunsResult: []domain.Run{{ID: 1}}}
+			repo := &fakeHistoryRepository{listRunsResult: []domain.Run{{ID: "1"}}}
 			q := NewQueryService(repo)
 
 			got, err := q.Runs(t.Context(), tt.limit)
@@ -378,7 +410,7 @@ func (f *fakeHistoryRepository) LatestMetrics(context.Context) ([]domain.MetricR
 	return f.latestMetricsResult, f.latestMetricsErr
 }
 
-func (f *fakeHistoryRepository) ListChecksByRun(context.Context, int64) ([]domain.Check, error) {
+func (f *fakeHistoryRepository) ListChecksByRun(context.Context, string) ([]domain.Check, error) {
 	f.listChecksByRunCalls++
 	return f.listChecksResult, f.listChecksErr
 }
@@ -398,6 +430,6 @@ func (f *fakeHistoryRepository) ListRuns(_ context.Context, limit int) ([]domain
 	return f.listRunsResult, f.listRunsErr
 }
 
-func (f *fakeHistoryRepository) RunByID(context.Context, int64) (domain.Run, bool, error) {
+func (f *fakeHistoryRepository) RunByID(context.Context, string) (domain.Run, bool, error) {
 	return f.runByIDResult, f.runByIDOK, f.runByIDErr
 }

@@ -90,7 +90,7 @@ func (f *fakeRepo) LatestMetrics(context.Context) ([]domain.MetricRecord, error)
 	return f.latestMetrics, f.latestMetricsErr
 }
 
-func (f *fakeRepo) ListChecksByRun(context.Context, int64) ([]domain.Check, error) {
+func (f *fakeRepo) ListChecksByRun(context.Context, string) ([]domain.Check, error) {
 	return f.listChecks, f.listChecksErr
 }
 
@@ -106,7 +106,7 @@ func (f *fakeRepo) ListRuns(context.Context, int) ([]domain.Run, error) {
 	return f.listRuns, f.listRunsErr
 }
 
-func (f *fakeRepo) RunByID(context.Context, int64) (domain.Run, bool, error) {
+func (f *fakeRepo) RunByID(context.Context, string) (domain.Run, bool, error) {
 	return f.runByID, f.runByIDOK, f.runByIDErr
 }
 

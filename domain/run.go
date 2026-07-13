@@ -39,11 +39,13 @@ const (
 )
 
 // Run is one row of the runs table (design §9), as returned by
-// RunRepository.GetRun. InternetOK is nil for a hard-mode run, which performs
-// no initial check; every *At field is nil until its phase transition has
-// happened.
+// RunRepository.GetRun. ID is a UUIDv7 string (issue #4: time-ordered, so
+// lexicographic and chronological order coincide) rather than an
+// autoincrement integer. InternetOK is nil for a hard-mode run, which
+// performs no initial check; every *At field is nil until its phase
+// transition has happened.
 type Run struct {
-	ID                 int64
+	ID                 string
 	StartedAt          time.Time
 	Mode               string
 	InternetOK         *bool
@@ -57,9 +59,10 @@ type Run struct {
 	Error              string
 }
 
-// Check is one row of the checks table (design §9).
+// Check is one row of the checks table (design §9). RunID is the owning
+// run's UUIDv7 string id (issue #4).
 type Check struct {
-	RunID     int64
+	RunID     string
 	TS        time.Time
 	Phase     string
 	Target    string

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -12,15 +13,16 @@ import (
 	"github.com/prorochestvo/yarddog/domain"
 	"github.com/prorochestvo/yarddog/services"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
-// NewStore opens the SQLite database at path with a single-connection pool —
-// it is OpenStore(ctx, path, 1). The collector and every :memory: test in
-// this codebase use NewStore; the daemon calls OpenStore directly with its
-// own configured pool size.
+// NewStore opens the SQLite database at path with a single-connection pool
+// and self-healing enabled — it is OpenStore(ctx, path, 1, true). The
+// collector and every :memory: test in this codebase use NewStore; the
+// daemon calls OpenStore directly with its own configured pool size and
+// selfHeal false (see OpenStore's own doc for why).
 func NewStore(ctx context.Context, path string) (*Store, error) {
-	return OpenStore(ctx, path, 1)
+	return OpenStore(ctx, path, 1, true)
 }
 
 // OpenStore opens (creating if absent) the SQLite database at path, applies
@@ -36,20 +38,83 @@ func NewStore(ctx context.Context, path string) (*Store, error) {
 // router credentials' error strings and must sit at the same permission bar
 // as the lock file and the .env file, not the umask default sql.Open would
 // otherwise leave it at.
-func OpenStore(ctx context.Context, path string, maxOpenConns int) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+//
+// Self-healing (issue #4 FIX 3) is gated behind selfHeal, granted only to
+// the database's sole writer: a file that fails to open/migrate with a
+// SQLITE_CORRUPT/SQLITE_NOTADB error, or a non-empty database whose
+// meta.schema_version predates currentSchemaVersion (a database written
+// before runs/checks/metrics/pings switched from autoincrement integers to
+// UUIDv7 strings — migrate's CREATE TABLE IF NOT EXISTS silently no-ops
+// against such a table, so every InsertRun would otherwise fail "datatype
+// mismatch" forever), is quarantined aside (renamed, never deleted) and a
+// fresh database is created at path in its place — but only when selfHeal is
+// true. NewStore always passes true: the collector reaches it only after
+// taking its exclusive flock, and the collector alone is the database's
+// documented sole writer, so it alone may safely rename the live file aside
+// and recreate it. The daemon calls OpenStore directly with selfHeal false:
+// it is a read-only reader with no lock of its own, and systemd can start it
+// before cron ever fires the collector — on a real upgrade, the daemon would
+// otherwise be the process that first finds a pre-issue-4 or corrupt file
+// and quarantines the operator's real history before the collector ever
+// gets a chance to migrate it, then serves an empty database. With selfHeal
+// false, both branches below instead surface the underlying problem as a
+// plain error and leave the file untouched. The daemon maps that error to
+// domain.ExitConfigError, so systemd restarts it until the collector's own
+// next run has quarantined and recreated the database — a brief flap on
+// first upgrade, no data destroyed, which is the intended behaviour.
+func OpenStore(ctx context.Context, path string, maxOpenConns int, selfHeal bool) (*Store, error) {
+	s, err := openOnce(ctx, path, maxOpenConns)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
+		if isMemoryDB(path) || !isSQLiteCorruptionError(err) || !selfHeal {
+			return nil, err
+		}
+		log.Printf("yarddog: %s: %v — quarantining and starting a fresh database", path, err)
+		if qErr := quarantineFile(path, "corrupt", time.Now()); qErr != nil {
+			return nil, fmt.Errorf("%w (also failed to quarantine it: %v)", err, qErr)
+		}
+		if s, err = openOnce(ctx, path, maxOpenConns); err != nil {
+			return nil, fmt.Errorf("open store after quarantining a corrupt database: %w", err)
+		}
 	}
 
-	if maxOpenConns < 1 {
-		maxOpenConns = 1
+	incompatible, err := s.needsQuarantine(ctx)
+	if err != nil {
+		if closeErr := s.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
+		}
+		return nil, err
 	}
-	db.SetMaxOpenConns(maxOpenConns)
+	if incompatible {
+		if !selfHeal {
+			err := fmt.Errorf("%w: the collector recreates it on its next run; this process starts serving once that has happened", errIncompatibleSchema)
+			if closeErr := s.Close(); closeErr != nil {
+				return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
+			}
+			return nil, err
+		}
+		if err := s.Close(); err != nil {
+			return nil, fmt.Errorf("close pre-issue-4 database before quarantining: %w", err)
+		}
+		log.Printf("yarddog: %s predates the UUIDv7 schema — quarantining and starting a fresh database", path)
+		if !isMemoryDB(path) {
+			if err := quarantineFile(path, "incompatible", time.Now()); err != nil {
+				return nil, fmt.Errorf("quarantine incompatible database: %w", err)
+			}
+		}
+		if s, err = openOnce(ctx, path, maxOpenConns); err != nil {
+			return nil, fmt.Errorf("open store after quarantining an incompatible database: %w", err)
+		}
+	}
 
-	s := &Store{db: db}
-	if err := s.migrate(ctx); err != nil {
-		if closeErr := db.Close(); closeErr != nil {
+	if err := s.ensureSchemaVersionStamped(ctx); err != nil {
+		if closeErr := s.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
+		}
+		return nil, err
+	}
+
+	if err := s.seedUUIDv7WatermarkFromDB(ctx); err != nil {
+		if closeErr := s.Close(); closeErr != nil {
 			return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
 		}
 		return nil, err
@@ -57,7 +122,7 @@ func OpenStore(ctx context.Context, path string, maxOpenConns int) (*Store, erro
 
 	if !isMemoryDB(path) {
 		if err := chmodStoreFiles(path); err != nil {
-			if closeErr := db.Close(); closeErr != nil {
+			if closeErr := s.Close(); closeErr != nil {
 				return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
 			}
 			return nil, err
@@ -109,7 +174,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// EnqueueOutboxMessage inserts an unsent tg_outbox row carrying text and
+// EnqueueOutboxMessage inserts an unsent tbot_queue row carrying text and
 // returns its id. Callers must persist before attempting to send (design
 // §8.3) so a crash mid-send never loses a message.
 func (s *Store) EnqueueOutboxMessage(ctx context.Context, createdAt time.Time, text string) (int64, error) {
@@ -130,11 +195,11 @@ func (s *Store) EnqueueOutboxMessage(ctx context.Context, createdAt time.Time, t
 	return id, nil
 }
 
-// GetHost reads back the host sidecar row for runID. It exists so tests can
-// verify what SaveMetrics persisted; it is off-port (not part of
-// MetricsRepository) since the orchestrator never reads a snapshot back,
-// mirroring GetRun's role for the runs table.
-func (s *Store) GetHost(ctx context.Context, runID int64) (domain.HostInfo, error) {
+// GetHost reads back the host sidecar row for runID (a UUIDv7 string,
+// issue #4). It exists so tests can verify what SaveMetrics persisted; it
+// is off-port (not part of MetricsRepository) since the orchestrator never
+// reads a snapshot back, mirroring GetRun's role for the runs table.
+func (s *Store) GetHost(ctx context.Context, runID string) (domain.HostInfo, error) {
 	row := s.db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT %s, %s, %s FROM %s WHERE %s = ?`,
 			colHostHostname, colHostOS, colHostArch, tableHost, colHostRunID),
@@ -144,9 +209,9 @@ func (s *Store) GetHost(ctx context.Context, runID int64) (domain.HostInfo, erro
 	var h domain.HostInfo
 	if err := row.Scan(&h.Hostname, &h.OS, &h.Arch); err != nil {
 		if err == sql.ErrNoRows {
-			return domain.HostInfo{}, fmt.Errorf("get host for run %d: %w", runID, sql.ErrNoRows)
+			return domain.HostInfo{}, fmt.Errorf("get host for run %s: %w", runID, sql.ErrNoRows)
 		}
-		return domain.HostInfo{}, fmt.Errorf("get host for run %d: %w", runID, err)
+		return domain.HostInfo{}, fmt.Errorf("get host for run %s: %w", runID, err)
 	}
 
 	return h, nil
@@ -178,13 +243,13 @@ func (s *Store) GetLastRebootStartedAt(ctx context.Context) (t time.Time, ok boo
 	return parsed, true, nil
 }
 
-// GetRun reads back the runs row id in full. It exists primarily so tests
-// and any future inspection tooling can verify what InsertRun/UpdateRun
-// persisted; the recovery loop itself only ever writes. It is off-port
-// (not part of RunRepository) since the orchestrator never reads a run back.
-// A missing id returns sql.ErrNoRows wrapped with %w, so callers (RunByID)
-// can errors.Is against it.
-func (s *Store) GetRun(ctx context.Context, id int64) (domain.Run, error) {
+// GetRun reads back the runs row id (a UUIDv7 string, issue #4) in full. It
+// exists primarily so tests and any future inspection tooling can verify
+// what InsertRun/UpdateRun persisted; the recovery loop itself only ever
+// writes. It is off-port (not part of RunRepository) since the orchestrator
+// never reads a run back. A missing id returns sql.ErrNoRows wrapped with
+// %w, so callers (RunByID) can errors.Is against it.
+func (s *Store) GetRun(ctx context.Context, id string) (domain.Run, error) {
 	row := s.db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s FROM %s WHERE %s = ?`,
 			colRunsID, colRunsStartedAt, colRunsMode, colRunsInternetOK, colRunsAction,
@@ -196,12 +261,12 @@ func (s *Store) GetRun(ctx context.Context, id int64) (domain.Run, error) {
 
 	r, err := scanRun(row)
 	if err != nil {
-		return domain.Run{}, fmt.Errorf("get run %d: %w", id, err)
+		return domain.Run{}, fmt.Errorf("get run %s: %w", id, err)
 	}
 	return r, nil
 }
 
-// IncrementOutboxAttempt records a failed send attempt on the tg_outbox row
+// IncrementOutboxAttempt records a failed send attempt on the tbot_queue row
 // id: attempts is incremented and last_error is set to err.
 func (s *Store) IncrementOutboxAttempt(ctx context.Context, id int64, sendErr string) error {
 	_, err := s.db.ExecContext(ctx,
@@ -215,38 +280,44 @@ func (s *Store) IncrementOutboxAttempt(ctx context.Context, id int64, sendErr st
 	return nil
 }
 
-// InsertCheck inserts one checks row. c.RunID, c.Phase, c.Target, and
-// c.Kind must be set; c.LatencyMS and c.Error are optional.
+// InsertCheck inserts one checks row, generating its id as a UUIDv7 string
+// stamped with c.TS (issue #4). c.RunID, c.Phase, c.Target, and c.Kind must
+// be set; c.LatencyMS and c.Error are optional.
 func (s *Store) InsertCheck(ctx context.Context, c domain.Check) error {
-	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			tableChecks, colChecksRunID, colChecksTS, colChecksPhase, colChecksTarget,
+	id, err := newUUIDv7(c.TS)
+	if err != nil {
+		return fmt.Errorf("insert check for run %s target %s: %w", c.RunID, c.Target, err)
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			tableChecks, colChecksID, colChecksRunID, colChecksTS, colChecksPhase, colChecksTarget,
 			colChecksKind, colChecksOK, colChecksLatencyMS, colChecksError),
-		c.RunID, formatTime(c.TS), c.Phase, c.Target, c.Kind, boolToInt(c.OK),
+		id, c.RunID, formatTime(c.TS), c.Phase, c.Target, c.Kind, boolToInt(c.OK),
 		nullInt64(c.LatencyMS), nullString(c.Error),
 	)
 	if err != nil {
-		return fmt.Errorf("insert check for run %d target %s: %w", c.RunID, c.Target, err)
+		return fmt.Errorf("insert check for run %s target %s: %w", c.RunID, c.Target, err)
 	}
 	return nil
 }
 
-// InsertRun inserts a new runs row and returns its id. mode is "soft" or
+// InsertRun inserts a new runs row, generating its id as a UUIDv7 string
+// stamped with startedAt (issue #4), and returns that id. mode is "soft" or
 // "hard"; internetOK is nil in hard mode, where no initial check is made
 // (design §7).
-func (s *Store) InsertRun(ctx context.Context, startedAt time.Time, mode string, internetOK *bool) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, ?)`,
-			tableRuns, colRunsStartedAt, colRunsMode, colRunsInternetOK, colRunsAction),
-		formatTime(startedAt), mode, nullBoolToInt(internetOK), domain.ActionNone,
-	)
+func (s *Store) InsertRun(ctx context.Context, startedAt time.Time, mode string, internetOK *bool) (string, error) {
+	id, err := newUUIDv7(startedAt)
 	if err != nil {
-		return 0, fmt.Errorf("insert run: %w", err)
+		return "", fmt.Errorf("insert run: %w", err)
 	}
 
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("insert run: last insert id: %w", err)
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?)`,
+			tableRuns, colRunsID, colRunsStartedAt, colRunsMode, colRunsInternetOK, colRunsAction),
+		id, formatTime(startedAt), mode, nullBoolToInt(internetOK), domain.ActionNone,
+	); err != nil {
+		return "", fmt.Errorf("insert run: %w", err)
 	}
 
 	return id, nil
@@ -308,17 +379,29 @@ func (s *Store) LatestMetrics(ctx context.Context) ([]domain.MetricRecord, error
 }
 
 // ListChecksByRun returns every checks row for runID, ordered by id, so
-// tests and any future report tooling see them in insertion order.
-func (s *Store) ListChecksByRun(ctx context.Context, runID int64) ([]domain.Check, error) {
-	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s, %s FROM %s WHERE %s = ? ORDER BY %s ASC`,
-			colChecksRunID, colChecksTS, colChecksPhase, colChecksTarget, colChecksKind,
-			colChecksOK, colChecksLatencyMS, colChecksError,
-			tableChecks, colChecksRunID, colChecksID),
-		runID,
+// tests and any future report tooling see them in insertion order. It spans
+// both tiers via UNION ALL: the run-boundary invariant guarantees a run's
+// checks live wholly in one tier, so this never duplicates a row, and it
+// sidesteps the ambiguity a "hot-first, archive-on-miss" lookup would have —
+// a run can legitimately have zero checks (e.g. a failed hard-mode reboot),
+// which looks identical to "this run is archived" under an empty result.
+func (s *Store) ListChecksByRun(ctx context.Context, runID string) ([]domain.Check, error) {
+	// id is selected only inside the inner legs (checksFullColumnList), not
+	// by the outer projection (checksColumnList) — the outer ORDER BY can
+	// still reference it because the outer SELECT is a simple query over a
+	// derived (unioned) table, not itself compound.
+	query := fmt.Sprintf(
+		`SELECT %[1]s FROM (
+			SELECT %[2]s FROM %[3]s WHERE %[4]s = ?
+			UNION ALL
+			SELECT %[2]s FROM %[5]s WHERE %[4]s = ?
+		) ORDER BY %[6]s ASC`,
+		checksColumnList, checksFullColumnList, tableChecks, colChecksRunID, tableChecksArchive, colChecksID,
 	)
+
+	rows, err := s.db.QueryContext(ctx, query, runID, runID)
 	if err != nil {
-		return nil, fmt.Errorf("list checks for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list checks for run %s: %w", runID, err)
 	}
 	defer rows.Close()
 
@@ -332,11 +415,11 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID int64) ([]domain.Chec
 			errStr    sql.NullString
 		)
 		if err := rows.Scan(&c.RunID, &ts, &c.Phase, &c.Target, &c.Kind, &ok, &latencyMS, &errStr); err != nil {
-			return nil, fmt.Errorf("list checks for run %d: scan: %w", runID, err)
+			return nil, fmt.Errorf("list checks for run %s: scan: %w", runID, err)
 		}
 		c.TS, err = parseTime(ts)
 		if err != nil {
-			return nil, fmt.Errorf("list checks for run %d: %w", runID, err)
+			return nil, fmt.Errorf("list checks for run %s: %w", runID, err)
 		}
 		c.OK = ok != 0
 		if latencyMS.Valid {
@@ -347,7 +430,7 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID int64) ([]domain.Chec
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list checks for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list checks for run %s: %w", runID, err)
 	}
 
 	return out, nil
@@ -355,20 +438,26 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID int64) ([]domain.Chec
 
 // ListMetrics returns metrics history matching f, newest first, bounded by
 // f.Limit (a parameterized LIMIT — never string-concatenated, Risk R8).
-// f.Since's zero value omits the "ts >= ?" clause; f.Collector's zero value
-// omits the "collector = ?" clause.
+// f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Collector's
+// zero value omits the "collector = ?" clause. f.IncludeArchive false (the
+// default) queries the hot table only, byte-for-byte the query this method
+// has always run; true also spans metrics_archive via spanQuery's UNION
+// ALL, with the same conds bound once per leg.
 func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]domain.MetricRecord, error) {
-	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s, %s FROM %s`,
-		colMetricsRunID, colMetricsTS, colMetricsCollector, colMetricsName,
-		colMetricsValue, colMetricsUnit, colMetricsOK, colMetricsError, tableMetrics)
-
 	var (
 		conds []string
 		args  []any
 	)
 	if !f.Since.IsZero() {
-		conds = append(conds, colMetricsTS+" >= ?")
-		args = append(args, formatTime(f.Since))
+		// uuidv7Floor gives the planner a sargable lower bound on the id
+		// index, so a f.IncludeArchive scan can seek and stop early instead
+		// of running to EOF (id order, not ts order, is what the archive
+		// leg's index actually supports). ts >= ? stays as the exact
+		// residual filter, since uuidv7Floor's millisecond truncation can
+		// make it a hair less restrictive than the real cutoff (issue #4
+		// FIX 2).
+		conds = append(conds, colMetricsID+" >= ?", colMetricsTS+" >= ?")
+		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
 	}
 	if f.Collector != "" {
 		conds = append(conds, colMetricsCollector+" = ?")
@@ -378,13 +467,20 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 		// drop unavailable rows in SQL so LIMIT counts only returned rows.
 		conds = append(conds, colMetricsOK+" = 1")
 	}
+	where := ""
 	if len(conds) > 0 {
-		query += " WHERE " + strings.Join(conds, " AND ")
+		where = " WHERE " + strings.Join(conds, " AND ")
 	}
-	query += fmt.Sprintf(" ORDER BY %s DESC LIMIT ?", colMetricsID)
-	args = append(args, f.Limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, legs := spanQuery(tableMetrics, tableMetricsArchive, metricsColumnList, metricsFullColumnList, colMetricsID, where, f.IncludeArchive)
+
+	var queryArgs []any
+	for range legs {
+		queryArgs = append(queryArgs, args...)
+	}
+	queryArgs = append(queryArgs, f.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list metrics: %w", err)
 	}
@@ -400,7 +496,7 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 // ListMetricsByRun returns every metrics row for runID, ordered by id,
 // mirroring ListChecksByRun. Off-port: it exists so tests can read back
 // what SaveMetrics persisted.
-func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.MetricSample, error) {
+func (s *Store) ListMetricsByRun(ctx context.Context, runID string) ([]domain.MetricSample, error) {
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s FROM %s WHERE %s = ? ORDER BY %s ASC`,
 			colMetricsCollector, colMetricsName, colMetricsValue, colMetricsUnit, colMetricsOK, colMetricsError,
@@ -408,7 +504,7 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.Met
 		runID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list metrics for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list metrics for run %s: %w", runID, err)
 	}
 	defer rows.Close()
 
@@ -421,7 +517,7 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.Met
 			errStr sql.NullString
 		)
 		if err := rows.Scan(&m.Collector, &m.Name, &value, &m.Unit, &ok, &errStr); err != nil {
-			return nil, fmt.Errorf("list metrics for run %d: scan: %w", runID, err)
+			return nil, fmt.Errorf("list metrics for run %s: scan: %w", runID, err)
 		}
 		m.Value = value.Float64
 		m.OK = ok != 0
@@ -429,7 +525,7 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.Met
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list metrics for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list metrics for run %s: %w", runID, err)
 	}
 
 	return out, nil
@@ -437,20 +533,24 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID int64) ([]domain.Met
 
 // ListPings returns ping history matching f, newest first, bounded by
 // f.Limit (a parameterized LIMIT — never string-concatenated, Risk R8).
-// f.Since's zero value omits the "ts >= ?" clause; f.Host's zero value omits
-// the "host = ?" clause; f.IncludeUnreachable false additionally drops
-// received=0 rows in SQL so LIMIT counts only returned rows.
+// f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Host's zero
+// value omits the "host = ?" clause; f.IncludeUnreachable false additionally
+// drops received=0 rows in SQL so LIMIT counts only returned rows.
+// f.IncludeArchive false (the default) queries the hot table only,
+// byte-for-byte the query this method has always run; true also spans
+// pings_archive via spanQuery's UNION ALL, with the same conds bound once
+// per leg.
 func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.PingRecord, error) {
-	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s FROM %s`,
-		colPingsRunID, colPingsTS, colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError, tablePings)
-
 	var (
 		conds []string
 		args  []any
 	)
 	if !f.Since.IsZero() {
-		conds = append(conds, colPingsTS+" >= ?")
-		args = append(args, formatTime(f.Since))
+		// see ListMetrics: uuidv7Floor gives the planner a sargable id
+		// lower bound so the archive leg can seek and stop early; ts >= ?
+		// stays as the exact residual filter (issue #4 FIX 2).
+		conds = append(conds, colPingsID+" >= ?", colPingsTS+" >= ?")
+		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
 	}
 	if f.Host != "" {
 		conds = append(conds, colPingsHost+" = ?")
@@ -460,13 +560,20 @@ func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.
 		// drop unreachable rows in SQL so LIMIT counts only returned rows.
 		conds = append(conds, colPingsReceived+" > 0")
 	}
+	where := ""
 	if len(conds) > 0 {
-		query += " WHERE " + strings.Join(conds, " AND ")
+		where = " WHERE " + strings.Join(conds, " AND ")
 	}
-	query += fmt.Sprintf(" ORDER BY %s DESC LIMIT ?", colPingsID)
-	args = append(args, f.Limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, legs := spanQuery(tablePings, tablePingsArchive, pingsColumnList, pingsFullColumnList, colPingsID, where, f.IncludeArchive)
+
+	var queryArgs []any
+	for range legs {
+		queryArgs = append(queryArgs, args...)
+	}
+	queryArgs = append(queryArgs, f.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list pings: %w", err)
 	}
@@ -482,7 +589,7 @@ func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.
 // ListPingsByRun returns every pings row for runID, ordered by id, mirroring
 // ListMetricsByRun. Off-port: it exists so tests can read back what
 // SavePings persisted.
-func (s *Store) ListPingsByRun(ctx context.Context, runID int64) ([]domain.PingResult, error) {
+func (s *Store) ListPingsByRun(ctx context.Context, runID string) ([]domain.PingResult, error) {
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s, %s, %s, %s, %s FROM %s WHERE %s = ? ORDER BY %s ASC`,
 			colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError,
@@ -490,7 +597,7 @@ func (s *Store) ListPingsByRun(ctx context.Context, runID int64) ([]domain.PingR
 		runID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list pings for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list pings for run %s: %w", runID, err)
 	}
 	defer rows.Close()
 
@@ -502,7 +609,7 @@ func (s *Store) ListPingsByRun(ctx context.Context, runID int64) ([]domain.PingR
 			errStr sql.NullString
 		)
 		if err := rows.Scan(&r.Host, &r.Sent, &r.Received, &avgMS, &errStr); err != nil {
-			return nil, fmt.Errorf("list pings for run %d: scan: %w", runID, err)
+			return nil, fmt.Errorf("list pings for run %s: scan: %w", runID, err)
 		}
 		r.AvgMS = avgMS.Float64
 		r.OK = r.Received > 0
@@ -510,7 +617,7 @@ func (s *Store) ListPingsByRun(ctx context.Context, runID int64) ([]domain.PingR
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pings for run %d: %w", runID, err)
+		return nil, fmt.Errorf("list pings for run %s: %w", runID, err)
 	}
 
 	return out, nil
@@ -548,7 +655,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]domain.Run, error) {
 	return out, nil
 }
 
-// ListUnsentOutboxMessages returns every tg_outbox row with sent_at still
+// ListUnsentOutboxMessages returns every tbot_queue row with sent_at still
 // NULL, oldest first, so a flush delivers messages in the order they were
 // queued.
 func (s *Store) ListUnsentOutboxMessages(ctx context.Context) ([]domain.OutboxMessage, error) {
@@ -586,7 +693,7 @@ func (s *Store) ListUnsentOutboxMessages(ctx context.Context) ([]domain.OutboxMe
 	return out, nil
 }
 
-// MarkOutboxSent sets sent_at on the tg_outbox row id.
+// MarkOutboxSent sets sent_at on the tbot_queue row id.
 func (s *Store) MarkOutboxSent(ctx context.Context, id int64, sentAt time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		fmt.Sprintf(`UPDATE %s SET %s = ? WHERE %s = ?`, tableOutbox, colOutboxSentAt, colOutboxID),
@@ -596,6 +703,53 @@ func (s *Store) MarkOutboxSent(ctx context.Context, id int64, sentAt time.Time) 
 		return fmt.Errorf("mark outbox message %d sent: %w", id, err)
 	}
 	return nil
+}
+
+// MaybeVacuum runs a full VACUUM at most once every vacuumInterval, gated by
+// meta[last_vacuum_at] (issue #4): VACUUM reclaims and defragments the pages
+// RolloverToArchive/PruneArchive's deletes free, which incremental_vacuum
+// would not (it only returns freelist pages to the OS without repacking
+// b-trees). VACUUM runs outside any transaction — SQLite rejects it inside
+// one — as two separate autocommit statements bracketing the bare VACUUM.
+// The stamp is written only after VACUUM succeeds, so a failure (e.g.
+// SQLITE_BUSY from a concurrent daemon reader) retries next call instead of
+// silently skipping a whole week. ran reports whether VACUUM ran and its
+// timestamp was recorded — false on the no-op/still-fresh path and on any
+// error, including a stamp write that fails after VACUUM itself succeeded —
+// so a caller can log a breadcrumb only on the run that did real work
+// instead of every call.
+func (s *Store) MaybeVacuum(ctx context.Context, now time.Time) (ran bool, err error) {
+	var raw string
+	err = s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE %s = ?`, colMetaValue, tableMeta, colMetaKey),
+		metaKeyLastVacuum,
+	).Scan(&raw)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// never vacuumed before — fall through and do it now.
+	case err != nil:
+		return false, fmt.Errorf("maybe vacuum: read last vacuum: %w", err)
+	default:
+		last, perr := parseTime(raw)
+		if perr != nil {
+			return false, fmt.Errorf("maybe vacuum: %w", perr)
+		}
+		if now.Sub(last) < vacuumInterval {
+			return false, nil
+		}
+	}
+
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil { // must run outside a transaction
+		return false, fmt.Errorf("maybe vacuum: vacuum: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT OR REPLACE INTO %s (%s, %s) VALUES (?, ?)`, tableMeta, colMetaKey, colMetaValue),
+		metaKeyLastVacuum, formatTime(now),
+	); err != nil {
+		return false, fmt.Errorf("maybe vacuum: record: %w", err)
+	}
+	return true, nil
 }
 
 // Name implements services.HealthProbe, naming this probe "sqlite" in a
@@ -627,77 +781,159 @@ func (s *Store) NewestRunStartedAt(ctx context.Context) (t time.Time, ok bool, e
 	return parsed, true, nil
 }
 
-// PruneChecks deletes checks rows older than retentionDays. retentionDays<=0
-// means "keep forever" and is a no-op — the caller passes RETENTION_DAYS
-// straight through without special-casing 0 (design §9: a 0-day cutoff must
-// never be computed as "now", which would wipe every row). Off-port: main
-// calls it directly on the concrete *Store at startup.
-func (s *Store) PruneChecks(ctx context.Context, now time.Time, retentionDays int) error {
+// PruneArchive deletes every archived run (started_at older than
+// now - retentionDays days) and all its archived children, in one
+// transaction, run-boundary — never by a child's own ts, which would
+// re-split a run across the retention boundary (the bug the old per-table
+// PruneChecks/PruneMetrics/PrunePings model had, and the reason runs_archive
+// itself was never pruned before). Only *_archive tables are touched; hot is
+// bounded by RolloverToArchive, not by retention. retentionDays<=0 means
+// "keep forever" and is a no-op (design §9's original semantics, now scoped
+// to the archive tier). Off-port: main calls it directly on the concrete
+// *Store at startup, after RolloverToArchive. pruned reports how many runs
+// were removed (issue #4 FIX 5) — 0 on the retentionDays<=0 no-op and
+// whenever nothing was old enough — so a caller can log a breadcrumb only
+// when real work happened, mirroring MaybeVacuum's ran bool.
+func (s *Store) PruneArchive(ctx context.Context, now time.Time, retentionDays int) (pruned int64, err error) {
 	if retentionDays <= 0 {
-		return nil
+		return 0, nil
 	}
-
-	cutoff := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
-	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tableChecks, colChecksTS),
-		formatTime(cutoff),
-	)
-	if err != nil {
-		return fmt.Errorf("prune checks older than %d days: %w", retentionDays, err)
-	}
-	return nil
-}
-
-// PruneMetrics deletes metrics and host rows older than retentionDays,
-// mirroring PruneChecks (retentionDays<=0 means "keep forever", a no-op).
-// Off-port: main calls it directly on the concrete *Store at startup, next
-// to PruneChecks.
-func (s *Store) PruneMetrics(ctx context.Context, now time.Time, retentionDays int) error {
-	if retentionDays <= 0 {
-		return nil
-	}
-
 	cutoff := formatTime(now.Add(-time.Duration(retentionDays) * 24 * time.Hour))
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tableMetrics, colMetricsTS), cutoff); err != nil {
-		return fmt.Errorf("prune metrics older than %d days: %w", retentionDays, err)
-	}
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tableHost, colHostTS), cutoff); err != nil {
-		return fmt.Errorf("prune host older than %d days: %w", retentionDays, err)
-	}
-	return nil
-}
 
-// PrunePings deletes pings rows older than retentionDays, mirroring
-// PruneChecks (retentionDays<=0 means "keep forever", a no-op). Off-port:
-// main calls it directly on the concrete *Store at startup, next to
-// PruneChecks/PruneMetrics.
-func (s *Store) PrunePings(ctx context.Context, now time.Time, retentionDays int) error {
-	if retentionDays <= 0 {
-		return nil
-	}
-
-	cutoff := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
-	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tablePings, colPingsTS),
-		formatTime(cutoff),
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("prune pings older than %d days: %w", retentionDays, err)
+		return 0, fmt.Errorf("prune archive: begin: %w", err)
 	}
-	return nil
+	defer func() { _ = tx.Rollback() }() // no-op after Commit (sanctioned discard, error-recovery path)
+
+	agedArchivedRunIDs := fmt.Sprintf(`SELECT %s FROM %s WHERE %s < ?`, colRunsID, tableRunsArchive, colRunsStartedAt)
+
+	// same ordering rule as RolloverToArchive: every child DELETE (which
+	// keys off agedArchivedRunIDs, itself reading runs_archive) must run
+	// before runs_archive's own rows disappear, or the subquery goes empty
+	// on the later statements and strands their children. runs_archive's own
+	// DELETE runs last, separately from the loop, so its RowsAffected — one
+	// row per pruned run — can be captured and returned.
+	childStmts := []string{
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableChecksArchive, colChecksRunID, agedArchivedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableMetricsArchive, colMetricsRunID, agedArchivedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableHostArchive, colHostRunID, agedArchivedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tablePingsArchive, colPingsRunID, agedArchivedRunIDs),
+	}
+	for _, stmt := range childStmts {
+		if _, err := tx.ExecContext(ctx, stmt, cutoff); err != nil {
+			return 0, fmt.Errorf("prune archive: %w", err)
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tableRunsArchive, colRunsStartedAt), cutoff) // runs_archive LAST
+	if err != nil {
+		return 0, fmt.Errorf("prune archive: %w", err)
+	}
+	if pruned, err = res.RowsAffected(); err != nil {
+		return 0, fmt.Errorf("prune archive: rows affected: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("prune archive: commit: %w", err)
+	}
+	return pruned, nil
 }
 
-// RunByID reads back runs row id in full, translating GetRun's sql.ErrNoRows
-// into a plain found bool (services.HistoryRepository's "not found" contract,
-// so services never needs to import database/sql). Any other GetRun error
-// still propagates.
-func (s *Store) RunByID(ctx context.Context, id int64) (domain.Run, bool, error) {
-	run, err := s.GetRun(ctx, id)
+// RolloverToArchive moves every run (and all its children) with
+// started_at older than now - hotWindowDays days from the hot tables into
+// their *_archive twins, in one transaction (issue #4): this run-boundary
+// maintenance pass is what bounds the hot working set — the collector's
+// write path stays single, into hot; this is a startup *move*, not a
+// dual-write. tbot_queue is a queue, not history, and is never touched.
+// hotWindowDays<=0 is a defense-in-depth no-op (LoadConfig already clamps
+// HOT_WINDOW_DAYS to >=1) so a stray zero/negative value can never archive
+// everything. Off-port: main calls it directly on the concrete *Store at
+// startup, before PruneArchive. moved reports how many runs were archived
+// (issue #4 FIX 5) — 0 on the hotWindowDays<=0 no-op and whenever nothing
+// was old enough — so a caller can log a breadcrumb only when real work
+// happened, mirroring MaybeVacuum's ran bool.
+func (s *Store) RolloverToArchive(ctx context.Context, now time.Time, hotWindowDays int) (moved int64, err error) {
+	if hotWindowDays <= 0 {
+		return 0, nil
+	}
+	cutoff := formatTime(now.Add(-time.Duration(hotWindowDays) * 24 * time.Hour))
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("rollover to archive: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit (sanctioned discard, error-recovery path)
+
+	agedRunIDs := fmt.Sprintf(`SELECT %s FROM %s WHERE %s < ?`, colRunsID, tableRuns, colRunsStartedAt)
+
+	// ordering is load-bearing (Risk R1): every INSERT...SELECT (children,
+	// then runs) must run before any DELETE, and `runs` must be deleted
+	// LAST. Every child statement below keys off agedRunIDs, which reads
+	// from `runs` — deleting `runs` first would make that subquery return
+	// nothing on every later statement and strand that run's children in
+	// hot. runs' own DELETE runs last, separately from the loop, so its
+	// RowsAffected — one row per moved run — can be captured and returned.
+	stmts := []string{
+		fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s IN (%s)`,
+			tableChecksArchive, checksFullColumnList, checksFullColumnList, tableChecks, colChecksRunID, agedRunIDs),
+		fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s IN (%s)`,
+			tableMetricsArchive, metricsFullColumnList, metricsFullColumnList, tableMetrics, colMetricsRunID, agedRunIDs),
+		fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s IN (%s)`,
+			tableHostArchive, hostColumnList, hostColumnList, tableHost, colHostRunID, agedRunIDs),
+		fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s IN (%s)`,
+			tablePingsArchive, pingsFullColumnList, pingsFullColumnList, tablePings, colPingsRunID, agedRunIDs),
+		fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s < ?`,
+			tableRunsArchive, runColumnList, runColumnList, tableRuns, colRunsStartedAt),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableChecks, colChecksRunID, agedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableMetrics, colMetricsRunID, agedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tableHost, colHostRunID, agedRunIDs),
+		fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, tablePings, colPingsRunID, agedRunIDs),
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt, cutoff); err != nil {
+			return 0, fmt.Errorf("rollover to archive: %w", err)
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s < ?`, tableRuns, colRunsStartedAt), cutoff) // runs LAST
+	if err != nil {
+		return 0, fmt.Errorf("rollover to archive: %w", err)
+	}
+	if moved, err = res.RowsAffected(); err != nil {
+		return 0, fmt.Errorf("rollover to archive: rows affected: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("rollover to archive: commit: %w", err)
+	}
+	return moved, nil
+}
+
+// RunByID reads back a run by id, spanning both tiers via UNION ALL: the
+// run-boundary invariant (RolloverToArchive/PruneArchive only ever move or
+// delete whole runs, never split one) guarantees id resolves in exactly one
+// of runs/runs_archive, so this never risks a duplicate. found is false, not
+// an error, when id exists in neither tier (services.HistoryRepository's
+// "not found" contract, so services never needs to import database/sql).
+// GetRun stays hot-only and is untouched by this method.
+func (s *Store) RunByID(ctx context.Context, id string) (domain.Run, bool, error) {
+	query := fmt.Sprintf(
+		`SELECT %[1]s FROM (
+			SELECT %[1]s FROM %[2]s WHERE %[3]s = ?
+			UNION ALL
+			SELECT %[1]s FROM %[4]s WHERE %[3]s = ?
+		) LIMIT 1`,
+		runColumnList, tableRuns, colRunsID, tableRunsArchive,
+	)
+
+	row := s.db.QueryRowContext(ctx, query, id, id)
+	run, err := scanRun(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.Run{}, false, nil
 		}
-		return domain.Run{}, false, err
+		return domain.Run{}, false, fmt.Errorf("run by id %s: %w", id, err)
 	}
 	return run, true, nil
 }
@@ -705,14 +941,18 @@ func (s *Store) RunByID(ctx context.Context, id int64) (domain.Run, bool, error)
 // SaveMetrics writes one telemetry snapshot: the host sidecar row plus one
 // metrics row per sample, all in a single transaction so a partial snapshot
 // (e.g. a failed sample insert) never persists (plans/003-host-telemetry.md).
-// host.run_id is a PRIMARY KEY, so a second SaveMetrics call for the same
-// runID fails outright — collectMetrics calls it exactly once per run, so
-// this is a correctness guard rather than a case to INSERT OR REPLACE
-// around.
-func (s *Store) SaveMetrics(ctx context.Context, runID int64, ts time.Time, m domain.HostMetrics) error {
+// Each metrics row gets its own freshly generated UUIDv7 id stamped with ts
+// (issue #4) — every sample in one call shares that same ts, so the
+// generator's monotonic counter is what keeps them in insertion order under
+// ORDER BY id. host.run_id is itself the PRIMARY KEY (not a separately
+// generated id — it is runID, the owning run's own id), so a second
+// SaveMetrics call for the same runID fails outright — collectMetrics calls
+// it exactly once per run, so this is a correctness guard rather than a
+// case to INSERT OR REPLACE around.
+func (s *Store) SaveMetrics(ctx context.Context, runID string, ts time.Time, m domain.HostMetrics) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("save metrics for run %d: begin: %w", runID, err)
+		return fmt.Errorf("save metrics for run %s: begin: %w", runID, err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit (sanctioned discard, error-recovery path)
 
@@ -721,51 +961,62 @@ func (s *Store) SaveMetrics(ctx context.Context, runID int64, ts time.Time, m do
 			tableHost, colHostRunID, colHostTS, colHostHostname, colHostOS, colHostArch),
 		runID, formatTime(ts), m.Host.Hostname, m.Host.OS, m.Host.Arch,
 	); err != nil {
-		return fmt.Errorf("save metrics for run %d: host: %w", runID, err)
+		return fmt.Errorf("save metrics for run %s: host: %w", runID, err)
 	}
 
 	for _, sm := range m.Samples {
+		id, err := newUUIDv7(ts)
+		if err != nil {
+			return fmt.Errorf("save metrics for run %s: sample %s/%s: %w", runID, sm.Collector, sm.Name, err)
+		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				tableMetrics, colMetricsRunID, colMetricsTS, colMetricsCollector, colMetricsName,
+			fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				tableMetrics, colMetricsID, colMetricsRunID, colMetricsTS, colMetricsCollector, colMetricsName,
 				colMetricsValue, colMetricsUnit, colMetricsOK, colMetricsError),
-			runID, formatTime(ts), string(sm.Collector), sm.Name,
+			id, runID, formatTime(ts), string(sm.Collector), sm.Name,
 			nullFloat(sm.Value, sm.OK), sm.Unit, boolToInt(sm.OK), nullString(sm.Error),
 		); err != nil {
-			return fmt.Errorf("save metrics for run %d: sample %s/%s: %w", runID, sm.Collector, sm.Name, err)
+			return fmt.Errorf("save metrics for run %s: sample %s/%s: %w", runID, sm.Collector, sm.Name, err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("save metrics for run %d: commit: %w", runID, err)
+		return fmt.Errorf("save metrics for run %s: commit: %w", runID, err)
 	}
 	return nil
 }
 
 // SavePings writes one round of ping probes for runID, one row per result,
 // all in a single transaction so a partial round never persists (mirrors
-// SaveMetrics). avg_ms is SQL NULL when the result is unavailable (OK
+// SaveMetrics). Each row gets its own freshly generated UUIDv7 id stamped
+// with ts (issue #4); every result in one call shares that same ts, so the
+// generator's monotonic counter is what keeps them in insertion order under
+// ORDER BY id. avg_ms is SQL NULL when the result is unavailable (OK
 // false), so an unreachable host's zero AvgMS is never mistaken for a
 // measured 0ms round trip.
-func (s *Store) SavePings(ctx context.Context, runID int64, ts time.Time, results []domain.PingResult) error {
+func (s *Store) SavePings(ctx context.Context, runID string, ts time.Time, results []domain.PingResult) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("save pings for run %d: begin: %w", runID, err)
+		return fmt.Errorf("save pings for run %s: begin: %w", runID, err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit (sanctioned discard, error-recovery path)
 
 	for _, r := range results {
+		id, err := newUUIDv7(ts)
+		if err != nil {
+			return fmt.Errorf("save pings for run %s: host %s: %w", runID, r.Host, err)
+		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				tablePings, colPingsRunID, colPingsTS, colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError),
-			runID, formatTime(ts), r.Host, r.Sent, r.Received, nullFloat(r.AvgMS, r.OK), nullString(r.Error),
+			fmt.Sprintf(`INSERT INTO %s (%s, %s, %s, %s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				tablePings, colPingsID, colPingsRunID, colPingsTS, colPingsHost, colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError),
+			id, runID, formatTime(ts), r.Host, r.Sent, r.Received, nullFloat(r.AvgMS, r.OK), nullString(r.Error),
 		); err != nil {
-			return fmt.Errorf("save pings for run %d: host %s: %w", runID, r.Host, err)
+			return fmt.Errorf("save pings for run %s: host %s: %w", runID, r.Host, err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("save pings for run %d: commit: %w", runID, err)
+		return fmt.Errorf("save pings for run %s: commit: %w", runID, err)
 	}
 	return nil
 }
@@ -773,7 +1024,7 @@ func (s *Store) SavePings(ctx context.Context, runID int64, ts time.Time, result
 // UpdateRun applies every non-nil field of u to the runs row id. Callers
 // build a domain.RunUpdate with only the fields that changed at a given
 // phase transition (e.g. just RouterDownAt) and leave the rest nil.
-func (s *Store) UpdateRun(ctx context.Context, id int64, u domain.RunUpdate) error {
+func (s *Store) UpdateRun(ctx context.Context, id string, u domain.RunUpdate) error {
 	sets, args := runUpdateAssignments(u)
 	if len(sets) == 0 {
 		return nil
@@ -782,7 +1033,7 @@ func (s *Store) UpdateRun(ctx context.Context, id int64, u domain.RunUpdate) err
 
 	query := fmt.Sprintf(`UPDATE %s SET %s WHERE %s = ?`, tableRuns, joinAssignments(sets), colRunsID)
 	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("update run %d: %w", id, err)
+		return fmt.Errorf("update run %s: %w", id, err)
 	}
 	return nil
 }
@@ -790,10 +1041,25 @@ func (s *Store) UpdateRun(ctx context.Context, id int64, u domain.RunUpdate) err
 const (
 	tableRuns    = "runs"
 	tableChecks  = "checks"
-	tableOutbox  = "tg_outbox"
+	tableOutbox  = "tbot_queue"
 	tableMetrics = "metrics"
 	tableHost    = "host"
 	tablePings   = "pings"
+
+	// tableRunsArchive, tableChecksArchive, tableMetricsArchive,
+	// tableHostArchive, and tablePingsArchive are the static "cold" twins
+	// (issue #4): identical schema to their hot counterpart, fed by
+	// RolloverToArchive's run-boundary move rather than a second write path.
+	tableRunsArchive    = "runs_archive"
+	tableChecksArchive  = "checks_archive"
+	tableMetricsArchive = "metrics_archive"
+	tableHostArchive    = "host_archive"
+	tablePingsArchive   = "pings_archive"
+
+	// tableMeta is a small key/value sidecar (currently just
+	// metaKeyLastVacuum) for maintenance bookkeeping that doesn't belong on
+	// any domain table.
+	tableMeta = "meta"
 
 	colRunsID                 = "id"
 	colRunsStartedAt          = "started_at"
@@ -808,6 +1074,15 @@ const (
 	colRunsOutcome            = "outcome"
 	colRunsError              = "error"
 
+	// runColumnList is the fixed 12-column projection every runs/runs_archive
+	// query selects, in scanRun's positional order: GetRun, ListRuns, and
+	// RunByID's tier-spanning query all depend on this exact order. Built
+	// from the column consts above (not hardcoded), so a column rename still
+	// surfaces at compile time.
+	runColumnList = colRunsID + ", " + colRunsStartedAt + ", " + colRunsMode + ", " + colRunsInternetOK + ", " +
+		colRunsAction + ", " + colRunsRebootStartedAt + ", " + colRunsRouterDownAt + ", " + colRunsRouterUpAt + ", " +
+		colRunsInternetRestoredAt + ", " + colRunsFinishedAt + ", " + colRunsOutcome + ", " + colRunsError
+
 	colChecksID        = "id"
 	colChecksRunID     = "run_id"
 	colChecksTS        = "ts"
@@ -818,8 +1093,18 @@ const (
 	colChecksLatencyMS = "latency_ms"
 	colChecksError     = "error"
 
+	// checksColumnList is the eight-column projection (no id) ListChecksByRun
+	// scans. checksFullColumnList prefixes id: RolloverToArchive's
+	// INSERT...SELECT must preserve ids, and ListChecksByRun's
+	// archive-spanning UNION ALL needs id in each inner leg so the outer
+	// ORDER BY can reference it without adding an id scan destination.
+	checksColumnList = colChecksRunID + ", " + colChecksTS + ", " + colChecksPhase + ", " + colChecksTarget + ", " +
+		colChecksKind + ", " + colChecksOK + ", " + colChecksLatencyMS + ", " + colChecksError
+	checksFullColumnList = colChecksID + ", " + checksColumnList
+
 	idxChecksRun = "idx_checks_run"
-	idxChecksTS  = "idx_checks_ts"
+
+	idxChecksArchiveRun = "idx_checks_archive_run"
 
 	colOutboxID        = "id"
 	colOutboxCreatedAt = "created_at"
@@ -838,14 +1123,29 @@ const (
 	colMetricsOK        = "ok"
 	colMetricsError     = "error"
 
+	// metricsColumnList and metricsFullColumnList mirror checksColumnList/
+	// checksFullColumnList: the former is what ListMetrics/LatestMetrics scan
+	// via scanMetricRecords, the latter (id-prefixed) is what
+	// RolloverToArchive's INSERT...SELECT and ListMetrics' archive-spanning
+	// UNION ALL legs select.
+	metricsColumnList = colMetricsRunID + ", " + colMetricsTS + ", " + colMetricsCollector + ", " + colMetricsName + ", " +
+		colMetricsValue + ", " + colMetricsUnit + ", " + colMetricsOK + ", " + colMetricsError
+	metricsFullColumnList = colMetricsID + ", " + metricsColumnList
+
 	idxMetricsRun = "idx_metrics_run"
-	idxMetricsTS  = "idx_metrics_ts"
+
+	idxMetricsArchiveRun = "idx_metrics_archive_run"
 
 	colHostRunID    = "run_id"
 	colHostTS       = "ts"
 	colHostHostname = "hostname"
 	colHostOS       = "os"
 	colHostArch     = "arch"
+
+	// hostColumnList is host/host_archive's full column list. Unlike
+	// checks/metrics/pings, host has no separate id column (run_id is itself
+	// the primary key), so there is no "with/without id" split to make.
+	hostColumnList = colHostRunID + ", " + colHostTS + ", " + colHostHostname + ", " + colHostOS + ", " + colHostArch
 
 	colPingsID       = "id"
 	colPingsRunID    = "run_id"
@@ -856,14 +1156,65 @@ const (
 	colPingsAvgMS    = "avg_ms"
 	colPingsError    = "error"
 
+	// pingsColumnList and pingsFullColumnList mirror checksColumnList/
+	// checksFullColumnList.
+	pingsColumnList = colPingsRunID + ", " + colPingsTS + ", " + colPingsHost + ", " + colPingsSent + ", " +
+		colPingsReceived + ", " + colPingsAvgMS + ", " + colPingsError
+	pingsFullColumnList = colPingsID + ", " + pingsColumnList
+
 	idxPingsRun = "idx_pings_run"
-	idxPingsTS  = "idx_pings_ts"
+
+	idxPingsArchiveRun = "idx_pings_archive_run"
+
+	colMetaKey   = "key"
+	colMetaValue = "value"
+
+	// metaKeyLastVacuum is the meta row key MaybeVacuum reads and writes to
+	// gate its cadence.
+	metaKeyLastVacuum = "last_vacuum_at"
+
+	// metaKeySchemaVersion is the meta row key OpenStore reads and writes
+	// (issue #4 FIX 3) to tell a genuinely fresh database (migrate just
+	// created meta, and every table with it) apart from a pre-issue-4
+	// database (migrate's CREATE TABLE IF NOT EXISTS no-ops against its
+	// already-existing, still-INTEGER-id runs table, but freshly creates an
+	// empty meta table alongside it) — both look identical as "meta has no
+	// schema_version row" without also checking whether runs already holds
+	// data. currentSchemaVersion is the version this binary's schema is at;
+	// bump it if a future change again makes an old on-disk schema
+	// incompatible with what migrate() assumes.
+	metaKeySchemaVersion = "schema_version"
+	currentSchemaVersion = "2"
 
 	// timeFormat is RFC3339 in UTC (design §9). Every timestamp column is
 	// stored in this fixed-width format so retention pruning can compare
 	// them lexicographically without parsing.
 	timeFormat = time.RFC3339
+
+	// vacuumInterval is MaybeVacuum's cadence gate: weekly, a package const
+	// rather than a config knob (Trade-off T7) since no operator has asked
+	// to tune it and unrequested config is not added speculatively.
+	vacuumInterval = 7 * 24 * time.Hour
+
+	// sqliteCorrupt and sqliteNotADB are the standard, stable SQLite result
+	// codes (https://www.sqlite.org/rescode.html; part of the public C API,
+	// unrelated to and unexported by modernc.org/sqlite's own Go surface)
+	// isSQLiteCorruptionError checks a *sqlite.Error against (issue #4
+	// FIX 3): "the database disk image is malformed" and "file opened that
+	// is not a database file" are the two ways a genuinely damaged or
+	// non-SQLite file can fail to open or migrate.
+	sqliteCorrupt = 11
+	sqliteNotADB  = 26
 )
+
+// errIncompatibleSchema is the sentinel OpenStore wraps and returns when
+// needsQuarantine reports a pre-issue-4 database and selfHeal is false: the
+// caller (the daemon) is a read-only reader with no exclusive lock of its
+// own, so it must never rename the live file aside itself — only the
+// collector, the database's sole writer and the only caller OpenStore ever
+// grants selfHeal to, may quarantine and recreate it (see OpenStore's own
+// doc).
+var errIncompatibleSchema = errors.New("database predates the UUIDv7 schema")
 
 // boolToInt renders a Go bool as the 0/1 SQLite stores in an INTEGER
 // column (checks.ok, which is NOT NULL and so needs no separate nullable
@@ -893,6 +1244,25 @@ func chmodStoreFiles(path string) error {
 	return nil
 }
 
+// ensureSchemaVersionStamped writes meta.schema_version = currentSchemaVersion,
+// unconditionally via INSERT OR REPLACE (issue #4 FIX 3). This runs on every
+// OpenStore call, not just a database's first: a freshly created database
+// gets its first stamp here (needsQuarantine already ran and found it merely
+// unstamped, not incompatible), and an already-stamped one is simply
+// rewritten with the same value — so a future schema bump only has to change
+// currentSchemaVersion, never add a migration path for "already at the
+// previous version".
+func (s *Store) ensureSchemaVersionStamped(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT OR REPLACE INTO %s (%s, %s) VALUES (?, ?)`, tableMeta, colMetaKey, colMetaValue),
+		metaKeySchemaVersion, currentSchemaVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("stamp schema version: %w", err)
+	}
+	return nil
+}
+
 // formatTime renders t as UTC RFC3339, the fixed-width string format every
 // timestamp column uses (design §9).
 func formatTime(t time.Time) string {
@@ -904,6 +1274,45 @@ func formatTime(t time.Time) string {
 // these ever touch disk, so there is no file for chmodStoreFiles to chmod.
 func isMemoryDB(path string) bool {
 	return path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory")
+}
+
+// isSQLiteCorruptionCode reports whether code — a *sqlite.Error's own
+// Code() — signals SQLITE_CORRUPT or SQLITE_NOTADB, base or extended (issue
+// #4 FIX 3). modernc.org/sqlite enables extended result codes on every
+// connection (conn.go's newConn), so a genuinely corrupt database usually
+// arrives as an extended code — SQLITE_CORRUPT_INDEX (779),
+// SQLITE_CORRUPT_SEQUENCE (523), SQLITE_CORRUPT_VTAB (267), and so on — not
+// the bare primary SQLITE_CORRUPT (11); masking to the low byte recovers
+// the primary code regardless of which extended variant fired, since an
+// extended code is always "primary | (extra info << 8)", the same encoding
+// sqlite3_extended_result_codes itself uses. This can never fold some
+// unrelated primary code down onto 11/26: every primary SQLite result code
+// occupies its own number in 0-28 (sqlite.org/rescode.html), so the masked
+// low byte only ever matches sqliteCorrupt/sqliteNotADB when the error
+// really is one of those two families — a transient SQLITE_BUSY (5) and its
+// extended forms (e.g. SQLITE_BUSY_TIMEOUT, 773) mask down to 5, never 11.
+func isSQLiteCorruptionCode(code int) bool {
+	switch code & 0xff {
+	case sqliteCorrupt, sqliteNotADB:
+		return true
+	default:
+		return false
+	}
+}
+
+// isSQLiteCorruptionError reports whether err is a *sqlite.Error carrying a
+// SQLITE_CORRUPT or SQLITE_NOTADB result code (isSQLiteCorruptionCode) — the
+// two ways opening or migrating the file at a configured path fails because
+// it is genuinely damaged or not a SQLite database at all. Any other error
+// (permissions, disk full, a locked file) is left alone: quarantining and
+// starting fresh would not fix those, and OpenStore must surface them as-is
+// rather than destroy data over an unrelated failure.
+func isSQLiteCorruptionError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return isSQLiteCorruptionCode(sqliteErr.Code())
 }
 
 // joinAssignments joins "col = ?" fragments with ", " for an UPDATE ... SET
@@ -920,19 +1329,22 @@ func joinAssignments(sets []string) string {
 // the same or a fresh Store) since every statement is CREATE ... IF NOT
 // EXISTS (design §9).
 func (s *Store) migrate(ctx context.Context) error {
-	pragmas := []string{
-		`PRAGMA journal_mode=WAL`,
-		`PRAGMA busy_timeout=5000`,
-	}
-	for _, p := range pragmas {
-		if _, err := s.db.ExecContext(ctx, p); err != nil {
-			return fmt.Errorf("apply pragma %q: %w", p, err)
-		}
+	// journal_mode=WAL is sticky at the database-FILE level (once set, every
+	// future connection to this file sees WAL without asking again), so a
+	// single exec here is enough. busy_timeout is the opposite — a
+	// per-CONNECTION setting the driver forgets on every new physical
+	// connection — so it is set via the DSN's _pragma parameter instead
+	// (see openOnce/FIX 6), which every pooled connection re-applies for
+	// itself; it must not also be exec'd here or it would only cover this
+	// one connection, leaving the daemon's 2nd+ (DAEMON_MAX_CONNS) pooled
+	// connection with SQLite's 0-timeout default.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
+		return fmt.Errorf("apply pragma %q: %w", `PRAGMA journal_mode=WAL`, err)
 	}
 
 	stmts := []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			%s INTEGER PRIMARY KEY,
+			%s TEXT PRIMARY KEY,
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
 			%s INTEGER,
@@ -950,8 +1362,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			colRunsInternetRestoredAt, colRunsFinishedAt, colRunsOutcome, colRunsError,
 		),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			%s INTEGER PRIMARY KEY,
-			%s INTEGER NOT NULL REFERENCES %s(%s),
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
@@ -964,7 +1376,6 @@ func (s *Store) migrate(ctx context.Context) error {
 			colChecksTarget, colChecksKind, colChecksOK, colChecksLatencyMS, colChecksError,
 		),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxChecksRun, tableChecks, colChecksRunID),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxChecksTS, tableChecks, colChecksTS),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			%s INTEGER PRIMARY KEY,
 			%s TEXT NOT NULL,
@@ -977,8 +1388,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			colOutboxAttempts, colOutboxLastError,
 		),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			%s INTEGER PRIMARY KEY,
-			%s INTEGER NOT NULL REFERENCES %s(%s),
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
@@ -991,9 +1402,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			colMetricsName, colMetricsValue, colMetricsUnit, colMetricsOK, colMetricsError,
 		),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxMetricsRun, tableMetrics, colMetricsRunID),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxMetricsTS, tableMetrics, colMetricsTS),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			%s INTEGER PRIMARY KEY REFERENCES %s(%s),
+			%s TEXT PRIMARY KEY REFERENCES %s(%s),
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
@@ -1002,8 +1412,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			colHostRunID, tableRuns, colRunsID, colHostTS, colHostHostname, colHostOS, colHostArch,
 		),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			%s INTEGER PRIMARY KEY AUTOINCREMENT,
-			%s INTEGER NOT NULL REFERENCES %s(%s),
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
 			%s TEXT NOT NULL,
 			%s TEXT NOT NULL,
 			%s INTEGER NOT NULL,
@@ -1015,7 +1425,92 @@ func (s *Store) migrate(ctx context.Context) error {
 			colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError,
 		),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxPingsRun, tablePings, colPingsRunID),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxPingsTS, tablePings, colPingsTS),
+
+		// *_archive twins (issue #4): byte-identical columns to their hot
+		// counterpart bar the table name and the FK target (runs_archive
+		// instead of runs), fed by RolloverToArchive rather than a second
+		// write path. Every id/run_id column, hot and archive alike, is a
+		// UUIDv7 TEXT string (issue #4 supersedes the AUTOINCREMENT-integer
+		// refinement this schema originally shipped with): a UUIDv7 is
+		// time-ordered and never reused, so "archived ids sort before live
+		// hot ids" is intrinsic to the id itself rather than a property the
+		// engine's rowid sequence had to be asked to preserve — it holds
+		// even if the hot set fully empties (a collector outage longer than
+		// HOT_WINDOW_DAYS) and a fresh InsertRun follows.
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s INTEGER,
+			%s TEXT NOT NULL,
+			%s TEXT,
+			%s TEXT,
+			%s TEXT,
+			%s TEXT,
+			%s TEXT,
+			%s TEXT,
+			%s TEXT
+		)`, tableRunsArchive,
+			colRunsID, colRunsStartedAt, colRunsMode, colRunsInternetOK, colRunsAction,
+			colRunsRebootStartedAt, colRunsRouterDownAt, colRunsRouterUpAt,
+			colRunsInternetRestoredAt, colRunsFinishedAt, colRunsOutcome, colRunsError,
+		),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s INTEGER NOT NULL,
+			%s INTEGER,
+			%s TEXT
+		)`, tableChecksArchive,
+			colChecksID, colChecksRunID, tableRunsArchive, colRunsID, colChecksTS, colChecksPhase,
+			colChecksTarget, colChecksKind, colChecksOK, colChecksLatencyMS, colChecksError,
+		),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxChecksArchiveRun, tableChecksArchive, colChecksRunID),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s REAL,
+			%s TEXT NOT NULL,
+			%s INTEGER NOT NULL,
+			%s TEXT
+		)`, tableMetricsArchive,
+			colMetricsID, colMetricsRunID, tableRunsArchive, colRunsID, colMetricsTS, colMetricsCollector,
+			colMetricsName, colMetricsValue, colMetricsUnit, colMetricsOK, colMetricsError,
+		),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxMetricsArchiveRun, tableMetricsArchive, colMetricsRunID),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY REFERENCES %s(%s),
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL
+		)`, tableHostArchive,
+			colHostRunID, tableRunsArchive, colRunsID, colHostTS, colHostHostname, colHostOS, colHostArch,
+		),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY,
+			%s TEXT NOT NULL REFERENCES %s(%s),
+			%s TEXT NOT NULL,
+			%s TEXT NOT NULL,
+			%s INTEGER NOT NULL,
+			%s INTEGER NOT NULL,
+			%s REAL,
+			%s TEXT
+		)`, tablePingsArchive,
+			colPingsID, colPingsRunID, tableRunsArchive, colRunsID, colPingsTS, colPingsHost,
+			colPingsSent, colPingsReceived, colPingsAvgMS, colPingsError,
+		),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s(%s)`, idxPingsArchiveRun, tablePingsArchive, colPingsRunID),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s TEXT PRIMARY KEY, %s TEXT NOT NULL)`,
+			tableMeta, colMetaKey, colMetaValue),
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -1024,6 +1519,43 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// needsQuarantine reports whether the already-open database s predates the
+// UUIDv7 schema (issue #4 FIX 3) and must be set aside rather than used
+// as-is. migrate's CREATE TABLE IF NOT EXISTS silently no-ops against an
+// already-existing runs table, so an old INTEGER-id schema survives
+// untouched underneath it and every subsequent InsertRun then fails
+// "datatype mismatch" forever. A meta.schema_version already reading
+// currentSchemaVersion is always compatible. Anything else is ambiguous by
+// itself, because a genuinely fresh database also has no schema_version row
+// yet (ensureSchemaVersionStamped only writes it after this check runs) —
+// so a missing/stale version is treated as incompatible only when runs
+// already holds at least one row; an empty runs table means "freshly
+// created, not yet stamped", not "predates issue #4".
+func (s *Store) needsQuarantine(ctx context.Context) (bool, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE %s = ?`, colMetaValue, tableMeta, colMetaKey),
+		metaKeySchemaVersion,
+	).Scan(&version)
+	switch {
+	case err == nil && version == currentSchemaVersion:
+		return false, nil
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return false, fmt.Errorf("read schema version: %w", err)
+	}
+
+	var probe int
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM %s LIMIT 1`, tableRuns)).Scan(&probe)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil // freshly created, just not stamped yet
+	case err != nil:
+		return false, fmt.Errorf("probe runs table: %w", err)
+	default:
+		return true, nil // non-empty runs table with a missing/stale schema_version: predates issue #4
+	}
 }
 
 // nullBoolToInt renders a *bool as the nullable INTEGER runs.internet_ok
@@ -1065,6 +1597,54 @@ func nullString(s string) any {
 	return s
 }
 
+// openOnce opens (creating if absent) the SQLite database at path and
+// migrates the schema, applying busy_timeout via the connection DSN rather
+// than a PRAGMA exec (issue #4 FIX 6): modernc.org/sqlite's _pragma query
+// parameter is re-applied by the driver on every new physical connection
+// (conn.go's newConn calls applyQueryParams for each one), whereas a bare
+// PRAGMA exec only ever reaches the single connection it ran on — leaving
+// the daemon's 2nd+ pooled connection (DAEMON_MAX_CONNS) at SQLite's 0
+// (no wait) default. journal_mode=WAL stays a migrate()-time exec: it is
+// sticky at the file level, so one connection setting it is enough. path is
+// left untouched for an in-memory sentinel (":memory:"/"file::memory:"/
+// "mode=memory"): production never pairs one with maxOpenConns>1 (OpenStore's
+// doc), so there is no pooled-connection gap here to close, and appending a
+// query string to the bare ":memory:" form risks the driver no longer
+// recognizing it as the sentinel. openOnce is split out from OpenStore so
+// the self-healing retry (open, discover corruption or an incompatible
+// schema, quarantine, open again) has one simple "just open it" primitive to
+// call more than once.
+func openOnce(ctx context.Context, path string, maxOpenConns int) (*Store, error) {
+	dsn := path
+	if !isMemoryDB(path) {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		dsn = path + sep + "_pragma=busy_timeout%3d5000"
+	}
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
+	}
+
+	if maxOpenConns < 1 {
+		maxOpenConns = 1
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+
+	s := &Store{db: db}
+	if err := s.migrate(ctx); err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w (also failed to close db: %v)", err, closeErr)
+		}
+		return nil, err
+	}
+
+	return s, nil
+}
+
 // parseNullTime parses a nullable RFC3339 column: an invalid (unset) ns
 // stays nil, distinguishing "phase not reached yet" from a zero time.
 func parseNullTime(ns sql.NullString) (*time.Time, error) {
@@ -1085,6 +1665,40 @@ func parseTime(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse time %q: %w", s, err)
 	}
 	return t.UTC(), nil
+}
+
+// quarantineFile renames path and its -wal/-shm siblings aside — never
+// deletes — so OpenStore can create a fresh, working database at path in
+// their place (issue #4 FIX 3), preserving the set-aside files for manual
+// inspection or recovery. The -wal/-shm siblings are renamed BEFORE the main
+// file, not after: a crash between renames is the exact threat this ordering
+// guards against, and SQLite locates a WAL/shm sidecar purely by the main
+// file's own path — so if the main file moved FIRST and a crash struck
+// before its sidecars followed, the next boot would create a brand-new
+// empty database at path, and that fresh file would silently inherit the
+// OLD sidecars still sitting at their original names, corrupting it via
+// stale WAL replay. Renaming the main file LAST means path is only ever
+// vacated once its own sidecars are already safely out of the way, so no
+// crash ordering can produce that outcome — the worst a crash can do is
+// leave path (and thus the whole problem) untouched for the next boot to
+// detect and retry from scratch. Each of the three files is renamed only if
+// it exists — a missing -wal/-shm (WAL not currently active, or already
+// quarantined by an earlier, interrupted attempt) is not an error; only the
+// collector, the database's sole writer and the only caller OpenStore ever
+// grants selfHeal to, calls this function, always under its own exclusive
+// flock, so there is no concurrent second quarantine attempt racing this one
+// that the tolerance needs to guard against either.
+func quarantineFile(path, reason string, now time.Time) error {
+	suffix := fmt.Sprintf(".%s-%s", reason, now.UTC().Format("20060102T150405Z"))
+	for _, p := range []string{path + "-wal", path + "-shm", path} {
+		if err := os.Rename(p, p+suffix); err != nil {
+			if os.IsNotExist(err) {
+				continue // tolerated: no concurrent quarantine attempt can race this one (see doc above)
+			}
+			return fmt.Errorf("quarantine %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // rowScanner abstracts *sql.Row and *sql.Rows behind their shared Scan
@@ -1252,4 +1866,105 @@ func scanRun(row rowScanner) (domain.Run, error) {
 	r.Error = errStr.String
 
 	return r, nil
+}
+
+// seedUUIDv7WatermarkFromDB seeds the process-wide UUIDv7 monotonic
+// watermark (uuid.go's seedUUIDv7Watermark) from the newest id already on
+// disk, across EVERY id-bearing table and both tiers (issue #4 FIX 1): a
+// cron process that restarts after the Pi's wall clock has stepped backward
+// (no RTC, no battery, no NTP — precisely the outage scenario yarddog exists
+// to recover from) would otherwise mint a fresh id whose embedded timestamp
+// sorts BELOW every row already stored, corrupting every "newest run/check/
+// metric" query from that point on. Seeding from runs alone undershoots
+// that watermark: within one run, the parent runs row is minted first and
+// its checks/metrics/pings children after, so a child id routinely carries
+// a higher (ms, counter) than its own run's — MAX(runs.id) misses it
+// entirely. A watermark seeded that low then mints its very next id (the
+// restarted process's own first run) right back inside the range the
+// previous process's children already occupy: not a literal duplicate id
+// (newUUIDv7's trailing random bits still make every id practically
+// unique), but one that sorts BELOW rows already on disk — exactly the
+// ordering corruption this function exists to prevent. seedUUIDv7Watermark
+// only ever raises the watermark, never lowers it, so visiting every table
+// below and seeding each one's own MAX(id) converges on the true global
+// maximum regardless of visiting order. This list must cover EVERY
+// id-bearing telemetry table — host/host_archive are the only ones
+// deliberately absent, since run_id is itself their primary key rather than
+// a separately generated id — a future table that mints its own UUIDv7 id
+// and is left off this list silently reintroduces the same undershoot.
+func (s *Store) seedUUIDv7WatermarkFromDB(ctx context.Context) error {
+	tables := []struct {
+		name     string
+		idColumn string
+	}{
+		{tableRuns, colRunsID},
+		{tableChecks, colChecksID},
+		{tableMetrics, colMetricsID},
+		{tablePings, colPingsID},
+		{tableRunsArchive, colRunsID},
+		{tableChecksArchive, colChecksID},
+		{tableMetricsArchive, colMetricsID},
+		{tablePingsArchive, colPingsID},
+	}
+	for _, tbl := range tables {
+		var id sql.NullString
+		if err := s.db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT MAX(%s) FROM %s`, tbl.idColumn, tbl.name),
+		).Scan(&id); err != nil {
+			return fmt.Errorf("seed uuidv7 watermark from %s: %w", tbl.name, err)
+		}
+		if !id.Valid {
+			continue
+		}
+		ms, counter, err := uuidv7MsAndCounter(id.String)
+		if err != nil {
+			return fmt.Errorf("seed uuidv7 watermark from %s: %w", tbl.name, err)
+		}
+		seedUUIDv7Watermark(ms, counter)
+	}
+	return nil
+}
+
+// spanQuery builds the full SELECT for a history list query (ListMetrics,
+// ListPings), including its own trailing ORDER BY/LIMIT. includeArchive
+// false returns "SELECT cols FROM hotTable<where> ORDER BY idCol DESC LIMIT
+// ?" — today's shape, byte-identical to before archive-spanning existed.
+// includeArchive true unions hotTable and archiveTable (each projected
+// through fullCols, with the identical where fragment applied to both
+// legs); legs reports how many times the caller must append its bound args
+// (1 or 2), since the archive leg repeats the exact same WHERE conditions
+// against a second table.
+//
+// ORDER BY/LIMIT must live INSIDE the compound (UNION ALL ... ORDER BY ...
+// LIMIT ?), never wrapped around it. Pushing them there lets SQLite apply
+// its MERGE(UNION ALL) optimization: id is a TEXT PRIMARY KEY (a UUIDv7
+// string, issue #4, not an autoincrement rowid alias), so each leg is
+// already ordered via the implicit unique index SQLite creates for that
+// constraint ("SCAN ... USING INDEX sqlite_autoindex_..._1" in EXPLAIN QUERY
+// PLAN) — the two pre-sorted streams are merged and cut off at LIMIT
+// without ever materializing the full result. An outer "SELECT ... FROM
+// (union) ORDER BY ... LIMIT ?" instead defeats that — SQLite must SCAN and
+// fully sort both tiers before the outer LIMIT can apply (EXPLAIN QUERY PLAN
+// showed a COMPOUND scan of both tables plus a temp b-tree sort; measured
+// two orders of magnitude slower against tens of thousands of archive rows,
+// both before and after the switch to UUIDv7 ids — the MERGE property comes
+// from the primary-key index, not from any particular id encoding). The
+// outer SELECT here exists only to re-narrow the projection from fullCols
+// (id included, needed for the inner ORDER BY) down to cols (id excluded,
+// matching the hot-only shape); its own ORDER BY re-asserts the final order
+// over what is by then an already LIMIT-bounded, already-sorted handful of
+// rows, so it costs nothing extra.
+func spanQuery(hotTable, archiveTable, cols, fullCols, idCol, where string, includeArchive bool) (query string, legs int) {
+	if !includeArchive {
+		return fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", cols, hotTable, where, idCol), 1
+	}
+	return fmt.Sprintf(
+		`SELECT %[1]s FROM (
+			SELECT %[2]s FROM %[3]s%[4]s
+			UNION ALL
+			SELECT %[2]s FROM %[5]s%[4]s
+			ORDER BY %[6]s DESC LIMIT ?
+		) ORDER BY %[6]s DESC`,
+		cols, fullCols, hotTable, where, archiveTable, idCol,
+	), 2
 }

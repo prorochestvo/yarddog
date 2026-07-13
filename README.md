@@ -133,6 +133,36 @@ painless:
 GOOS=linux GOARCH=arm64 go build -o yarddog ./cmd/yarddog   # e.g. for a Raspberry Pi
 ```
 
+### Upgrading to the hot/archive split
+
+The `*_archive` tables (see [History](#history)) and the UUIDv7 string ids the
+hot and archive tables share are created idempotently, but there is no
+migration path for a database written before this change (`INTEGER`-id
+`runs`/`checks`/`metrics`/`pings`) — the two schemas aren't compatible, so
+rows never "age out" gracefully on an old database.
+
+The collector self-heals this on its own: at startup it detects a pre-upgrade
+database, renames it aside (never deletes it — look for the original filename
+with an `.incompatible-<timestamp>` suffix) and starts a fresh database in its
+place, logging loudly either way. The daemon (`yarddogd`) deliberately does
+not — it is a read-only reader with no lock of its own, so it never renames
+the shared database. If systemd starts it against a pre-upgrade database
+before the collector's next run, it logs a configuration error and exits, and
+systemd restarts it until the collector has recreated the database — a brief
+restart loop on first upgrade, nothing destroyed. Manually resetting the file
+yourself beforehand is therefore optional, not the only way forward — useful
+if you'd rather control exactly when the switch happens, keep the old file's
+original name free, or skip that first-upgrade daemon flap:
+
+```bash
+sudo systemctl stop yarddogd   # if the daemon is running
+sudo rm -f /var/lib/yarddog/yarddog.db /var/lib/yarddog/yarddog.db-wal /var/lib/yarddog/yarddog.db-shm
+```
+
+Either way, any undelivered `tbot_queue` Telegram messages in the old
+database do not carry over to the new one — they stay behind in whichever
+old file results (self-quarantined or manually removed).
+
 ## Configuration
 
 Settings are read from an env file (`--env /path`, default `/opt/yarddog/.env`,
@@ -155,7 +185,8 @@ real environment.
 | `YARDDOG_RECOVERY_INTERVAL` | no | `60s` | polling period after a reboot |
 | `YARDDOG_RECOVERY_TIMEOUT` | no | `15m` | how long to wait for recovery |
 | `YARDDOG_REBOOT_COOLDOWN` | no | `2h` | minimal gap between soft reboots |
-| `YARDDOG_RETENTION_DAYS` | no | `90` | prune old checks/metrics (0 = keep forever) |
+| `YARDDOG_HOT_WINDOW_DAYS` | no | `30` | a run stays in the fast "hot" tables while younger than this; older runs roll into the `*_archive` tables (clamped to 1–100000) |
+| `YARDDOG_RETENTION_DAYS` | no | `90` | prune *archived* runs and their checks/metrics older than this (0 = keep the archive forever; clamped to ≤100000 otherwise) |
 | `YARDDOG_REBOOT_ENABLED` | no | `true` | `false` = monitor-only: check/record/notify, never reboot |
 | `YARDDOG_METRICS_ENABLED` | no | `true` | master switch for the per-run host-telemetry snapshot |
 | `YARDDOG_METRICS_TEMPERATURE` | no | `true` | temperatures in °C (Linux only) |
@@ -203,10 +234,20 @@ by the kernel when the process dies, so it can never go stale.
 ## History
 
 Everything lands in SQLite: `runs` (one row per invocation with all phase
-timestamps), `checks` (one row per probed target), `tg_outbox` (the message
+timestamps), `checks` (one row per probed target), `tbot_queue` (the message
 queue), and — when telemetry is enabled — `metrics` and `host` (the per-run
 snapshot and its host identity). `yarddogd` serves all of it over HTTP (see
 [Daemon / query API](#daemon--query-api)).
+
+`runs`, `checks`, `metrics`, `host`, and `pings` form the fast "hot" working
+set: at every collector startup, any run older than `YARDDOG_HOT_WINDOW_DAYS`
+is moved — together with all its checks/metrics/host/pings rows — into a
+same-shaped `*_archive` table in one step, so recent-history queries never
+scan more than a bounded, `HOT_WINDOW_DAYS`-wide slice. Archived runs older
+than `YARDDOG_RETENTION_DAYS` are then deleted outright, and a full `VACUUM`
+runs at most once a week to reclaim and defragment the space both steps free.
+All three are best-effort maintenance passes — a failure is logged and never
+aborts the actual connectivity check.
 
 ```bash
 sqlite3 /var/lib/yarddog/yarddog.db \
@@ -237,18 +278,27 @@ internet.
 | `GET /health/check` | token | readiness: per-dependency probe report, `200` / `503` |
 | `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
 | `GET /api/v1/metrics/latest` | token | every metric of the newest run that has any (`404` if none) |
-| `GET /api/v1/metrics?since=&collector=&limit=` | token | metrics history, newest first (`200`+`[]` when empty) |
-| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=` | token | ping history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/metrics?since=&collector=&limit=&archive=` | token | metrics history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=&archive=` | token | ping history, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
-| `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` bad id, `404` unknown) |
+| `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` empty id, `404` unknown) |
 
-`since` is RFC3339 UTC; `collector` is one of
+Every `id`/`run_id` — `runs.id`, `checks`/`metrics`/`pings`' own row ids, and the
+`host`/`host_archive` `run_id` — is a UUIDv7 string (RFC 9562), not a numeric
+autoincrement value: it is time-ordered, so lexicographic order already matches
+chronological order (newest-first listings need no separate sort key), and it
+stays globally unique even if a future host ever aggregates records from more
+than one collector. `since` is RFC3339 UTC; `collector` is one of
 `temperature`/`fans`/`cpu`/`memory`/`disk`/`uptime`/`network`; `limit` is capped
 server-side (runs 500, metrics 1000, pings 1000). `/api/v1/pings` rows carry
 `{run_id, ts, host, sent, received, avg_ms, ok, error}`; `avg_ms` is `null`
 unless `ok` (a host with zero replies has no round trip to average).
 `include_unreachable=true` keeps those null-avg rows, which the default
-response omits. `/health/check` probes the SQLite handle
+response omits. `archive=true` additionally spans the `*_archive` tables (see
+[History](#history)) for `/api/v1/metrics` and `/api/v1/pings`; omitted or
+`false` stays within the hot, last-`HOT_WINDOW_DAYS` window. `/api/v1/runs/{id}`
+needs no such flag — it transparently resolves a run whether it is still hot
+or has already been archived. `/health/check` probes the SQLite handle
 (`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
 than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
 it is token-gated because its body names internal dependencies.

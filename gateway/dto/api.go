@@ -23,9 +23,9 @@ type HealthServer struct {
 }
 
 // HostResponse is the body of GET /api/v1/host: the newest host-identity
-// sidecar row.
+// sidecar row. RunID is a UUIDv7 string (issue #4).
 type HostResponse struct {
-	RunID    int64  `json:"run_id"`
+	RunID    string `json:"run_id"`
 	TS       string `json:"ts"`
 	Hostname string `json:"hostname"`
 	OS       string `json:"os"`
@@ -42,11 +42,11 @@ type HostInfoDTO struct {
 }
 
 // MetricDTO is one metrics row of the multi-run list (GET /api/v1/metrics), so
-// it carries its own run_id/ts. Value is nil (JSON null) exactly when OK is
-// false — an unavailable, unsupported, or failed sample never carries a
-// measured value.
+// it carries its own run_id/ts. RunID is a UUIDv7 string (issue #4). Value is
+// nil (JSON null) exactly when OK is false — an unavailable, unsupported, or
+// failed sample never carries a measured value.
 type MetricDTO struct {
-	RunID     int64    `json:"run_id"`
+	RunID     string   `json:"run_id"`
 	TS        string   `json:"ts"`
 	Collector string   `json:"collector"`
 	Name      string   `json:"name"`
@@ -70,11 +70,12 @@ type MetricRowDTO struct {
 
 // MetricsLatestResponse is the body of GET /api/v1/metrics/latest: the
 // available metrics rows of the newest run that has any, sharing that run's
-// RunID/TS and Host identity (hoisted here, not repeated per row — the
-// collector writes the host row with the metrics rows, so that run always has
-// one). Rows with an unavailable sample are omitted unless ?include_empty=true.
+// RunID (a UUIDv7 string, issue #4)/TS and Host identity (hoisted here, not
+// repeated per row — the collector writes the host row with the metrics
+// rows, so that run always has one). Rows with an unavailable sample are
+// omitted unless ?include_empty=true.
 type MetricsLatestResponse struct {
-	RunID   int64          `json:"run_id"`
+	RunID   string         `json:"run_id"`
 	TS      string         `json:"ts"`
 	Host    HostInfoDTO    `json:"host"`
 	Metrics []MetricRowDTO `json:"metrics"`
@@ -88,10 +89,11 @@ type MetricsListResponse struct {
 }
 
 // PingDTO is one pings row of the multi-run list (GET /api/v1/pings), so it
-// carries its own run_id/ts (issue #2). AvgMS is nil (JSON null) exactly when
-// OK is false — an unreachable host never carries a measured round trip.
+// carries its own run_id/ts (issue #2). RunID is a UUIDv7 string (issue #4).
+// AvgMS is nil (JSON null) exactly when OK is false — an unreachable host
+// never carries a measured round trip.
 type PingDTO struct {
-	RunID    int64    `json:"run_id"`
+	RunID    string   `json:"run_id"`
 	TS       string   `json:"ts"`
 	Host     string   `json:"host"`
 	Sent     int      `json:"sent"`
@@ -108,10 +110,12 @@ type PingsListResponse struct {
 	Pings []PingDTO `json:"pings"`
 }
 
-// RunDTO mirrors domain.Run. Every *At field is nil (JSON null) until that
-// phase transition has happened, matching the domain type's own semantics.
+// RunDTO mirrors domain.Run. ID is a UUIDv7 string (issue #4) — an
+// API-visible change from the previously numeric id. Every *At field is nil
+// (JSON null) until that phase transition has happened, matching the domain
+// type's own semantics.
 type RunDTO struct {
-	ID                 int64   `json:"id"`
+	ID                 string  `json:"id"`
 	StartedAt          string  `json:"started_at"`
 	Mode               string  `json:"mode"`
 	InternetOK         *bool   `json:"internet_ok"`

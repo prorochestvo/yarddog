@@ -13,11 +13,14 @@ import (
 // QueryService.Metrics clamps whatever it receives to a hard maximum.
 // IncludeEmpty false (the default) drops unavailable rows (ok=false) in SQL so
 // LIMIT counts only returned rows; true keeps them (?include_empty=true).
+// IncludeArchive false (the default, issue #4) queries the hot table only;
+// true also spans the metrics_archive twin (?archive=true).
 type MetricsFilter struct {
-	Since        time.Time
-	Collector    domain.Collector
-	Limit        int
-	IncludeEmpty bool
+	Since          time.Time
+	Collector      domain.Collector
+	Limit          int
+	IncludeEmpty   bool
+	IncludeArchive bool
 }
 
 // PingFilter narrows HistoryRepository.ListPings (issue #2), mirroring
@@ -26,26 +29,30 @@ type MetricsFilter struct {
 // default", and QueryService.Pings clamps whatever it receives to a hard
 // maximum. IncludeUnreachable false (the default) drops rows with no
 // received replies (received=0) in SQL so LIMIT counts only returned rows;
-// true keeps them (?include_unreachable=true).
+// true keeps them (?include_unreachable=true). IncludeArchive false (the
+// default, issue #4) queries the hot table only; true also spans the
+// pings_archive twin (?archive=true).
 type PingFilter struct {
 	Since              time.Time
 	Host               string
 	Limit              int
 	IncludeUnreachable bool
+	IncludeArchive     bool
 }
 
 // HistoryRepository is the read-only persistence port the query daemon
 // consumes (plans/004-query-daemon.md); infrastructure.Store satisfies it.
 // Every "not found" case is reported through a bool return, never a sentinel
-// error, so services never needs to import database/sql.
+// error, so services never needs to import database/sql. id/runID are
+// opaque UUIDv7 strings (issue #4).
 type HistoryRepository interface {
 	LatestHost(ctx context.Context) (domain.HostRecord, bool, error)
 	LatestMetrics(ctx context.Context) ([]domain.MetricRecord, error)
 	ListMetrics(ctx context.Context, f MetricsFilter) ([]domain.MetricRecord, error)
 	ListPings(ctx context.Context, f PingFilter) ([]domain.PingRecord, error)
 	ListRuns(ctx context.Context, limit int) ([]domain.Run, error)
-	RunByID(ctx context.Context, id int64) (domain.Run, bool, error)
-	ListChecksByRun(ctx context.Context, runID int64) ([]domain.Check, error)
+	RunByID(ctx context.Context, id string) (domain.Run, bool, error)
+	ListChecksByRun(ctx context.Context, runID string) ([]domain.Check, error)
 }
 
 // NewQueryService builds a QueryService over repo.
@@ -88,10 +95,11 @@ func (q *QueryService) Pings(ctx context.Context, f PingFilter) ([]domain.PingRe
 	return q.repo.ListPings(ctx, f)
 }
 
-// Run returns run id together with every checks row recorded against it.
-// found is false when no such run exists, in which case checks is always nil
-// and ListChecksByRun is never called — there is nothing to look up.
-func (q *QueryService) Run(ctx context.Context, id int64) (run domain.Run, checks []domain.Check, found bool, err error) {
+// Run returns run id together with every checks row recorded against it. id
+// is an opaque UUIDv7 string (issue #4). found is false when no such run
+// exists, in which case checks is always nil and ListChecksByRun is never
+// called — there is nothing to look up.
+func (q *QueryService) Run(ctx context.Context, id string) (run domain.Run, checks []domain.Check, found bool, err error) {
 	run, found, err = q.repo.RunByID(ctx, id)
 	if err != nil || !found {
 		return domain.Run{}, nil, found, err

@@ -73,7 +73,14 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := infrastructure.OpenStore(ctx, cfg.DBPath, cfg.MaxConns)
+	// selfHeal is false: the daemon is a read-only reader with no exclusive
+	// lock of its own, and systemd can start it before cron ever fires the
+	// collector — it must never be the process that quarantines/recreates
+	// the shared database (see infrastructure.OpenStore's own doc). If the
+	// database is pre-issue-4 or corrupt, this surfaces as a config error
+	// and systemd restarts the daemon until the collector's next run has
+	// self-healed it.
+	st, err := infrastructure.OpenStore(ctx, cfg.DBPath, cfg.MaxConns, false)
 	if err != nil {
 		log.Printf("yarddogd: open store: %v", err)
 		return domain.ExitConfigError

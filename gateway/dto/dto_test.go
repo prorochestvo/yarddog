@@ -149,7 +149,7 @@ func TestRunDTO_JSON(t *testing.T) {
 		t.Parallel()
 
 		run := RunDTO{
-			ID:        128,
+			ID:        "128",
 			StartedAt: "2026-07-07T04:07:00Z",
 			Mode:      "hard",
 			Action:    "none",
@@ -160,7 +160,7 @@ func TestRunDTO_JSON(t *testing.T) {
 			t.Fatalf("Marshal: %v", err)
 		}
 
-		want := `{"id":128,"started_at":"2026-07-07T04:07:00Z","mode":"hard","internet_ok":null,` +
+		want := `{"id":"128","started_at":"2026-07-07T04:07:00Z","mode":"hard","internet_ok":null,` +
 			`"action":"none","reboot_started_at":null,"router_down_at":null,"router_up_at":null,` +
 			`"internet_restored_at":null,"finished_at":null,"outcome":"","error":""}`
 		if string(body) != want {
@@ -176,7 +176,7 @@ func TestRunDTO_JSON(t *testing.T) {
 		finishedAt := "2026-07-07T04:07:03Z"
 
 		run := RunDTO{
-			ID:              128,
+			ID:              "128",
 			StartedAt:       "2026-07-07T04:07:00Z",
 			Mode:            "soft",
 			InternetOK:      &internetOK,
@@ -223,7 +223,7 @@ func TestMetricDTO_JSON(t *testing.T) {
 		t.Parallel()
 
 		m := MetricDTO{
-			RunID:     128,
+			RunID:     "128",
 			TS:        "2026-07-07T04:07:00Z",
 			Collector: "fans",
 			Name:      "fans",
@@ -237,7 +237,7 @@ func TestMetricDTO_JSON(t *testing.T) {
 			t.Fatalf("Marshal: %v", err)
 		}
 
-		want := `{"run_id":128,"ts":"2026-07-07T04:07:00Z","collector":"fans","name":"fans",` +
+		want := `{"run_id":"128","ts":"2026-07-07T04:07:00Z","collector":"fans","name":"fans",` +
 			`"value":null,"unit":"rpm","ok":false,"error":"no fan sensors present"}`
 		if string(body) != want {
 			t.Fatalf("Marshal() = %s, want %s", body, want)
@@ -249,7 +249,7 @@ func TestMetricDTO_JSON(t *testing.T) {
 
 		value := 52.35
 		m := MetricDTO{
-			RunID:     128,
+			RunID:     "128",
 			TS:        "2026-07-07T04:07:00Z",
 			Collector: "temperature",
 			Name:      "cpu-thermal",
@@ -263,7 +263,7 @@ func TestMetricDTO_JSON(t *testing.T) {
 			t.Fatalf("Marshal: %v", err)
 		}
 
-		want := `{"run_id":128,"ts":"2026-07-07T04:07:00Z","collector":"temperature","name":"cpu-thermal",` +
+		want := `{"run_id":"128","ts":"2026-07-07T04:07:00Z","collector":"temperature","name":"cpu-thermal",` +
 			`"value":52.35,"unit":"celsius","ok":true,"error":""}`
 		if string(body) != want {
 			t.Fatalf("Marshal() = %s, want %s", body, want)

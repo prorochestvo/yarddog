@@ -95,21 +95,35 @@ against rebooting the router because one remote server hiccuped.
 
 ### Data model
 
-SQLite (`modernc.org/sqlite`), WAL mode, `busy_timeout=5000`, times stored UTC/RFC3339,
-schema applied idempotently with `CREATE TABLE IF NOT EXISTS` at startup. Five tables:
+SQLite (`modernc.org/sqlite`), WAL mode, `busy_timeout=5000`, times stored UTC/RFC3339.
+Telemetry primary keys are UUIDv7 (RFC 9562) strings — time-ordered, so `ORDER BY id` /
+`MAX(id)` stay chronological, and globally unique against a future multi-collector merge.
+Schema applied idempotently with `CREATE TABLE IF NOT EXISTS` at startup.
+
+Five **telemetry** tables, each split into a bounded **hot** working set (the names
+below) plus a static **`*_archive`** twin of identical schema:
 
 - `runs` — one row per invocation, carrying every phase timestamp and the outcome.
 - `checks` — one row per probed target (`phase` = `initial` | `recovery`).
-- `tg_outbox` — the Telegram message queue (see **Telegram & the outbox**).
 - `metrics` — host-telemetry snapshot, EAV rows per run (`collector`, `name`, `value`, `unit`, `ok`, `error`); strictly best-effort (a collector never errors a run — an unsupported/absent sensor is an `ok=0` row).
 - `host` — per-run host-identity sidecar (`hostname`/`os`/`arch`), keyed by `run_id`.
+- `pings` — average-ping metrics per configured host (`sent`/`received`/`avg_ms`).
+
+Plus `tbot_queue` — the Telegram message queue (see **Telegram & the outbox**; keeps an
+`INTEGER` id — it is a local queue, never aggregated) — and `meta`, a `key`/`value`
+sidecar (currently `last_vacuum_at`).
 
 Reference table/column names through `const` declarations in `infrastructure/store.go`
 so a schema rename surfaces at compile time / via `grep`, never as a runtime "no such
 column".
-`checks`, `metrics` and `host` older than `RETENTION_DAYS` are pruned at startup (`0` = keep forever). The
-real runtime DB lives at `/var/lib/yarddog/yarddog.db` (outside the repo); tests use
-`:memory:`.
+
+At collector startup, in order: a **run-boundary roll-over** moves runs (and all their
+children) older than `HOT_WINDOW_DAYS` from hot → archive in one transaction;
+`RETENTION_DAYS` then prunes whole aged runs from the archive (`0` = keep forever); a
+weekly, cadence-gated `VACUUM` (tracked in `meta`) compacts the file after the
+connectivity check. Reads hit hot only by default; `runs/{id}` spans both tiers
+transparently and `metrics`/`pings` history spans on `?archive=true`. The real runtime DB
+lives at `/var/lib/yarddog/yarddog.db` (outside the repo); tests use `:memory:`.
 
 ### Health checks — collector N/A, daemon has the pair
 
@@ -220,7 +234,7 @@ layers return plain wrapped errors and let `services` decide.
 
 The Pi's only uplink is *through the router it reboots*, so at the moment a message
 matters most there is often no internet. Every message is therefore written to
-`tg_outbox` first, then a send is attempted; failures stay queued and are flushed when
+`tbot_queue` first, then a send is attempted; failures stay queued and are flushed when
 connectivity returns (end of the recovery loop) and again at the start of the next run.
 A late message carries its original time: `… [queued 04:02]`. Telegram is spoken over
 raw `net/http` — no bot library. The outbox spans three layers: the queue table + CRUD
