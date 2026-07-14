@@ -52,7 +52,7 @@ type HistoryRepository interface {
 	ListChecksByRun(ctx context.Context, runID string) ([]domain.Check, error)
 	OverviewMetrics(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.MetricSeries, error)
 	OverviewPings(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.PingSeries, error)
-	PingOutageSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error)
+	PingSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error)
 }
 
 // NewQueryService builds a QueryService over repo, using clock to resolve the
@@ -98,7 +98,7 @@ func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.M
 // (defaultSince) and bucket is clamped to [minBucket, maxBucket]
 // (clampBucket, defaultBucket when unset), then every enabled metric
 // collector and configured ping host is bucketed across that window. Each
-// PingSeries' Outages come from a separate PingOutageSamples call, collapsed
+// PingSeries' Outages come from a separate PingSamples call, collapsed
 // by collapseOutages and attached to its matching host by a map lookup — a
 // host with no degraded samples in the window simply keeps a nil Outages.
 func (q *QueryService) Overview(ctx context.Context, since time.Time, bucket time.Duration) (domain.Overview, error) {
@@ -115,7 +115,7 @@ func (q *QueryService) Overview(ctx context.Context, since time.Time, bucket tim
 		return domain.Overview{}, err
 	}
 
-	samples, err := q.repo.PingOutageSamples(ctx, since)
+	samples, err := q.repo.PingSamples(ctx, since)
 	if err != nil {
 		return domain.Overview{}, err
 	}
@@ -218,14 +218,16 @@ func clampLimit(limit, def, max int) int {
 }
 
 // collapseOutages groups samples — already ordered (host, id) by
-// PingOutageSamples' own contract — into one domain.PingOutage per maximal
-// run of consecutive same-host entries (plans/010). Adjacency is purely the
-// sequence itself: there is no time-gap heuristic, so a healthy sample that
-// once separated two degraded runs for the same host — already excluded
-// from samples by PingOutageSamples' "received < sent" filter — leaves no
-// trace here, and the two runs merge into a single episode. Returns a map
+// PingSamples' own contract — into one domain.PingOutage per maximal run of
+// consecutive degraded entries for one host (plans/010 FIX 1). A degraded
+// sample (Received<Sent) opens or extends the currently open episode for its
+// host; a healthy sample (Received>=Sent) closes it without starting a new
+// one, so a recover-then-refail for the same host now reports two episodes,
+// not one merged span. A host change also closes whatever episode was open
+// for the previous host before the new row is considered. Returns a map
 // keyed by host so Overview can attach each PingSeries' own episodes by a
-// plain lookup; a host absent from samples is simply absent from the map.
+// plain lookup; a host with no degraded sample in the window is simply
+// absent from the map.
 func collapseOutages(samples []domain.PingRecord) map[string][]domain.PingOutage {
 	out := make(map[string][]domain.PingOutage)
 
@@ -234,15 +236,23 @@ func collapseOutages(samples []domain.PingRecord) map[string][]domain.PingOutage
 	flush := func() {
 		if cur != nil {
 			out[curHost] = append(out[curHost], *cur)
+			cur = nil
 		}
 	}
 
 	for _, s := range samples {
-		lossPct := lossPercent(s.Result.Sent, s.Result.Received)
-
-		if cur == nil || s.Result.Host != curHost {
+		if s.Result.Host != curHost {
 			flush()
 			curHost = s.Result.Host
+		}
+
+		if s.Result.Received >= s.Result.Sent {
+			flush() // a healthy sample closes any open episode and starts nothing
+			continue
+		}
+
+		lossPct := lossPercent(s.Result.Sent, s.Result.Received)
+		if cur == nil {
 			cur = &domain.PingOutage{Start: s.TS, End: s.TS, WorstLossPct: lossPct, Unreachable: s.Result.Received == 0}
 			continue
 		}
@@ -255,7 +265,7 @@ func collapseOutages(samples []domain.PingRecord) map[string][]domain.PingOutage
 			cur.Unreachable = true
 		}
 	}
-	flush() // the final run never sees a host change to trigger its own flush
+	flush() // the final row never sees a host change or healthy sample to trigger its own flush
 
 	return out
 }
@@ -274,10 +284,10 @@ func (q *QueryService) defaultSince(since time.Time) time.Time {
 }
 
 // lossPercent rounds a sample's loss to the nearest whole percent. sent<=0
-// reports 0 rather than dividing by zero — PingOutageSamples' own
-// "received < sent" filter guarantees sent>received>=0 (so sent>=1) for
-// every real row this ever sees, so the guard only protects a future or
-// test caller passing in a degenerate sample directly.
+// reports 0 rather than dividing by zero — collapseOutages only calls this
+// on a sample it has already classified as degraded (received < sent), so
+// sent>=1 for every real row this ever sees; the guard only protects a
+// future or test caller passing in a degenerate sample directly.
 func lossPercent(sent, received int) int {
 	if sent <= 0 {
 		return 0

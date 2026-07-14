@@ -484,7 +484,7 @@ func TestServer_handleOverview(t *testing.T) {
 					{TS: ts, Sent: 5, Received: 5, AvgMS: 10, MaxMS: 12, Samples: 1},
 				}},
 			},
-			pingOutageSamples: []domain.PingRecord{
+			pingSamples: []domain.PingRecord{
 				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
 			},
 		}
@@ -597,10 +597,10 @@ func TestServer_handleOverview(t *testing.T) {
 		}
 	})
 
-	t.Run("a PingOutageSamples repo error is 500 with a generic body", func(t *testing.T) {
+	t.Run("a PingSamples repo error is 500 with a generic body", func(t *testing.T) {
 		t.Parallel()
 
-		srv := newTestServer(&fakeRepo{pingOutageSamplesErr: errors.New("boom")}, "tok")
+		srv := newTestServer(&fakeRepo{pingSamplesErr: errors.New("boom")}, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
 		if rec.Code != http.StatusInternalServerError {

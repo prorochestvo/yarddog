@@ -231,9 +231,9 @@ func TestQueryService_Overview(t *testing.T) {
 		}
 
 		want := testNow.Add(-defaultWindow)
-		if !repo.overviewMetricsSince.Equal(want) || !repo.overviewPingsSince.Equal(want) || !repo.pingOutageSamplesSince.Equal(want) {
+		if !repo.overviewMetricsSince.Equal(want) || !repo.overviewPingsSince.Equal(want) || !repo.pingSamplesSince.Equal(want) {
 			t.Fatalf("repo received since = %v/%v/%v, want %v (now-7d default) on every call",
-				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingOutageSamplesSince, want)
+				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingSamplesSince, want)
 		}
 		if !got.Since.Equal(want) {
 			t.Fatalf("Overview().Since = %v, want %v", got.Since, want)
@@ -251,9 +251,9 @@ func TestQueryService_Overview(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Overview() error = %v", err)
 		}
-		if !repo.overviewMetricsSince.Equal(since) || !repo.overviewPingsSince.Equal(since) || !repo.pingOutageSamplesSince.Equal(since) {
+		if !repo.overviewMetricsSince.Equal(since) || !repo.overviewPingsSince.Equal(since) || !repo.pingSamplesSince.Equal(since) {
 			t.Fatalf("repo received since not forwarded untouched: %v/%v/%v, want %v",
-				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingOutageSamplesSince, since)
+				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingSamplesSince, since)
 		}
 		if !got.Since.Equal(since) {
 			t.Fatalf("Overview().Since = %v, want %v", got.Since, since)
@@ -281,7 +281,7 @@ func TestQueryService_Overview(t *testing.T) {
 		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
 		repo := &fakeHistoryRepository{
 			overviewPingsResult: []domain.PingSeries{{Host: "1.1.1.1"}, {Host: "8.8.8.8"}},
-			pingOutageSamplesResult: []domain.PingRecord{
+			pingSamplesResult: []domain.PingRecord{
 				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
 			},
 		}
@@ -328,11 +328,11 @@ func TestQueryService_Overview(t *testing.T) {
 		}
 	})
 
-	t.Run("a PingOutageSamples repo error propagates", func(t *testing.T) {
+	t.Run("a PingSamples repo error propagates", func(t *testing.T) {
 		t.Parallel()
 
 		wantErr := errors.New("db exploded")
-		repo := &fakeHistoryRepository{pingOutageSamplesErr: wantErr}
+		repo := &fakeHistoryRepository{pingSamplesErr: wantErr}
 		q := newQueryService(repo)
 
 		_, err := q.Overview(t.Context(), time.Time{}, 0)
@@ -610,15 +610,39 @@ func TestCollapseOutages(t *testing.T) {
 		}
 	})
 
-	t.Run("consecutive degraded samples for one host merge across a filtered-out healthy gap (no gap heuristic)", func(t *testing.T) {
+	t.Run("a healthy sample between two degraded clusters for one host splits them into two episodes", func(t *testing.T) {
 		t.Parallel()
 
-		// PingOutageSamples' own "received < sent" filter already excludes any
-		// healthy sample that separated these two clusters in the real pings
-		// history, so collapseOutages never sees it and has no other signal to
-		// split on (adjacency is the filtered sequence itself) — the two
-		// clusters below, however far apart in wall-clock time, merge into one
-		// spanning episode rather than two.
+		// PingSamples now returns every sample, healthy included, so the
+		// midday recovery below is visible to collapseOutages and must close
+		// the morning episode rather than let it merge with the evening
+		// relapse (plans/010 FIX 1: a recover-then-refail is two episodes).
+		morning := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+		midday := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+		evening := time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: morning, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}}, // degraded
+			{TS: midday, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 5}},  // healthy — closes it
+			{TS: evening, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 4}}, // degraded again — new episode
+		})
+
+		outages := got["1.1.1.1"]
+		if len(outages) != 2 {
+			t.Fatalf("outages = %+v, want exactly 2 episodes, split by the healthy sample", outages)
+		}
+		if !outages[0].Start.Equal(morning) || !outages[0].End.Equal(morning) {
+			t.Fatalf("outages[0] Start/End = %v/%v, want both %v (closed at the healthy sample, not extended)", outages[0].Start, outages[0].End, morning)
+		}
+		if !outages[1].Start.Equal(evening) || !outages[1].End.Equal(evening) {
+			t.Fatalf("outages[1] Start/End = %v/%v, want both %v (the relapse starts a fresh episode)", outages[1].Start, outages[1].End, evening)
+		}
+	})
+
+	t.Run("truly consecutive degraded samples for one host still merge into one episode", func(t *testing.T) {
+		t.Parallel()
+
+		// Contrast with the split above: with no healthy sample in between,
+		// adjacency alone still merges consecutive degraded runs.
 		morning := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
 		evening := time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC)
 		got := collapseOutages([]domain.PingRecord{
@@ -739,9 +763,9 @@ type fakeHistoryRepository struct {
 	overviewPingsSince  time.Time
 	overviewPingsBucket time.Duration
 
-	pingOutageSamplesResult []domain.PingRecord
-	pingOutageSamplesErr    error
-	pingOutageSamplesSince  time.Time
+	pingSamplesResult []domain.PingRecord
+	pingSamplesErr    error
+	pingSamplesSince  time.Time
 }
 
 func (f *fakeHistoryRepository) LatestHost(context.Context) (domain.HostRecord, bool, error) {
@@ -788,7 +812,7 @@ func (f *fakeHistoryRepository) OverviewPings(_ context.Context, since time.Time
 	return f.overviewPingsResult, f.overviewPingsErr
 }
 
-func (f *fakeHistoryRepository) PingOutageSamples(_ context.Context, since time.Time) ([]domain.PingRecord, error) {
-	f.pingOutageSamplesSince = since
-	return f.pingOutageSamplesResult, f.pingOutageSamplesErr
+func (f *fakeHistoryRepository) PingSamples(_ context.Context, since time.Time) ([]domain.PingRecord, error) {
+	f.pingSamplesSince = since
+	return f.pingSamplesResult, f.pingSamplesErr
 }

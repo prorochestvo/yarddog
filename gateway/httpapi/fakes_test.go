@@ -97,8 +97,8 @@ type fakeRepo struct {
 	overviewPings    []domain.PingSeries
 	overviewPingsErr error
 
-	pingOutageSamples    []domain.PingRecord
-	pingOutageSamplesErr error
+	pingSamples    []domain.PingRecord
+	pingSamplesErr error
 }
 
 func (f *fakeRepo) LatestHost(context.Context) (domain.HostRecord, bool, error) {
@@ -137,8 +137,8 @@ func (f *fakeRepo) OverviewPings(context.Context, time.Time, time.Duration) ([]d
 	return f.overviewPings, f.overviewPingsErr
 }
 
-func (f *fakeRepo) PingOutageSamples(context.Context, time.Time) ([]domain.PingRecord, error) {
-	return f.pingOutageSamples, f.pingOutageSamplesErr
+func (f *fakeRepo) PingSamples(context.Context, time.Time) ([]domain.PingRecord, error) {
+	return f.pingSamples, f.pingSamplesErr
 }
 
 // fakeHealthProbe is a settable services.HealthProbe stand-in: it reports

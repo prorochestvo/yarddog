@@ -835,7 +835,7 @@ func (s *Store) OverviewMetrics(ctx context.Context, since time.Time, bucket tim
 // OverviewPings returns every hot pings row from since onward, bucketed at
 // bucket-wide intervals and grouped into one domain.PingSeries per host
 // (Outages left nil — services.QueryService.Overview attaches those
-// separately from PingOutageSamples): the dashboard's server-downsampled
+// separately from PingSamples): the dashboard's server-downsampled
 // retrospective view (plans/010, GET /api/v1/overview). Mirrors ListPings'
 // sargable "id >= ? AND ts >= ?" since floor (uuidv7Floor). Unlike
 // ListPings, sent/received are summed over EVERY sample including fully
@@ -903,27 +903,29 @@ func (s *Store) OverviewPings(ctx context.Context, since time.Time, bucket time.
 	return out, nil
 }
 
-// PingOutageSamples returns every hot pings row from since onward where the
-// host lost at least one reply (received < sent), ascending by (host, id) so
-// services.QueryService.Overview can walk each host's samples in
-// chronological order and collapse consecutive degraded runs into
-// domain.PingOutage episodes. Mirrors ListPings' sargable "id >= ? AND
-// ts >= ?" since floor (uuidv7Floor); hot-only and unbounded by any LIMIT —
-// the 7-day default window this is scoped to is already bounded by since.
-func (s *Store) PingOutageSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error) {
-	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s >= ? AND %s >= ? AND %s < %s ORDER BY %s, %s`,
-		pingsColumnList, tablePings, colPingsID, colPingsTS, colPingsReceived, colPingsSent, colPingsHost, colPingsID,
+// PingSamples returns every hot pings row from since onward, ascending by
+// (host, id) so services.QueryService.Overview can walk each host's samples
+// in chronological order and collapse them into domain.PingOutage episodes
+// (plans/010 FIX 1). Unlike ListPings/OverviewPings, this returns healthy
+// rows too, not just degraded ones: collapseOutages needs to see a healthy
+// sample to know that a recover-then-refail for one host is two episodes,
+// not one merged span. Mirrors ListPings' sargable "id >= ? AND ts >= ?"
+// since floor (uuidv7Floor); hot-only and unbounded by any LIMIT — the
+// 7-day default window this is scoped to is already bounded by since.
+func (s *Store) PingSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error) {
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s >= ? AND %s >= ? ORDER BY %s, %s`,
+		pingsColumnList, tablePings, colPingsID, colPingsTS, colPingsHost, colPingsID,
 	)
 
 	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
 	if err != nil {
-		return nil, fmt.Errorf("ping outage samples: %w", err)
+		return nil, fmt.Errorf("ping samples: %w", err)
 	}
 	defer rows.Close()
 
 	out, err := scanPingRecords(rows)
 	if err != nil {
-		return nil, fmt.Errorf("ping outage samples: %w", err)
+		return nil, fmt.Errorf("ping samples: %w", err)
 	}
 	return out, nil
 }

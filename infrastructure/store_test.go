@@ -2035,43 +2035,46 @@ func TestStore_OverviewPings(t *testing.T) {
 	})
 }
 
-func TestStore_PingOutageSamples(t *testing.T) {
+func TestStore_PingSamples(t *testing.T) {
 	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestStore(t)
 
-		got, err := s.PingOutageSamples(t.Context(), time.Time{})
+		got, err := s.PingSamples(t.Context(), time.Time{})
 		if err != nil {
-			t.Fatalf("PingOutageSamples() error = %v", err)
+			t.Fatalf("PingSamples() error = %v", err)
 		}
 		if len(got) != 0 {
-			t.Fatalf("PingOutageSamples() = %d rows, want 0 on an empty store", len(got))
+			t.Fatalf("PingSamples() = %d rows, want 0 on an empty store", len(got))
 		}
 	})
 
-	t.Run("returns only received<sent rows, ascending by (host, id)", func(t *testing.T) {
+	t.Run("returns every row including healthy ones, ascending by (host, id)", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestStore(t)
 		base := time.Now().UTC().Truncate(time.Second)
 
-		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 10, "")                                   // healthy, excluded
+		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 10, "")                                   // healthy
 		insertPingAt(t, s, base.Add(time.Minute), "1.1.1.1", 5, 3, 20, "")                  // degraded
 		insertPingAt(t, s, base.Add(2*time.Minute), "8.8.8.8", 5, 0, 0, "no route to host") // unreachable, degraded
 
-		got, err := s.PingOutageSamples(t.Context(), base.Add(-time.Hour))
+		got, err := s.PingSamples(t.Context(), base.Add(-time.Hour))
 		if err != nil {
-			t.Fatalf("PingOutageSamples() error = %v", err)
+			t.Fatalf("PingSamples() error = %v", err)
 		}
-		if len(got) != 2 {
-			t.Fatalf("PingOutageSamples() = %d rows, want 2 (the healthy round excluded)", len(got))
+		if len(got) != 3 {
+			t.Fatalf("PingSamples() = %d rows, want 3 (every sample, healthy included — collapseOutages needs the healthy one to split episodes)", len(got))
 		}
-		if got[0].Result.Host != "1.1.1.1" || got[0].Result.Received != 3 {
-			t.Fatalf("got[0] = %+v, want the 1.1.1.1 degraded round (host sorts before 8.8.8.8)", got[0])
+		if got[0].Result.Host != "1.1.1.1" || got[0].Result.Received != 5 {
+			t.Fatalf("got[0] = %+v, want the 1.1.1.1 healthy round first (host sorts before 8.8.8.8, id orders within host)", got[0])
 		}
-		if got[1].Result.Host != "8.8.8.8" || got[1].Result.Received != 0 {
-			t.Fatalf("got[1] = %+v, want the 8.8.8.8 unreachable round", got[1])
+		if got[1].Result.Host != "1.1.1.1" || got[1].Result.Received != 3 {
+			t.Fatalf("got[1] = %+v, want the 1.1.1.1 degraded round second", got[1])
+		}
+		if got[2].Result.Host != "8.8.8.8" || got[2].Result.Received != 0 {
+			t.Fatalf("got[2] = %+v, want the 8.8.8.8 unreachable round", got[2])
 		}
 	})
 
@@ -2084,12 +2087,12 @@ func TestStore_PingOutageSamples(t *testing.T) {
 		insertPingAt(t, s, base.Add(-2*time.Hour), "1.1.1.1", 5, 2, 10, "")
 		insertPingAt(t, s, base, "1.1.1.1", 5, 3, 20, "")
 
-		got, err := s.PingOutageSamples(t.Context(), base.Add(-time.Hour))
+		got, err := s.PingSamples(t.Context(), base.Add(-time.Hour))
 		if err != nil {
-			t.Fatalf("PingOutageSamples() error = %v", err)
+			t.Fatalf("PingSamples() error = %v", err)
 		}
 		if len(got) != 1 || got[0].Result.Received != 3 {
-			t.Fatalf("PingOutageSamples() = %+v, want only the recent row (the -2h row is out of range)", got)
+			t.Fatalf("PingSamples() = %+v, want only the recent row (the -2h row is out of range)", got)
 		}
 	})
 }
