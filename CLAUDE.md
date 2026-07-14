@@ -10,7 +10,9 @@ for the user-facing description.
 
 The module ships **two binaries**: `cmd/yarddog`, the short-lived collector above, and
 `cmd/yarddogd`, a long-running **query daemon** that serves the data the collector
-records (runs, checks, host telemetry) as a read-only JSON REST API over the LAN. They
+records (runs, checks, host telemetry) as a read-only JSON REST API over the LAN, plus
+its own embedded, read-only status dashboard at `/` (a static asset built into the
+binary, so the UI version always equals the daemon's). They
 share every layer package and the one SQLite database — the collector is its sole writer
 — but each has its own composition root and its own, disjoint required config.
 
@@ -60,7 +62,7 @@ domain  ←  services  ←  { infrastructure, gateway/* }  ←  { cmd/yarddog, c
 | `gateway/router/` | the device-driver *family*. `New(kind, cfg)` dispatches on `ROUTER_KIND` (default `nokia`) and returns a `services.Rebooter`. A new device (TP-Link ONT, Tapo/Sonoff smart-plug fallback) is "add a driver file + a factory case", never a fork. |
 | `gateway/telegram/` | Telegram Bot API `Client` (implements `Sender`): DSN parse, `sendMessage`, bot-token redaction. |
 | `gateway/dto/` | the wire shapes at those boundaries (Telegram JSON body, Nokia login form + reboot markers, and the daemon's JSON response bodies in `api.go`). |
-| `gateway/httpapi/` | the daemon's inbound-HTTP adapter: a stdlib `net/http` `ServeMux` (Go 1.22 method+`{id}` patterns) serving the read-only JSON REST API, the shared-token auth middleware, and the domain→DTO mapping. Implements `http.Handler`; consumes `services.QueryService` + `services.Inspector`, never `infrastructure`. |
+| `gateway/httpapi/` | the daemon's inbound-HTTP adapter: a stdlib `net/http` `ServeMux` (Go 1.22 method+`{id}` patterns) serving the read-only JSON REST API, the `go:embed`-ed static dashboard at `GET /{$}` (ungated, `web/index.html`), the shared-token auth middleware, and the domain→DTO mapping. Implements `http.Handler`; consumes `services.QueryService` + `services.Inspector`, never `infrastructure`. |
 | `cmd/yarddog/` | the collector's composition root: flags, `flock`, `LoadConfig`, wire every adapter through the ports, `services.Execute`, the only `os.Exit`. |
 | `cmd/yarddogd/` | the daemon's composition root: `LoadDaemonConfig`, open the shared `Store`, wire `QueryService`/`Inspector`/`httpapi.Server`, run `http.Server` with timeouts + `signal.NotifyContext` graceful shutdown, the only `os.Exit`. Its own exit-code contract (0/1/2), disjoint from the collector's. |
 
@@ -121,8 +123,10 @@ At collector startup, in order: a **run-boundary roll-over** moves runs (and all
 children) older than `HOT_WINDOW_DAYS` from hot → archive in one transaction;
 `RETENTION_DAYS` then prunes whole aged runs from the archive (`0` = keep forever); a
 weekly, cadence-gated `VACUUM` (tracked in `meta`) compacts the file after the
-connectivity check. Reads hit hot only by default; `runs/{id}` spans both tiers
-transparently and `metrics`/`pings` history spans on `?archive=true`. The real runtime DB
+connectivity check. The list endpoints read hot only (an absent `since` on
+`metrics`/`pings` defaults to the last 7 days, well inside the hot window); only
+`runs/{id}` spans both tiers transparently. Archive browsing is not exposed on the list
+endpoints yet (a later cursor-pagination pass reintroduces it). The real runtime DB
 lives at `/var/lib/yarddog/yarddog.db` (outside the repo); tests use `:memory:`.
 
 ### Health checks — collector N/A, daemon has the pair

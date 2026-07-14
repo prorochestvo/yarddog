@@ -15,7 +15,17 @@ import (
 var (
 	_ services.HistoryRepository = (*fakeRepo)(nil)
 	_ services.HealthProbe       = (*fakeHealthProbe)(nil)
+	_ services.Clock             = testClock{}
 )
+
+// testClock is a real-time services.Clock for the handler tests; the default
+// 7-day window resolves against wall-clock now, which no handler test asserts
+// to the instant.
+type testClock struct{}
+
+func (testClock) Now() time.Time { return time.Now() }
+
+func (testClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 // decodeJSON decodes rec's body into v, failing the test on any decode
 // error so a malformed response surfaces at the assertion site instead of
@@ -48,7 +58,7 @@ func doRequest(t *testing.T, srv *Server, method, path, token string) *httptest.
 // sit in front of the fakes, so only the repository/probe layer is faked —
 // no DB, no network (plans/004-query-daemon.md Task 8).
 func newTestServer(repo services.HistoryRepository, token string, probes ...services.HealthProbe) *Server {
-	q := services.NewQueryService(repo)
+	q := services.NewQueryService(repo, testClock{})
 	insp := services.NewInspector(time.Second, probes...)
 	return NewServer(q, insp, token, "v0.0.0-test", time.Now())
 }
@@ -80,6 +90,15 @@ type fakeRepo struct {
 
 	listChecks    []domain.Check
 	listChecksErr error
+
+	overviewMetrics    []domain.MetricSeries
+	overviewMetricsErr error
+
+	overviewPings    []domain.PingSeries
+	overviewPingsErr error
+
+	pingSamples    []domain.PingRecord
+	pingSamplesErr error
 }
 
 func (f *fakeRepo) LatestHost(context.Context) (domain.HostRecord, bool, error) {
@@ -108,6 +127,18 @@ func (f *fakeRepo) ListRuns(context.Context, int) ([]domain.Run, error) {
 
 func (f *fakeRepo) RunByID(context.Context, string) (domain.Run, bool, error) {
 	return f.runByID, f.runByIDOK, f.runByIDErr
+}
+
+func (f *fakeRepo) OverviewMetrics(context.Context, time.Time, time.Duration) ([]domain.MetricSeries, error) {
+	return f.overviewMetrics, f.overviewMetricsErr
+}
+
+func (f *fakeRepo) OverviewPings(context.Context, time.Time, time.Duration) ([]domain.PingSeries, error) {
+	return f.overviewPings, f.overviewPingsErr
+}
+
+func (f *fakeRepo) PingSamples(context.Context, time.Time) ([]domain.PingRecord, error) {
+	return f.pingSamples, f.pingSamplesErr
 }
 
 // fakeHealthProbe is a settable services.HealthProbe stand-in: it reports

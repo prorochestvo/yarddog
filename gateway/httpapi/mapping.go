@@ -69,6 +69,27 @@ func hostInfoDTO(h domain.HostInfo) dto.HostInfoDTO {
 	}
 }
 
+// metricBucketDTO maps one domain.MetricBucket onto its wire shape.
+func metricBucketDTO(b domain.MetricBucket) dto.MetricBucketDTO {
+	return dto.MetricBucketDTO{
+		TS:    formatTime(b.TS),
+		Min:   b.Min,
+		Max:   b.Max,
+		Avg:   b.Avg,
+		Count: b.Count,
+	}
+}
+
+// metricBucketDTOs maps a slice of domain.MetricBucket to their wire DTOs,
+// always returning a non-nil (possibly empty) slice (see checkDTOs).
+func metricBucketDTOs(buckets []domain.MetricBucket) []dto.MetricBucketDTO {
+	out := make([]dto.MetricBucketDTO, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, metricBucketDTO(b))
+	}
+	return out
+}
+
 // metricDTO maps one domain.MetricRecord onto its wire shape. Value is nil
 // (JSON null) exactly when the sample is unavailable (OK false), never a
 // measured zero.
@@ -134,6 +155,74 @@ func metricRowDTOs(records []domain.MetricRecord, includeEmpty bool) []dto.Metri
 	return out
 }
 
+// metricSeriesDTO maps one domain.MetricSeries onto its wire shape.
+func metricSeriesDTO(s domain.MetricSeries) dto.MetricSeriesDTO {
+	return dto.MetricSeriesDTO{
+		Collector: string(s.Collector),
+		Name:      s.Name,
+		Unit:      s.Unit,
+		Buckets:   metricBucketDTOs(s.Buckets),
+	}
+}
+
+// metricSeriesDTOs maps a slice of domain.MetricSeries to their wire DTOs,
+// always returning a non-nil (possibly empty) slice (see checkDTOs).
+func metricSeriesDTOs(series []domain.MetricSeries) []dto.MetricSeriesDTO {
+	out := make([]dto.MetricSeriesDTO, 0, len(series))
+	for _, s := range series {
+		out = append(out, metricSeriesDTO(s))
+	}
+	return out
+}
+
+// overviewResponse maps a domain.Overview onto its wire shape (plans/010):
+// Window is resolved server-side (services.QueryService.Overview's own
+// defaults/clamps), never an echo of the raw request params.
+func overviewResponse(o domain.Overview) dto.OverviewResponse {
+	return dto.OverviewResponse{
+		Window: dto.OverviewWindowDTO{
+			Since:  formatTime(o.Since),
+			Until:  formatTime(o.Until),
+			Bucket: o.Bucket.String(),
+		},
+		Metrics: metricSeriesDTOs(o.Metrics),
+		Pings:   pingSeriesDTOs(o.Pings),
+	}
+}
+
+// pingBucketDTO maps one domain.PingBucket onto its wire shape. LossPct
+// comes from domain.LossPercent rather than a field stored on the domain
+// type, since it is a presentation detail derived from Sent/Received, not a
+// value the domain layer itself needs to hold. AvgMS/MaxMS are nil (JSON
+// null) exactly when Received is 0 for the whole bucket — no reply ever came
+// back, so there is no round trip to report — mirroring pingDTO's AvgMS
+// handling.
+func pingBucketDTO(b domain.PingBucket) dto.PingBucketDTO {
+	d := dto.PingBucketDTO{
+		TS:       formatTime(b.TS),
+		Sent:     b.Sent,
+		Received: b.Received,
+		LossPct:  domain.LossPercent(b.Sent, b.Received),
+		Samples:  b.Samples,
+	}
+	if b.Received > 0 {
+		avg, max := b.AvgMS, b.MaxMS
+		d.AvgMS = &avg
+		d.MaxMS = &max
+	}
+	return d
+}
+
+// pingBucketDTOs maps a slice of domain.PingBucket to their wire DTOs,
+// always returning a non-nil (possibly empty) slice (see checkDTOs).
+func pingBucketDTOs(buckets []domain.PingBucket) []dto.PingBucketDTO {
+	out := make([]dto.PingBucketDTO, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, pingBucketDTO(b))
+	}
+	return out
+}
+
 // pingDTO maps one domain.PingRecord onto its wire shape (issue #2). AvgMS
 // is nil (JSON null) exactly when the result is unreachable (OK false),
 // mirroring metricDTO's Value handling.
@@ -162,6 +251,51 @@ func pingDTOs(records []domain.PingRecord) []dto.PingDTO {
 	out := make([]dto.PingDTO, 0, len(records))
 	for _, r := range records {
 		out = append(out, pingDTO(r))
+	}
+	return out
+}
+
+// pingOutageDTO maps one domain.PingOutage onto its wire shape. Kind is
+// "unreachable" when the episode saw at least one 100%-loss sample, "loss"
+// when every sample in it kept at least a partial reply.
+func pingOutageDTO(o domain.PingOutage) dto.PingOutageDTO {
+	kind := "loss"
+	if o.Unreachable {
+		kind = "unreachable"
+	}
+	return dto.PingOutageDTO{
+		Start:        formatTime(o.Start),
+		End:          formatTime(o.End),
+		Kind:         kind,
+		WorstLossPct: o.WorstLossPct,
+	}
+}
+
+// pingOutageDTOs maps a slice of domain.PingOutage to their wire DTOs,
+// always returning a non-nil (possibly empty) slice (see checkDTOs).
+func pingOutageDTOs(outages []domain.PingOutage) []dto.PingOutageDTO {
+	out := make([]dto.PingOutageDTO, 0, len(outages))
+	for _, o := range outages {
+		out = append(out, pingOutageDTO(o))
+	}
+	return out
+}
+
+// pingSeriesDTO maps one domain.PingSeries onto its wire shape.
+func pingSeriesDTO(s domain.PingSeries) dto.PingSeriesDTO {
+	return dto.PingSeriesDTO{
+		Host:    s.Host,
+		Buckets: pingBucketDTOs(s.Buckets),
+		Outages: pingOutageDTOs(s.Outages),
+	}
+}
+
+// pingSeriesDTOs maps a slice of domain.PingSeries to their wire DTOs,
+// always returning a non-nil (possibly empty) slice (see checkDTOs).
+func pingSeriesDTOs(series []domain.PingSeries) []dto.PingSeriesDTO {
+	out := make([]dto.PingSeriesDTO, 0, len(series))
+	for _, s := range series {
+		out = append(out, pingSeriesDTO(s))
 	}
 	return out
 }

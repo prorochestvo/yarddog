@@ -24,6 +24,7 @@
 # Claude Code: local per-developer permission overrides + agent working notes
 .claude/settings.local.json
 .claude/agent-memory/
+.claude/worktrees/
 
 # editors / OS
 .idea/

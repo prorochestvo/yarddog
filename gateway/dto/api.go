@@ -156,6 +156,76 @@ type RunDetailResponse struct {
 	Checks []CheckDTO `json:"checks"`
 }
 
+// OverviewResponse is the body of GET /api/v1/overview (plans/010): the
+// dashboard's server-downsampled multi-day view, one bucketed series per
+// metric collector/name and per configured ping host.
+type OverviewResponse struct {
+	Window  OverviewWindowDTO `json:"window"`
+	Metrics []MetricSeriesDTO `json:"metrics"`
+	Pings   []PingSeriesDTO   `json:"pings"`
+}
+
+// OverviewWindowDTO describes the resolved [Since, Until] span and bucket
+// width an OverviewResponse was computed over — resolved server-side
+// (defaults/clamps), never echoing a raw, possibly-absent request param.
+// Bucket is a Go duration string (e.g. "1h0m0s"), not a number of seconds.
+type OverviewWindowDTO struct {
+	Since  string `json:"since"`
+	Until  string `json:"until"`
+	Bucket string `json:"bucket"`
+}
+
+// MetricSeriesDTO is one (Collector, Name) metric's bucketed history within
+// an OverviewResponse.
+type MetricSeriesDTO struct {
+	Collector string            `json:"collector"`
+	Name      string            `json:"name"`
+	Unit      string            `json:"unit"`
+	Buckets   []MetricBucketDTO `json:"buckets"`
+}
+
+// MetricBucketDTO is one time bucket of a MetricSeriesDTO. Count is always
+// >0 — an empty bucket is simply absent from Buckets, never a zero row.
+type MetricBucketDTO struct {
+	TS    string  `json:"ts"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Avg   float64 `json:"avg"`
+	Count int     `json:"count"`
+}
+
+// PingSeriesDTO is one host's bucketed ping reachability plus every outage
+// episode detected within the window, inside an OverviewResponse.
+type PingSeriesDTO struct {
+	Host    string          `json:"host"`
+	Buckets []PingBucketDTO `json:"buckets"`
+	Outages []PingOutageDTO `json:"outages"`
+}
+
+// PingBucketDTO is one time bucket of a PingSeriesDTO. LossPct is derived
+// from Sent/Received (0 when Sent is 0, per domain.LossPercent). AvgMS and MaxMS are nil (JSON
+// null) exactly when Received is 0 for the whole bucket — no reply ever came
+// back, so there is no round trip to report.
+type PingBucketDTO struct {
+	TS       string   `json:"ts"`
+	Sent     int      `json:"sent"`
+	Received int      `json:"received"`
+	LossPct  int      `json:"loss_pct"`
+	AvgMS    *float64 `json:"avg_ms"`
+	MaxMS    *float64 `json:"max_ms"`
+	Samples  int      `json:"samples"`
+}
+
+// PingOutageDTO is one detected outage episode within a PingSeriesDTO. Kind
+// is "unreachable" when at least one sample in the episode had zero
+// replies, "loss" when every sample kept at least a partial reply.
+type PingOutageDTO struct {
+	Start        string `json:"start"`
+	End          string `json:"end"`
+	Kind         string `json:"kind"`
+	WorstLossPct int    `json:"worst_loss_pct"`
+}
+
 // ErrorResponse is the body of every 4xx/5xx response.
 type ErrorResponse struct {
 	Error string `json:"error"`

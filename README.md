@@ -257,10 +257,14 @@ sqlite3 /var/lib/yarddog/yarddog.db \
 ## Daemon / query API
 
 `yarddog` records everything locally; `yarddogd` is an optional long-running
-companion that serves that record as a read-only JSON REST API, so a dashboard,
-an uptime monitor, or another host on the LAN can read the runs, checks and host
-telemetry without touching the SQLite file directly. The collector stays the
-sole writer — the daemon only ever reads.
+companion that serves that record as a read-only JSON REST API — plus its own
+embedded, read-only status dashboard at `/` — so the built-in page, an uptime
+monitor, or another host on the LAN can read the runs, checks and host telemetry
+without touching the SQLite file directly. The dashboard is a static asset
+compiled into the binary (its version therefore always equals the daemon's, and
+the same value appears in `/health/check`'s `server.version`); it holds no secret
+and is the one route besides `/ping` served without the token. The collector
+stays the sole writer — the daemon only ever reads.
 
 ```bash
 YARDDOG_DAEMON_TOKEN=$(openssl rand -hex 32) YARDDOG_DAEMON_ADDR=192.168.1.10:8420 yarddogd
@@ -268,40 +272,66 @@ YARDDOG_DAEMON_TOKEN=$(openssl rand -hex 32) YARDDOG_DAEMON_ADDR=192.168.1.10:84
 
 It binds `YARDDOG_DAEMON_ADDR` (loopback `127.0.0.1:8420` by default — set a LAN
 `ip:port` to expose it) and requires `YARDDOG_DAEMON_TOKEN`: every route but `/ping`
-demands that secret in the `Authorization: Bearer <token>` header. There is no TLS and no
+and `/` (the secret-free dashboard) demands that secret in the `Authorization: Bearer <token>` header. There is no TLS and no
 per-user auth, so bind it to the LAN behind your firewall, never the open
 internet.
 
 | Method & path | Auth | Returns |
 |---|---|---|
+| `GET /` | — | embedded read-only status dashboard (HTML) |
 | `GET /ping` | — | liveness, always `200 {"status":"ok"}` |
 | `GET /health/check` | token | readiness: per-dependency probe report, `200` / `503` |
 | `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
 | `GET /api/v1/metrics/latest` | token | every metric of the newest run that has any (`404` if none) |
-| `GET /api/v1/metrics?since=&collector=&limit=&archive=` | token | metrics history, newest first (`200`+`[]` when empty) |
-| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=&archive=` | token | ping history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/metrics?since=&collector=&limit=&include_empty=` | token | metrics history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=` | token | ping history, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` empty id, `404` unknown) |
+| `GET /api/v1/overview?since=&bucket=` | token | server-downsampled multi-day view: bucketed metrics + ping reachability with server-detected outage episodes (`200`+`[]` series when empty) |
 
 Every `id`/`run_id` — `runs.id`, `checks`/`metrics`/`pings`' own row ids, and the
 `host`/`host_archive` `run_id` — is a UUIDv7 string (RFC 9562), not a numeric
 autoincrement value: it is time-ordered, so lexicographic order already matches
 chronological order (newest-first listings need no separate sort key), and it
 stays globally unique even if a future host ever aggregates records from more
-than one collector. `since` is RFC3339 UTC; `collector` is one of
+than one collector. `since` is RFC3339 UTC and, when omitted from
+`/api/v1/metrics` or `/api/v1/pings`, defaults to the **last 7 days**; an
+explicit `since` overrides it. `collector` is one of
 `temperature`/`fans`/`cpu`/`memory`/`disk`/`uptime`/`network`; `limit` is capped
-server-side (runs 500, metrics 1000, pings 1000). `/api/v1/pings` rows carry
+server-side (runs 500, metrics 1000, pings 1000) and defaults to 100 when
+absent (runs default 100, metrics/pings 100). `/api/v1/pings` rows carry
 `{run_id, ts, host, sent, received, avg_ms, ok, error}`; `avg_ms` is `null`
 unless `ok` (a host with zero replies has no round trip to average).
 `include_unreachable=true` keeps those null-avg rows, which the default
-response omits. `archive=true` additionally spans the `*_archive` tables (see
-[History](#history)) for `/api/v1/metrics` and `/api/v1/pings`; omitted or
-`false` stays within the hot, last-`HOT_WINDOW_DAYS` window. `/api/v1/runs/{id}`
-needs no such flag — it transparently resolves a run whether it is still hot
-or has already been archived. `/health/check` probes the SQLite handle
+response omits. The list endpoints read the hot tables only — the default
+7-day window sits well inside the `HOT_WINDOW_DAYS` (default 30) hot span, and
+an explicit `since` reaching before the hot floor simply returns what hot
+holds (archive browsing is not yet exposed on the list endpoints).
+`/api/v1/runs/{id}` still transparently resolves a run whether it is hot or
+already archived. `/health/check` probes the SQLite handle
 (`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
 than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
 it is token-gated because its body names internal dependencies.
+
+`GET /api/v1/overview` serves the dashboard's retrospective view: every
+enabled metric collector and configured ping host, bucketed across a window
+instead of returned as raw per-run rows. `since` (RFC3339 UTC) and `bucket`
+(a Go duration, e.g. `2h`) are both optional — omitted, they default to the
+same last-7-days window and a 1-hour bucket, and an out-of-range `bucket` is
+clamped to `[1m, 24h]` rather than rejected. Each `metrics[]` entry is one
+collector/name pair's `{ts, min, max, avg, count}` buckets; each `pings[]`
+entry is one host's `{ts, sent, received, loss_pct, avg_ms, max_ms, samples}`
+buckets (`avg_ms`/`max_ms` are `null` when every sample in the bucket was
+unreachable) plus its own `outages[]` — contiguous runs of degraded samples
+the server has already detected and classified `loss`/`unreachable`, so the
+dashboard never has to recompute them. Metric presentation stays
+gauge-uniform across every collector for now; richer, collector-specific
+presentation (e.g. network throughput, memory breakdown) is deferred to a
+later pass. Everything past that — value thresholds, coloring, alerting — is
+a client-side/dashboard concern; only ping outage detection happens
+server-side. This endpoint is heavier than the row-capped list endpoints — an
+unbounded `GROUP BY` over the whole window — so clients should call it on
+dashboard load or occasional refresh, not on a tight poll.
 
 ```bash
 curl -s -H "Authorization: Bearer $YARDDOG_DAEMON_TOKEN" \

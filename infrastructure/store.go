@@ -439,10 +439,9 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID string) ([]domain.Che
 // ListMetrics returns metrics history matching f, newest first, bounded by
 // f.Limit (a parameterized LIMIT — never string-concatenated, Risk R8).
 // f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Collector's
-// zero value omits the "collector = ?" clause. f.IncludeArchive false (the
-// default) queries the hot table only, byte-for-byte the query this method
-// has always run; true also spans metrics_archive via spanQuery's UNION
-// ALL, with the same conds bound once per leg.
+// zero value omits the "collector = ?" clause. The query is hot-only: an
+// f.Since older than the hot floor simply returns nothing older than hot
+// holds (archive history is out of scope for the list endpoints).
 func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]domain.MetricRecord, error) {
 	var (
 		conds []string
@@ -450,12 +449,10 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 	)
 	if !f.Since.IsZero() {
 		// uuidv7Floor gives the planner a sargable lower bound on the id
-		// index, so a f.IncludeArchive scan can seek and stop early instead
-		// of running to EOF (id order, not ts order, is what the archive
-		// leg's index actually supports). ts >= ? stays as the exact
-		// residual filter, since uuidv7Floor's millisecond truncation can
-		// make it a hair less restrictive than the real cutoff (issue #4
-		// FIX 2).
+		// index so the scan can seek to the cutoff and stop early instead of
+		// running to EOF. ts >= ? stays as the exact residual filter, since
+		// uuidv7Floor's millisecond truncation can make it a hair less
+		// restrictive than the real cutoff (issue #4 FIX 2).
 		conds = append(conds, colMetricsID+" >= ?", colMetricsTS+" >= ?")
 		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
 	}
@@ -472,15 +469,10 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	query, legs := spanQuery(tableMetrics, tableMetricsArchive, metricsColumnList, metricsFullColumnList, colMetricsID, where, f.IncludeArchive)
+	query := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", metricsColumnList, tableMetrics, where, colMetricsID)
+	args = append(args, f.Limit)
 
-	var queryArgs []any
-	for range legs {
-		queryArgs = append(queryArgs, args...)
-	}
-	queryArgs = append(queryArgs, f.Limit)
-
-	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list metrics: %w", err)
 	}
@@ -536,18 +528,17 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID string) ([]domain.Me
 // f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Host's zero
 // value omits the "host = ?" clause; f.IncludeUnreachable false additionally
 // drops received=0 rows in SQL so LIMIT counts only returned rows.
-// f.IncludeArchive false (the default) queries the hot table only,
-// byte-for-byte the query this method has always run; true also spans
-// pings_archive via spanQuery's UNION ALL, with the same conds bound once
-// per leg.
+// The query is hot-only: an f.Since older than the hot floor simply returns
+// nothing older than hot holds (archive history is out of scope for the list
+// endpoints).
 func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.PingRecord, error) {
 	var (
 		conds []string
 		args  []any
 	)
 	if !f.Since.IsZero() {
-		// see ListMetrics: uuidv7Floor gives the planner a sargable id
-		// lower bound so the archive leg can seek and stop early; ts >= ?
+		// see ListMetrics: uuidv7Floor gives the planner a sargable id lower
+		// bound so the scan can seek to the cutoff and stop early; ts >= ?
 		// stays as the exact residual filter (issue #4 FIX 2).
 		conds = append(conds, colPingsID+" >= ?", colPingsTS+" >= ?")
 		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
@@ -565,15 +556,10 @@ func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	query, legs := spanQuery(tablePings, tablePingsArchive, pingsColumnList, pingsFullColumnList, colPingsID, where, f.IncludeArchive)
+	query := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", pingsColumnList, tablePings, where, colPingsID)
+	args = append(args, f.Limit)
 
-	var queryArgs []any
-	for range legs {
-		queryArgs = append(queryArgs, args...)
-	}
-	queryArgs = append(queryArgs, f.Limit)
-
-	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list pings: %w", err)
 	}
@@ -779,6 +765,169 @@ func (s *Store) NewestRunStartedAt(ctx context.Context) (t time.Time, ok bool, e
 	}
 
 	return parsed, true, nil
+}
+
+// OverviewMetrics returns every hot metrics row from since onward, bucketed
+// at bucket-wide intervals and grouped into one domain.MetricSeries per
+// (collector, name): the dashboard's server-downsampled retrospective view
+// (plans/010, GET /api/v1/overview). Mirrors ListMetrics' sargable
+// "id >= ? AND ts >= ?" since floor (uuidv7Floor), but always drops
+// unavailable samples (ok=1, no IncludeEmpty knob here) — an unavailable
+// reading contributes nothing to a MIN/MAX/AVG bucket. bucket is assumed
+// already clamped by services.QueryService.Overview; bucketEpochExpr floors
+// a non-positive value defensively rather than dividing by zero.
+func (s *Store) OverviewMetrics(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.MetricSeries, error) {
+	query := fmt.Sprintf(
+		`SELECT %s, %s, %s, %s AS b, MIN(%s), MAX(%s), AVG(%s), COUNT(%s)
+		 FROM %s
+		 WHERE %s >= ? AND %s >= ? AND %s = 1
+		 GROUP BY %s, %s, b
+		 ORDER BY %s, %s, b`,
+		colMetricsCollector, colMetricsName, colMetricsUnit, bucketEpochExpr(colMetricsTS, bucket),
+		colMetricsValue, colMetricsValue, colMetricsValue, colMetricsValue,
+		tableMetrics,
+		colMetricsID, colMetricsTS, colMetricsOK,
+		colMetricsCollector, colMetricsName,
+		colMetricsCollector, colMetricsName,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("overview metrics: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.MetricSeries
+	var cur *domain.MetricSeries
+	for rows.Next() {
+		var (
+			collector, name, unit string
+			epoch                 int64
+			min, max, avg         float64
+			count                 int
+		)
+		if err := rows.Scan(&collector, &name, &unit, &epoch, &min, &max, &avg, &count); err != nil {
+			return nil, fmt.Errorf("overview metrics: scan: %w", err)
+		}
+
+		// each row's own collector/name is authoritative for whether it starts
+		// a new series — GROUP BY ... ORDER BY collector, name, b already
+		// guarantees every row of one series arrives contiguously.
+		if cur == nil || cur.Collector != domain.Collector(collector) || cur.Name != name {
+			out = append(out, domain.MetricSeries{Collector: domain.Collector(collector), Name: name, Unit: unit})
+			cur = &out[len(out)-1]
+		}
+		cur.Buckets = append(cur.Buckets, domain.MetricBucket{
+			TS:    time.Unix(epoch, 0).UTC(),
+			Min:   min,
+			Max:   max,
+			Avg:   avg,
+			Count: count,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("overview metrics: %w", err)
+	}
+
+	return out, nil
+}
+
+// OverviewPings returns every hot pings row from since onward, bucketed at
+// bucket-wide intervals and grouped into one domain.PingSeries per host
+// (Outages left nil — services.QueryService.Overview attaches those
+// separately from PingSamples): the dashboard's server-downsampled
+// retrospective view (plans/010, GET /api/v1/overview). Mirrors ListPings'
+// sargable "id >= ? AND ts >= ?" since floor (uuidv7Floor). Unlike
+// ListPings, sent/received are summed over EVERY sample including fully
+// unreachable ones — a loss percentage needs the unreachable rows counted —
+// while avg_ms is averaged only over reachable samples (received>0); an
+// all-unreachable bucket leaves both the average and the max SQL NULL,
+// scanned into sql.NullFloat64 and reported as 0 with Samples/Received
+// telling the real story (domain.PingBucket's own doc).
+func (s *Store) OverviewPings(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.PingSeries, error) {
+	query := fmt.Sprintf(
+		`SELECT %s, %s AS b, SUM(%s), SUM(%s), AVG(CASE WHEN %s > 0 THEN %s END), MAX(%s), COUNT(*)
+		 FROM %s
+		 WHERE %s >= ? AND %s >= ?
+		 GROUP BY %s, b
+		 ORDER BY %s, b`,
+		colPingsHost, bucketEpochExpr(colPingsTS, bucket), colPingsSent, colPingsReceived,
+		colPingsReceived, colPingsAvgMS, colPingsAvgMS,
+		tablePings,
+		colPingsID, colPingsTS,
+		colPingsHost,
+		colPingsHost,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("overview pings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.PingSeries
+	var cur *domain.PingSeries
+	for rows.Next() {
+		var (
+			host       string
+			epoch      int64
+			sent, recv int
+			avgMS      sql.NullFloat64
+			maxMS      sql.NullFloat64
+			samples    int
+		)
+		if err := rows.Scan(&host, &epoch, &sent, &recv, &avgMS, &maxMS, &samples); err != nil {
+			return nil, fmt.Errorf("overview pings: scan: %w", err)
+		}
+
+		// each row's own host is authoritative for whether it starts a new
+		// series — GROUP BY ... ORDER BY host, b already guarantees every row
+		// of one series arrives contiguously.
+		if cur == nil || cur.Host != host {
+			out = append(out, domain.PingSeries{Host: host})
+			cur = &out[len(out)-1]
+		}
+		cur.Buckets = append(cur.Buckets, domain.PingBucket{
+			TS:       time.Unix(epoch, 0).UTC(),
+			Sent:     sent,
+			Received: recv,
+			AvgMS:    avgMS.Float64,
+			MaxMS:    maxMS.Float64,
+			Samples:  samples,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("overview pings: %w", err)
+	}
+
+	return out, nil
+}
+
+// PingSamples returns every hot pings row from since onward, ascending by
+// (host, id) so services.QueryService.Overview can walk each host's samples
+// in chronological order and collapse them into domain.PingOutage episodes
+// (plans/010 FIX 1). Unlike ListPings/OverviewPings, this returns healthy
+// rows too, not just degraded ones: collapseOutages needs to see a healthy
+// sample to know that a recover-then-refail for one host is two episodes,
+// not one merged span. Mirrors ListPings' sargable "id >= ? AND ts >= ?"
+// since floor (uuidv7Floor); hot-only and unbounded by any LIMIT — the
+// 7-day default window this is scoped to is already bounded by since.
+func (s *Store) PingSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error) {
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s >= ? AND %s >= ? ORDER BY %s, %s`,
+		pingsColumnList, tablePings, colPingsID, colPingsTS, colPingsHost, colPingsID,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("ping samples: %w", err)
+	}
+	defer rows.Close()
+
+	out, err := scanPingRecords(rows)
+	if err != nil {
+		return nil, fmt.Errorf("ping samples: %w", err)
+	}
+	return out, nil
 }
 
 // PruneArchive deletes every archived run (started_at older than
@@ -1224,6 +1373,23 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// bucketEpochExpr renders the portable "bucket-start epoch seconds" SQL
+// expression for tsCol at the given bucket width (plans/010): strftime('%s',
+// tsCol) converts the stored RFC3339 string to a Unix-epoch second count —
+// portable across any SQLite build, unlike the newer unixepoch() function —
+// integer-divided by the bucket width in seconds and multiplied back rounds
+// it down to that bucket's start. services.QueryService.Overview always
+// clamps bucket to a positive range before calling OverviewMetrics/
+// OverviewPings; a non-positive bucket here is floored to one second so the
+// division can never be by zero.
+func bucketEpochExpr(tsCol string, bucket time.Duration) string {
+	secs := int(bucket / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return fmt.Sprintf(`(CAST(strftime('%%s', %s) AS INTEGER) / %d) * %d`, tsCol, secs, secs)
 }
 
 // chmodStoreFiles restricts path and its WAL-mode -wal/-shm siblings to
@@ -1923,48 +2089,4 @@ func (s *Store) seedUUIDv7WatermarkFromDB(ctx context.Context) error {
 		seedUUIDv7Watermark(ms, counter)
 	}
 	return nil
-}
-
-// spanQuery builds the full SELECT for a history list query (ListMetrics,
-// ListPings), including its own trailing ORDER BY/LIMIT. includeArchive
-// false returns "SELECT cols FROM hotTable<where> ORDER BY idCol DESC LIMIT
-// ?" — today's shape, byte-identical to before archive-spanning existed.
-// includeArchive true unions hotTable and archiveTable (each projected
-// through fullCols, with the identical where fragment applied to both
-// legs); legs reports how many times the caller must append its bound args
-// (1 or 2), since the archive leg repeats the exact same WHERE conditions
-// against a second table.
-//
-// ORDER BY/LIMIT must live INSIDE the compound (UNION ALL ... ORDER BY ...
-// LIMIT ?), never wrapped around it. Pushing them there lets SQLite apply
-// its MERGE(UNION ALL) optimization: id is a TEXT PRIMARY KEY (a UUIDv7
-// string, issue #4, not an autoincrement rowid alias), so each leg is
-// already ordered via the implicit unique index SQLite creates for that
-// constraint ("SCAN ... USING INDEX sqlite_autoindex_..._1" in EXPLAIN QUERY
-// PLAN) — the two pre-sorted streams are merged and cut off at LIMIT
-// without ever materializing the full result. An outer "SELECT ... FROM
-// (union) ORDER BY ... LIMIT ?" instead defeats that — SQLite must SCAN and
-// fully sort both tiers before the outer LIMIT can apply (EXPLAIN QUERY PLAN
-// showed a COMPOUND scan of both tables plus a temp b-tree sort; measured
-// two orders of magnitude slower against tens of thousands of archive rows,
-// both before and after the switch to UUIDv7 ids — the MERGE property comes
-// from the primary-key index, not from any particular id encoding). The
-// outer SELECT here exists only to re-narrow the projection from fullCols
-// (id included, needed for the inner ORDER BY) down to cols (id excluded,
-// matching the hot-only shape); its own ORDER BY re-asserts the final order
-// over what is by then an already LIMIT-bounded, already-sorted handful of
-// rows, so it costs nothing extra.
-func spanQuery(hotTable, archiveTable, cols, fullCols, idCol, where string, includeArchive bool) (query string, legs int) {
-	if !includeArchive {
-		return fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", cols, hotTable, where, idCol), 1
-	}
-	return fmt.Sprintf(
-		`SELECT %[1]s FROM (
-			SELECT %[2]s FROM %[3]s%[4]s
-			UNION ALL
-			SELECT %[2]s FROM %[5]s%[4]s
-			ORDER BY %[6]s DESC LIMIT ?
-		) ORDER BY %[6]s DESC`,
-		cols, fullCols, hotTable, where, archiveTable, idCol,
-	), 2
 }

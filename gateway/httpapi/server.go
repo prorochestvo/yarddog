@@ -56,6 +56,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // mux using Go's method-and-path ServeMux patterns; a request for a known
 // path with the wrong method gets ServeMux's built-in 405.
 func (s *Server) register(mux *http.ServeMux) {
+	// GET /{$} is the exact-root pattern (Go 1.22): it serves the dashboard at
+	// "/" only, leaving every unknown path a clean 404 rather than a catch-all.
+	mux.HandleFunc("GET "+rootPath+"{$}", handleDashboard)
 	mux.HandleFunc("GET "+pingPath, handlePing)
 	mux.HandleFunc("GET /health/check", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/host", s.handleLatestHost)
@@ -64,6 +67,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/pings", s.handlePings)
 	mux.HandleFunc("GET /api/v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.handleRunByID)
+	mux.HandleFunc("GET /api/v1/overview", s.handleOverview)
 }
 
 // loggingMiddleware logs each request's method, path, status, and duration

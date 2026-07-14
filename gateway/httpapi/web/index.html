@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0e14">
+<title>pi5 · status</title>
+<style>
+  /* design tokens — sampled from seilbekskindirov.dev */
+  :root{
+    --bg:#0b0e14; --bg-soft:#0d1117; --panel:#10141d; --panel-hi:#141a25;
+    --line:#1b2230; --line-soft:#161c27;
+    --text:#e7edf3; --text-dim:#9aa6b6; --muted:#6b7789;
+    --accent:#6f9dff; --accent-dim:#5b8def;
+    --ok:#57b74a; --warn:#e0a54e; --crit:#e2564e;
+    --mono:"JetBrains Mono","SF Mono",SFMono-Regular,"Cascadia Code","Roboto Mono",ui-monospace,Menlo,Consolas,monospace;
+    --gutter:clamp(20px,5vw,64px); --maxw:960px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:radial-gradient(1200px 600px at 50% -10%,#101725 0%,transparent 60%),var(--bg);
+    color:var(--text);font-family:var(--mono);font-size:15px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;min-height:100dvh;padding:var(--gutter);
+    display:flex;justify-content:center;
+  }
+  .wrap{width:100%;max-width:var(--maxw)}
+
+  /* terminal titlebar */
+  .bar{display:flex;align-items:center;gap:12px;border:1px solid var(--line);
+    border-radius:10px 10px 0 0;background:linear-gradient(var(--panel-hi),var(--panel));
+    padding:11px 16px;font-size:12.5px;color:var(--text-dim)}
+  .bar .host{display:flex;align-items:center;gap:11px;color:var(--text-dim)}
+  .dots{display:inline-flex;gap:6px}
+  .dots i{width:11px;height:11px;border-radius:50%;background:#3b4353}
+  .bar .right{margin-left:auto;color:var(--muted);letter-spacing:.02em}
+
+  .term{border:1px solid var(--line);border-top:0;border-radius:0 0 10px 10px;
+    background:var(--bg-soft);padding:clamp(20px,4vw,34px)}
+  .prompt{font-size:16px;color:var(--text);margin:0 0 24px}
+  .prompt .dollar{color:var(--ok)}
+  .cursor{display:inline-block;width:9px;height:1.05em;vertical-align:-2px;margin-left:4px;
+    background:var(--ok);animation:blink 1s step-end infinite}
+  @keyframes blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}
+
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(3,1fr)}
+  @media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:460px){.grid{grid-template-columns:1fr}}
+  /* full-width divider: spans every column so following cards wrap to a new row */
+  .sect{grid-column:1/-1;display:flex;align-items:center;gap:10px;
+    margin:6px 2px 0;font-family:var(--mono);font-size:11px;letter-spacing:.11em;
+    text-transform:uppercase;color:var(--muted)}
+  .sect::after{content:"";flex:1;height:1px;background:var(--line)}
+  .sect .cm{color:var(--line);text-transform:none;letter-spacing:0}
+
+  .card{position:relative;border:1px solid var(--line);border-radius:9px;
+    background:linear-gradient(180deg,var(--panel),var(--bg-soft));
+    padding:16px 16px 15px;overflow:hidden;
+    display:flex;flex-direction:column;
+    opacity:0;transform:translateY(8px);animation:rise .5s cubic-bezier(.2,.7,.2,1) forwards}
+  .card::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:2px;
+    background:var(--st,var(--line));border-radius:2px;opacity:.9}
+  .card:nth-child(1){animation-delay:.02s}.card:nth-child(2){animation-delay:.07s}
+  .card:nth-child(3){animation-delay:.12s}.card:nth-child(4){animation-delay:.17s}
+  .card:nth-child(5){animation-delay:.22s}.card:nth-child(6){animation-delay:.27s}
+  @keyframes rise{to{opacity:1;transform:none}}
+
+  .k{font-size:11px;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);
+    display:flex;align-items:center;gap:7px}
+  .k .tag{color:var(--line)}
+  .v{margin-top:10px;font-size:clamp(28px,5.5vw,36px);line-height:1;font-weight:700;
+    letter-spacing:-.02em;color:var(--text);display:flex;align-items:baseline;gap:6px}
+  .v small{font-size:14px;font-weight:500;color:var(--text-dim)}
+  /* meta stays on a single line so every card shares the same rhythm */
+  .meta{margin-top:9px;font-size:12.5px;color:var(--text-dim);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* fixed-height visualization slot: holds a sparkline, a meter, or nothing */
+  .viz{margin-top:11px;height:34px;display:flex;align-items:center}
+  .spark{position:relative;width:100%;height:34px}
+  .spark svg{position:absolute;inset:0;display:block;width:100%;height:34px;overflow:visible}
+  .spark .line{fill:none;stroke:var(--accent);stroke-width:1.6;
+    stroke-linecap:round;stroke-linejoin:round;
+    stroke-dasharray:var(--len);stroke-dashoffset:var(--len);
+    animation:draw .9s ease forwards .15s}
+  .spark .line.dashed{stroke:var(--accent-dim);stroke-dasharray:3 3;
+    stroke-dashoffset:0;opacity:.7;animation:none}
+  .spark .area{fill:var(--accent);opacity:.10}
+  @keyframes draw{to{stroke-dashoffset:0}}
+  .spark .end{fill:var(--accent)}
+
+  /* legend swatches for the dual network line */
+  .lg{display:inline-block;width:12px;height:0;border-top:2px solid var(--accent);
+    border-radius:2px;vertical-align:middle;margin-right:5px}
+  .lg.rx{border-top-style:dashed;border-color:var(--accent-dim);opacity:.85}
+
+  .meter{width:100%;height:5px;border-radius:3px;background:#0a0e15;
+    border:1px solid var(--line-soft);overflow:hidden}
+  .meter>span{display:block;height:100%;width:0;border-radius:3px;
+    background:linear-gradient(90deg,var(--accent-dim),var(--accent));
+    animation:fill .8s cubic-bezier(.2,.7,.2,1) forwards .3s}
+  @keyframes fill{to{width:var(--pct,0%)}}
+
+  .chip{margin-top:auto;padding-top:11px;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--st,var(--text-dim))}
+  .chip b{width:7px;height:7px;border-radius:50%;background:var(--st,var(--muted))}
+  .ok{--st:var(--ok)} .warn{--st:var(--warn)} .crit{--st:var(--crit)} .info{--st:var(--accent-dim)}
+
+  footer{margin-top:22px;color:var(--muted);font-size:12.5px;line-height:1.7}
+  footer .cm{color:var(--line)} footer .warnnote{color:var(--warn)}
+  a{color:var(--accent-dim);text-decoration:none} a:hover{color:var(--accent)}
+
+  /* pending indicator: shown while --watch waits on the daemon / first data */
+  .load{display:inline-flex;align-items:center;gap:9px;color:var(--muted)}
+  .load .cm{color:var(--line)}
+  .load .dots{display:inline-flex;gap:5px}
+  .load .dots i{width:5px;height:5px;border-radius:50%;background:var(--text-dim);
+    opacity:.2;animation:pulse 1.25s ease-in-out infinite}
+  .load .dots i:nth-child(2){animation-delay:.18s}
+  .load .dots i:nth-child(3){animation-delay:.36s}
+  @keyframes pulse{0%,75%,100%{opacity:.2}35%{opacity:1}}
+
+  /* ---- weekly retrospective: gauges + incident feed ---- */
+  /* the whole section is absent until /overview answers, so it takes no space
+     when #weekly is empty and only claims a top margin once populated */
+  #weekly:not(:empty){display:block;margin-top:20px}
+  .wk-sub{color:var(--muted);font-size:11.5px;margin:6px 2px 2px}
+  .wk-sub .cm{color:var(--line)}
+  .wk-note{color:var(--muted);text-transform:none;letter-spacing:0;margin-left:6px}
+
+  .gauges{display:flex;flex-direction:column;gap:12px;margin-top:10px}
+  .gauge{border:1px solid var(--line);border-radius:9px;
+    background:linear-gradient(180deg,var(--panel),var(--bg-soft));padding:13px 15px 11px;
+    opacity:0;transform:translateY(8px);animation:rise .5s cubic-bezier(.2,.7,.2,1) forwards}
+  .ghead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .ghead .k{margin-right:auto}
+  .ghead .thr{font-size:11px;letter-spacing:.04em;color:var(--muted)}
+  .ghead .thr .w{color:var(--warn)} .ghead .thr .c{color:var(--crit)}
+  .ghead .peak{font-size:11.5px;color:var(--text-dim)}
+  .ghead .peak b{color:var(--st,var(--text-dim));font-weight:700}
+
+  /* wide gauge: taller than the live spark and min-width'd so ~168 hourly
+     points scroll on mobile instead of squashing; height tracks the viewBox
+     ratio so the worst-bucket dot stays a circle at any width */
+  .gchart{margin-top:10px;overflow-x:auto;overflow-y:hidden}
+  .gchart svg{display:block;width:100%;min-width:640px;height:auto}
+  .g-band{fill:var(--accent);opacity:.09}
+  .g-avg{fill:none;stroke:var(--text-dim);stroke-width:1;opacity:.45;stroke-linejoin:round}
+  .g-max{fill:none;stroke:var(--accent);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;
+    stroke-dasharray:var(--len);stroke-dashoffset:var(--len);animation:draw 1s ease forwards .12s}
+  .g-thr{stroke-width:1;stroke-dasharray:4 4}
+  .g-thr.w{stroke:var(--warn);opacity:.7} .g-thr.c{stroke:var(--crit);opacity:.8}
+  .g-ring{fill:none;stroke-width:1.4;opacity:.6}
+  .g-ring.c{stroke:var(--crit)} .g-ring.w{stroke:var(--warn)} .g-ring.k{stroke:var(--accent)}
+  .g-dot.c{fill:var(--crit)} .g-dot.w{fill:var(--warn)} .g-dot.k{fill:var(--accent)}
+
+  .feed{display:flex;flex-direction:column;gap:3px;margin-top:10px}
+  .inc{display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+    padding:7px 11px;border:1px solid var(--line-soft);border-radius:7px;
+    background:var(--bg-soft);color:var(--text-dim);font-size:13px}
+  .inc .dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--st,var(--muted))}
+  .inc .who{color:var(--text)}
+  .inc .val{color:var(--st,var(--text-dim));font-variant-numeric:tabular-nums}
+  .inc .rng{margin-left:auto;color:var(--muted);font-size:11.5px;white-space:nowrap}
+  .inc-none{color:var(--text-dim);padding:8px 2px}
+  .inc-none .cm{color:var(--line)}
+  .inc-more{color:var(--muted);font-size:12px;padding:5px 2px}
+  .inc-more .cm{color:var(--line)}
+
+  @media (prefers-reduced-motion:reduce){
+    .card,.meter>span{animation:none;opacity:1;transform:none}
+    .meter>span{width:var(--pct,0%)}
+    .spark .line{animation:none;stroke-dashoffset:0}
+    .load .dots i{animation:none;opacity:.6}
+    .gauge{animation:none;opacity:1;transform:none}
+    .g-max{animation:none;stroke-dashoffset:0}
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <div class="bar">
+    <span class="host"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span id="host">pi5</span></span>
+    <span class="right" id="os"></span>
+  </div>
+  <div class="term">
+    <p class="prompt"><span class="dollar">$</span> <span id="cmd">yarddog status --watch</span><span class="cursor" aria-hidden="true"></span></p>
+    <div class="grid" id="grid"><!-- cards injected here --></div>
+    <section id="weekly"></section><!-- weekly retrospective injected here once /overview answers; kept truly empty so :empty hides it until then -->
+    <footer id="foot"><div class="load"><span class="cm">//</span> waiting for data <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span></div></footer>
+  </div>
+</main>
+
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- read seed, else fetch the api as a fallback ---------------------
+  function readSeed(){
+    try{
+      if (Array.isArray(window.__METRICS__)) return window.__METRICS__;
+      const el = document.getElementById("seed");
+      const raw = el && el.textContent.trim();
+      if (raw && raw[0] === "[") return JSON.parse(raw);
+    }catch(_){}
+    return null;
+  }
+
+  // fetch json, tolerate any failure (missing endpoint, 503, offline) → null
+  async function fetchJSON(url){
+    try{
+      const r = await fetch(url, {headers:{Accept:"application/json"}, cache:"no-store"});
+      if (r.ok) return await r.json();
+    }catch(_){}
+    return null;
+  }
+
+  // pull the ping series alongside the metrics; unreachable targets included on
+  // purpose so a down host shows as a red card instead of silently vanishing.
+  const PINGS_URL = "/api/v1/pings?include_unreachable=true";
+
+  async function load(){
+    let rows = readSeed();
+    const [mj, pj] = await Promise.all([
+      rows ? Promise.resolve(null) : fetchJSON("/api/v1/metrics"),
+      fetchJSON(PINGS_URL),
+    ]);
+    if (!rows) rows = (mj && mj.metrics) || [];
+    render(rows, (pj && pj.pings) || []);
+  }
+
+  // ---- helpers ---------------------------------------------------------
+  // animated pending indicator, reused by the initial state and the no-data path
+  const loader = label =>
+    '<div class="load"><span class="cm">//</span> ' + label
+    + ' <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span></div>';
+  const GiB = 1024**3;
+  const fmtGiB = b => (b/GiB).toFixed(1) + " GiB";
+  const pad = n => String(n).padStart(2,"0");
+
+  function fmtUptime(sec){
+    const d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600), m = Math.floor((sec%3600)/60);
+    if (d > 0) return d+"d "+h+"h";
+    if (h > 0) return h+"h "+m+"m";
+    return m+"m";
+  }
+  function fmtRate(bps){
+    if (bps < 1024) return bps.toFixed(0)+" B/s";
+    if (bps < 1024*1024) return (bps/1024).toFixed(1)+" kB/s";
+    return (bps/1024/1024).toFixed(2)+" MB/s";
+  }
+  function fmtTs(iso){
+    const t = new Date(iso);
+    return t.getFullYear()+"-"+pad(t.getMonth()+1)+"-"+pad(t.getDate())+" "+pad(t.getHours())+":"+pad(t.getMinutes())+":"+pad(t.getSeconds());
+  }
+
+  // shared [warn, crit] thresholds: one source read by the live cards above and
+  // the weekly gauges/incidents below, so the numbers are never duplicated.
+  const TH = { temp:[65,78], load:[2.8,4], disk:[80,92], mem:[80,92] };
+
+  // status thresholds → class name
+  function statusFor(v, warn, crit){
+    if (v == null || Number.isNaN(v)) return "info";
+    if (v >= crit) return "crit";
+    if (v >= warn) return "warn";
+    return "ok";
+  }
+
+  // ---- pivot raw rows into per-run series ------------------------------
+  function pivot(rows){
+    // group by run_id, keep a map of "collector/name" -> value
+    const byRun = new Map();
+    for (const r of rows){
+      let g = byRun.get(r.run_id);
+      if (!g){ g = {run_id:r.run_id, ts:r.ts, v:{}}; byRun.set(r.run_id, g); }
+      g.v[r.collector+"/"+r.name] = r.value;
+    }
+    // sort runs oldest → newest so charts read left to right
+    return [...byRun.values()].sort((a,b)=> new Date(a.ts)-new Date(b.ts));
+  }
+
+  // ---- pivot ping rows into a per-host, time-ordered series -----------
+  // shape per row: {run_id, ts, host, sent, received, avg_ms, ok, error}
+  function pivotPings(rows){
+    const byHost = new Map();
+    for (const p of rows){
+      if (!byHost.has(p.host)) byHost.set(p.host, []);
+      byHost.get(p.host).push(p);
+    }
+    for (const arr of byHost.values()) arr.sort((a,b)=> new Date(a.ts)-new Date(b.ts));
+    return byHost;
+  }
+
+  // reachability, not latency: 0 received → down, partial → loss, full → up.
+  // latency thresholds are target-specific, so we don't invent them.
+  function pingStatus(p){
+    if (!p || p.ok === false || p.received === 0) return "crit";
+    if (p.received < p.sent) return "warn";
+    return "ok";
+  }
+
+  // ---- sparkline: values[] → svg markup --------------------------------
+  // opt: {lo, hi} force a shared domain; {dashed} dashed dim line;
+  //      {area:false} no fill; {end:false} no endpoint dot.
+  function spark(values, opt){
+    opt = opt || {};
+    const W=100, H=30, P=3;
+    const pts = values.filter(v => v != null && !Number.isNaN(v));
+    if (pts.length < 2) return '';
+    let lo = opt.lo != null ? opt.lo : Math.min(...pts);
+    let hi = opt.hi != null ? opt.hi : Math.max(...pts);
+    if (hi === lo){ hi = lo + 1; lo = lo - 1; } // flat series → centered line
+    const n = values.length;
+    const x = i => P + (i/(n-1))*(W-2*P);
+    const y = v => (H-P) - ((v-lo)/(hi-lo))*(H-2*P);
+    let d="", first=true, lastX=0, lastY=0;
+    values.forEach((v,i)=>{
+      if (v==null || Number.isNaN(v)) return;
+      const px=x(i), py=y(v);
+      d += (first?"M":"L")+px.toFixed(2)+" "+py.toFixed(2)+" ";
+      first=false; lastX=px; lastY=py;
+    });
+    const len = Math.round((W-2*P) * 1.6 + H); // rough length for the draw animation
+    const areaSvg = opt.area === false ? "" :
+      '<path class="area" d="M'+P+' '+(H-P)+' '+d.replace(/^M/,"L")+"L"+lastX.toFixed(2)+" "+(H-P)+' Z"/>';
+    const endSvg = opt.end === false ? "" :
+      '<circle class="end" cx="'+lastX.toFixed(2)+'" cy="'+lastY.toFixed(2)+'" r="1.9"/>';
+    return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+      + areaSvg
+      + '<path class="line'+(opt.dashed?' dashed':'')+'" style="--len:'+len+'" d="'+d.trim()+'"/>'
+      + endSvg
+      + '</svg>';
+  }
+
+  // every card shares the same skeleton: k → value → meta(1 line) → viz(34px) → chip(bottom)
+  function card({cls, k, tag, value, unit, meta, viz, pct, chip}){
+    const style = pct != null ? ' style="--pct:'+pct+'%"' : '';
+    return '<div class="card '+(cls||"")+'"'+style+'>'
+      + '<div class="k">'+k+(tag?' <span class="tag">// '+tag+'</span>':'')+'</div>'
+      + '<div class="v">'+value+(unit?'<small>'+unit+'</small>':'')+'</div>'
+      + '<div class="meta">'+(meta||'&nbsp;')+'</div>'
+      + '<div class="viz">'+(viz||'')+'</div>'
+      + '<div class="chip">'+(chip?'<b></b>'+chip:'')+'</div>'
+      + '</div>';
+  }
+
+  // ---- render ----------------------------------------------------------
+  function render(rows, pings){
+    pings = pings || [];
+    const grid = document.getElementById("grid");
+    const foot = document.getElementById("foot");
+    const runs = pivot(rows);
+    if (!runs.length && !pings.length){ foot.innerHTML = loader("waiting for data"); return; }
+
+    const has = v => v != null && !Number.isNaN(v);
+    const wrapSpark = svg => svg ? '<div class="spark">'+svg+'</div>' : '';
+    const cards = [];
+    let last = null, up = null;
+
+    // ---- system metrics (only when snapshots are present) --------------
+    if (runs.length){
+    last = runs[runs.length-1];
+    const g = last.v;
+    const get = key => runs.map(r => r.v[key]);
+
+    // temperature (prefer cpu_thermal)
+    const temp = g["temperature/cpu_thermal"];
+    const tempSeries = get("temperature/cpu_thermal");
+
+    // load
+    const l1 = g["cpu/load1"], l5 = g["cpu/load5"], l15 = g["cpu/load15"];
+    const loadSeries = get("cpu/load1");
+
+    // memory: used = total - available
+    const memTotal = g["memory/total"], memAvail = g["memory/available"];
+    const memUsed = memTotal - memAvail;
+    const memPct = Math.round(memUsed/memTotal*100);
+    const memSeries = runs.map(r => {
+      const t=r.v["memory/total"], a=r.v["memory/available"];
+      return (t&&a!=null) ? (t-a)/t*100 : null;
+    });
+
+    // disk sample names depend on the mount: the root "/" mount drops the
+    // prefix ("used_ratio"), any other keeps it ("/ used_ratio", "/data used_ratio").
+    // accept both so the card survives a mount/prefix change without a code edit.
+    const diskRatio = g["disk/used_ratio"] ?? g["disk// used_ratio"];
+    const dPct = Math.round((diskRatio ?? 0)*100);
+    const dUsed = g["disk/used"] ?? g["disk// used"], dTotal = g["disk/total"] ?? g["disk// total"];
+
+    // uptime
+    up = g["uptime/uptime"];
+    const reboot = new Date(new Date(last.ts).getTime() - up*1000);
+    const rebootStr = reboot.getFullYear()+"-"+pad(reboot.getMonth()+1)+"-"+pad(reboot.getDate())+" "+pad(reboot.getHours())+":"+pad(reboot.getMinutes());
+
+    // network wlan0: derive rate = Δbytes / Δseconds between runs
+    function rateSeries(key){
+      const out=[null];
+      for (let i=1;i<runs.length;i++){
+        const a=runs[i-1], b=runs[i];
+        const db = b.v[key]-a.v[key];
+        const dt = (new Date(b.ts)-new Date(a.ts))/1000;
+        out.push(dt>0 && db>=0 ? db/dt : null);
+      }
+      return out;
+    }
+    const rxRate = rateSeries("network/wlan0 rx_bytes");
+    const txRate = rateSeries("network/wlan0 tx_bytes");
+    const rxNow = rxRate[rxRate.length-1], txNow = txRate[txRate.length-1];
+
+    // ---- build cards (a card renders only when its data is present) ----
+    if (has(temp)) cards.push(card({
+      cls: statusFor(temp, ...TH.temp), k:"cpu.temp", tag:"°C",
+      value: temp.toFixed(1), unit:"°C",
+      meta: (80-temp).toFixed(0)+"°C below throttle",
+      viz: wrapSpark(spark(tempSeries)),
+      chip: statusLabel(statusFor(temp, ...TH.temp))
+    }));
+
+    if (has(l1)) cards.push(card({
+      cls: statusFor(l1, ...TH.load), k:"load.avg", tag:"1m",
+      value: l1.toFixed(2),
+      meta: (l5??0).toFixed(2)+" · "+(l15??0).toFixed(2)+' <span style="color:var(--muted)">(5m · 15m)</span>',
+      viz: wrapSpark(spark(loadSeries)),
+      chip: statusLabel(statusFor(l1, ...TH.load))
+    }));
+
+    if (has(memTotal) && has(memAvail)) cards.push(card({
+      cls: statusFor(memPct, ...TH.mem), k:"mem.used", tag:"%",
+      value: String(memPct), unit:"%",
+      meta: fmtGiB(memUsed)+" of "+fmtGiB(memTotal),
+      viz: wrapSpark(spark(memSeries)),
+      chip: statusLabel(statusFor(memPct, ...TH.mem))
+    }));
+
+    if (has(diskRatio)) cards.push(card({
+      cls: statusFor(dPct, ...TH.disk), k:"disk.used", tag:"/",
+      value: String(dPct), unit:"%",
+      meta: fmtGiB(dUsed)+" of "+fmtGiB(dTotal),
+      viz: '<div class="meter"><span></span></div>', pct: dPct,
+      chip: statusLabel(statusFor(dPct, ...TH.disk))
+    }));
+
+    // network: overlay tx and rx on a shared scale so tx (out) sits above rx (in)
+    if (has(txNow) || has(rxNow)){
+      const netPts = [...txRate, ...rxRate].filter(has);
+      const nlo = netPts.length ? Math.min(...netPts) : 0;
+      const nhi = netPts.length ? Math.max(...netPts) : 1;
+      const netViz = '<div class="spark">'
+        + spark(txRate, {lo:nlo, hi:nhi})
+        + spark(rxRate, {lo:nlo, hi:nhi, dashed:true, area:false})
+        + '</div>';
+      cards.push(card({
+        cls:"info", k:"net.wlan0", tag:"rate",
+        value: has(txNow)?fmtRate(txNow).split(" ")[0]:"—",
+        unit: has(txNow)?fmtRate(txNow).split(" ")[1]:"",
+        meta: '<span class="lg tx"></span>tx&nbsp;'+(has(txNow)?fmtRate(txNow):"—")
+            + '&nbsp;&nbsp;<span class="lg rx"></span>rx&nbsp;'+(has(rxNow)?fmtRate(rxNow):"—"),
+        viz: netViz,
+        chip: "active"
+      }));
+    }
+
+    // fans: only shown when a real sensor reports a reading
+    const fan = g["fans/fans"];
+    if (has(fan)) cards.push(card({
+      cls: fan > 0 ? "ok" : "warn", k:"fan.speed", tag:"rpm",
+      value: String(Math.round(fan)), unit:"rpm",
+      meta: fan > 0 ? "cooling active" : "stalled",
+      viz: wrapSpark(spark(get("fans/fans"))),
+      chip: fan > 0 ? "spinning" : "stalled"
+    }));
+    } // end system metrics
+
+    // ---- ping targets: own row, one card per host --------------------
+    const pingLabel = {ok:"reachable", warn:"packet loss", crit:"unreachable"};
+    const pingHosts = pivotPings(pings);
+    // full-width divider forces the ping cards onto a fresh grid row
+    if (pingHosts.size) cards.push('<div class="sect"><span class="cm">//</span> ping targets</div>');
+    for (const [host, series] of pingHosts){
+      const p = series[series.length-1];
+      const cls = pingStatus(p);
+      const loss = p.sent ? Math.round((1 - p.received/p.sent)*100) : 100;
+      const meta = cls === "ok"
+        ? p.received+"/"+p.sent+" received"
+        : (p.received === 0 ? "100% packet loss"
+                            : loss+"% loss · "+p.received+"/"+p.sent);
+      cards.push(card({
+        cls: cls, k:"ping."+host, tag:"ms",
+        value: has(p.avg_ms) ? p.avg_ms.toFixed(1) : "—",
+        unit:  has(p.avg_ms) ? "ms" : "",
+        meta: meta,
+        viz: wrapSpark(spark(series.map(x => x.avg_ms))),
+        chip: pingLabel[cls]
+      }));
+    }
+
+    grid.innerHTML = cards.join("");
+
+    // footer: only real records, nothing about missing sensors
+    const foots = [];
+    if (has(up)) foots.push('<div><span class="cm">//</span> uptime: '+fmtUptime(up)+'</div>');
+    if (last)    foots.push('<div><span class="cm">//</span> snapshot: #'+last.run_id+' at '+fmtTs(last.ts)+'</div>');
+    foot.innerHTML = foots.join("");
+  }
+
+  function statusLabel(cls){
+    return {ok:"normal", warn:"elevated", crit:"critical", info:"—"}[cls] || "—";
+  }
+
+  // ---- weekly retrospective: /overview → gauges + incident feed --------
+  // the three gauge metrics, keyed to their /overview collector+name identity;
+  // disk arrives as a 0..1 ratio, so it carries a ×100 scale to read as a %.
+  const GAUGES = [
+    {th:"temp", collector:"temperature", name:"cpu_thermal",  label:"cpu.temp",  unit:"°C", scale:1},
+    {th:"load", collector:"cpu",         name:"load1",        label:"load.avg",  unit:"",   scale:1},
+    {th:"disk", collector:"disk",        name:"used_ratio",   label:"disk.used", unit:"%",  scale:100},
+  ];
+
+  // compact MM-DD HH:MM stamp for incident ranges and gauge peak captions
+  function fmtClock(iso){
+    const t = new Date(iso);
+    return pad(t.getMonth()+1)+"-"+pad(t.getDate())+" "+pad(t.getHours())+":"+pad(t.getMinutes());
+  }
+
+  // bucket span in ms, inferred from the first gap between stamps so an episode
+  // end can cover its whole bucket instead of collapsing to a point.
+  function bucketSpan(buckets){
+    for (let i=1;i<buckets.length;i++){
+      const d = new Date(buckets[i].ts) - new Date(buckets[i-1].ts);
+      if (d > 0) return d;
+    }
+    return 3600*1000; // documented 1h default
+  }
+
+  // scaled present points {i, ts, min, max, avg}; empty buckets are dropped so
+  // the path connects across gaps instead of diving to zero.
+  function gaugePoints(buckets, scale){
+    const pts = [];
+    buckets.forEach((b,i) => {
+      if (!b || b.max == null || Number.isNaN(b.max)) return;
+      const mx = b.max*scale;
+      const mn = (b.min != null ? b.min : b.max)*scale;
+      const av = (b.avg != null ? b.avg : b.max)*scale;
+      pts.push({i, ts:b.ts, min:Math.min(mn,mx), max:mx, avg:av});
+    });
+    return pts;
+  }
+
+  // wide gauge svg: faint min–max band, muted avg, bold spike-preserving max,
+  // warn/crit rules, and a ring on the worst bucket. the y-domain always spans
+  // warn..crit so a breach sits visibly above the line; a flat series centers.
+  function gaugeSVG(pts, n, warn, crit){
+    if (!pts.length) return "";
+    const W=720, H=104, P=8;
+    let lo = Math.min(warn, ...pts.map(p => p.min));
+    let hi = Math.max(crit, ...pts.map(p => p.max));
+    const padd = (hi-lo)*0.08 || 1; hi += padd; lo -= padd;
+    if (hi === lo){ hi = lo+1; lo = lo-1; }
+    const x = i => P + (n < 2 ? 0.5 : i/(n-1))*(W-2*P);
+    const y = v => (H-P) - ((v-lo)/(hi-lo))*(H-2*P);
+    const path = sel => pts.map((p,k) => (k?"L":"M")+x(p.i).toFixed(1)+" "+y(p[sel]).toFixed(1)).join(" ");
+    // band = forward along max, then back along min, closed into an envelope
+    const band = "M"+pts.map(p => x(p.i).toFixed(1)+" "+y(p.max).toFixed(1)).join(" L")
+      + " L"+pts.slice().reverse().map(p => x(p.i).toFixed(1)+" "+y(p.min).toFixed(1)).join(" L")+" Z";
+    const rule = (v,c) => '<line class="g-thr '+c+'" x1="'+P+'" x2="'+(W-P)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'"/>';
+    const worst = pts.reduce((a,b) => b.max > a.max ? b : a, pts[0]);
+    const mc = worst.max >= crit ? "c" : worst.max >= warn ? "w" : "k";
+    const wx = x(worst.i).toFixed(1), wy = y(worst.max).toFixed(1);
+    const len = Math.round((W-2*P)*1.6 + H);
+    const multi = pts.length > 1;
+    return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-hidden="true">'
+      + '<path class="g-band" d="'+band+'"/>'
+      + (multi ? '<path class="g-avg" d="'+path("avg")+'"/>' : "")
+      + rule(warn,"w") + rule(crit,"c")
+      + (multi ? '<path class="g-max" style="--len:'+len+'" d="'+path("max")+'"/>' : "")
+      + '<circle class="g-ring '+mc+'" cx="'+wx+'" cy="'+wy+'" r="4.2"/>'
+      + '<circle class="g-dot '+mc+'" cx="'+wx+'" cy="'+wy+'" r="2.3"/>'
+      + '</svg>';
+  }
+
+  // peak value formatted per metric: load raw, disk rounded %, temp one decimal °C
+  function fmtPeak(cfg, v){
+    if (cfg.th === "load") return v.toFixed(2);
+    if (cfg.th === "disk") return Math.round(v)+"%";
+    return v.toFixed(1)+"°C";
+  }
+
+  // one gauge block (header + wide chart) for a present /overview metric series
+  function weeklyGauge(series, cfg){
+    const pts = gaugePoints(series.buckets, cfg.scale);
+    if (!pts.length) return "";
+    const [warn, crit] = TH[cfg.th];
+    const worst = pts.reduce((a,b) => b.max > a.max ? b : a, pts[0]);
+    const peakCls = worst.max >= crit ? "crit" : worst.max >= warn ? "warn" : "";
+    return '<div class="gauge">'
+      + '<div class="ghead">'
+      +   '<span class="k">'+cfg.label+' <span class="tag">// max</span></span>'
+      +   '<span class="thr">warn <span class="w">'+warn+'</span> · crit <span class="c">'+crit+'</span></span>'
+      +   '<span class="peak '+peakCls+'">peak <b>'+fmtPeak(cfg, worst.max)+'</b> · '+fmtClock(worst.ts)+'</span>'
+      + '</div>'
+      + '<div class="gchart">'+gaugeSVG(pts, series.buckets.length, warn, crit)+'</div>'
+      + '</div>';
+  }
+
+  // collapse consecutive breached buckets (max ≥ warn) into episodes; a healthy
+  // bucket or a gap closes the run, and any crit within a run promotes it.
+  function metricEpisodes(buckets, warn, crit, scale){
+    const span = bucketSpan(buckets);
+    const out = []; let cur = null;
+    const close = () => { if (cur){ out.push(cur); cur = null; } };
+    for (const b of buckets){
+      const present = b && b.max != null && !Number.isNaN(b.max);
+      const v = present ? b.max*scale : null;
+      if (present && v >= warn){
+        if (!cur) cur = {start:b.ts, end:b.ts, peak:v, crit:v >= crit};
+        else { cur.end = b.ts; cur.peak = Math.max(cur.peak, v); if (v >= crit) cur.crit = true; }
+      } else close();
+    }
+    close();
+    return out.map(e => ({
+      level: e.crit ? "crit" : "warn",
+      start: e.start,
+      end:   new Date(new Date(e.end).getTime()+span).toISOString(),
+      peak:  e.peak,
+    }));
+  }
+
+  // one incident row: status dot + who + peak/worst value + terminal-styled range
+  function incRow(x){
+    return '<div class="inc '+x.level+'">'
+      + '<span class="dot"></span>'
+      + '<span class="who">'+x.who+'</span>'
+      + '<span class="val">'+x.val+'</span>'
+      + '<span class="rng">'+fmtClock(x.start)+' → '+fmtClock(x.end)+'</span>'
+      + '</div>';
+  }
+
+  // build the whole section from an /overview payload; caps the visible feed and
+  // clears only when there is genuinely nothing to show (no gauges, no pings).
+  function renderWeekly(oj){
+    const host = document.getElementById("weekly");
+    if (!host) return;
+    const metrics = Array.isArray(oj.metrics) ? oj.metrics : [];
+    const pings   = Array.isArray(oj.pings)   ? oj.pings   : [];
+    // match on a name suffix, not equality: the disk series name carries a
+    // mount prefix for non-root mounts ("/ used_ratio", "/data used_ratio")
+    // and none for "/" ("used_ratio"), so endsWith catches every variant;
+    // temp/load names are exact and unaffected.
+    const find = cfg => metrics.find(m =>
+      m.collector === cfg.collector && m.name.endsWith(cfg.name) && Array.isArray(m.buckets) && m.buckets.length);
+
+    const gaugeHTML = [], incidents = [];
+    for (const cfg of GAUGES){
+      const s = find(cfg);
+      if (!s) continue;
+      const g = weeklyGauge(s, cfg);
+      if (g) gaugeHTML.push(g);
+      const [warn, crit] = TH[cfg.th];
+      for (const e of metricEpisodes(s.buckets, warn, crit, cfg.scale))
+        incidents.push({level:e.level, who:cfg.label, val:"peak "+fmtPeak(cfg, e.peak), start:e.start, end:e.end});
+    }
+    // ping outages are server-scored — rendered verbatim, no client threshold
+    for (const p of pings){
+      for (const o of (Array.isArray(p.outages) ? p.outages : [])){
+        const loss = o.worst_loss_pct != null ? Math.round(o.worst_loss_pct)+"% loss"
+                   : (o.kind === "unreachable" ? "unreachable" : "loss");
+        incidents.push({
+          level: o.kind === "unreachable" ? "crit" : "warn",
+          who: "ping "+p.host, val: loss, start:o.start, end:o.end,
+        });
+      }
+    }
+    incidents.sort((a,b) => new Date(b.start) - new Date(a.start)); // newest first
+
+    if (!gaugeHTML.length && !pings.length && !incidents.length){ host.innerHTML = ""; return; }
+
+    const win = oj.window || {};
+    const sub = win.since && win.until
+      ? "window "+fmtClock(win.since)+" → "+fmtClock(win.until)
+      : "last 7 days";
+    const CAP = 20;
+    const feed = incidents.length
+      ? incidents.slice(0, CAP).map(incRow).join("")
+        + (incidents.length > CAP ? '<div class="inc-more"><span class="cm">//</span> +'+(incidents.length-CAP)+' more</div>' : "")
+      : '<div class="inc-none"><span class="cm">//</span> no incidents in the last 7 days</div>';
+
+    const parts = [
+      '<div class="sect"><span class="cm">//</span> weekly retrospective</div>',
+      '<div class="wk-sub"><span class="cm">//</span> '+sub+' · gauges: temp · load · disk · ping — mem/net live-only</div>',
+    ];
+    if (gaugeHTML.length) parts.push('<div class="gauges">'+gaugeHTML.join("")+'</div>');
+    parts.push('<div class="sect"><span class="cm">//</span> incidents'
+      + (incidents.length ? ' <span class="wk-note">'+incidents.length+' in 7d</span>' : '')+'</div>');
+    parts.push('<div class="feed">'+feed+'</div>');
+    host.innerHTML = parts.join("");
+  }
+
+  // fetch /overview and render; a null (endpoint absent, offline, 503) leaves the
+  // already-drawn section untouched — never blanks it on a transient failure.
+  async function loadOverview(){
+    const oj = await fetchJSON("/api/v1/overview");
+    if (!oj) return;
+    renderWeekly(oj);
+  }
+
+  // ---- optional host identity (not part of the metrics api) -----------
+  // server may inject:  window.__HOST__ = {host:"...", os:"...", arch:"..."};
+  function applyHost(){
+    const h = window.__HOST__;
+    if (!h) return; // nothing injected → leave defaults / empty
+    if (h.host) document.getElementById("host").textContent = h.host;
+    const right = [h.os, h.arch].filter(Boolean).join(" · ");
+    if (right) document.getElementById("os").textContent = right;
+  }
+
+  // ---- type the command in on load, like a live terminal --------------
+  function typePrompt(){
+    const el = document.getElementById("cmd");
+    if (!el) return;
+    const full = el.textContent;
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduce) return; // keep full text, cursor still blinks via css
+    el.textContent = "";
+    let i = 0;
+    (function step(){
+      el.textContent = full.slice(0, i++);
+      if (i <= full.length) setTimeout(step, 45);
+    })();
+  }
+
+  applyHost();
+  typePrompt();
+  load();
+  loadOverview();
+
+  // ---- auto-refresh every 3 minutes -----------------------------------
+  // tries an in-place update first (no flash); falls back to a full reload
+  // so a server-injected snapshot still gets refreshed when the api needs auth.
+  const REFRESH_MS = 3 * 60 * 1000;
+  async function refresh(){
+    const [mj, pj] = await Promise.all([
+      fetchJSON("/api/v1/metrics"),
+      fetchJSON(PINGS_URL),
+    ]);
+    if (mj && Array.isArray(mj.metrics)){ render(mj.metrics, (pj && pj.pings) || []); return; }
+    location.reload();
+  }
+  setInterval(refresh, REFRESH_MS);
+
+  // ---- weekly retrospective refresh: slow, decoupled from the live timer
+  // /overview is a heavy 7-day group-by scan, so it is polled far less often
+  // than the live cards; a transient failure leaves the last render in place.
+  const OVERVIEW_MS = 10 * 60 * 1000;
+  setInterval(loadOverview, OVERVIEW_MS);
+})();
+</script>
+</body>
+</html>

@@ -1361,51 +1361,7 @@ func TestStore_ListMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("IncludeArchive spans hot and archive, newest first even when an archived id is lower", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
-
-		oldRunID := insertMetricAt(t, s, old, domain.CollectorCPU, "load1", 1.0, true)
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
-		// the archived run's id must sort lower than every subsequently
-		// generated hot id: UUIDv7 is time-ordered and canonical lowercase
-		// hex sorts lexicographically exactly as it sorts chronologically
-		// (issue #4), so this holds for any two ids generated further apart
-		// in time than the generator's within-millisecond counter spans.
-		// This pins the monotonic-id assumption ORDER BY id DESC relies on
-		// across the hot/archive union.
-		newRunID := insertMetricAt(t, s, now, domain.CollectorCPU, "load1", 2.0, true)
-		if oldRunID >= newRunID {
-			t.Fatalf("fixture invariant broken: archived run id %q must sort lower than hot run id %q", oldRunID, newRunID)
-		}
-
-		withoutArchive, err := s.ListMetrics(t.Context(), services.MetricsFilter{Limit: 10})
-		if err != nil {
-			t.Fatalf("ListMetrics(IncludeArchive=false) error = %v", err)
-		}
-		if len(withoutArchive) != 1 {
-			t.Fatalf("ListMetrics(IncludeArchive=false) = %d rows, want 1 (hot only)", len(withoutArchive))
-		}
-
-		withArchive, err := s.ListMetrics(t.Context(), services.MetricsFilter{Limit: 10, IncludeArchive: true})
-		if err != nil {
-			t.Fatalf("ListMetrics(IncludeArchive=true) error = %v", err)
-		}
-		if len(withArchive) != 2 {
-			t.Fatalf("ListMetrics(IncludeArchive=true) = %d rows, want 2 (hot + archive)", len(withArchive))
-		}
-		if withArchive[0].RunID != newRunID || withArchive[1].RunID != oldRunID {
-			t.Fatalf("ListMetrics(IncludeArchive=true) run ids = [%q, %q], want [%q, %q] newest first",
-				withArchive[0].RunID, withArchive[1].RunID, newRunID, oldRunID)
-		}
-	})
-
-	t.Run("Since older than the hot window pulls archived rows only when IncludeArchive is set", func(t *testing.T) {
+	t.Run("the query is hot-only: a Since older than the hot floor returns nothing archived", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestStore(t)
@@ -1416,123 +1372,36 @@ func TestStore_ListMetrics(t *testing.T) {
 		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
 			t.Fatalf("RolloverToArchive() error = %v", err)
 		}
-
-		withoutArchive, err := s.ListMetrics(t.Context(), services.MetricsFilter{Since: old.Add(-time.Hour), Limit: 10})
-		if err != nil {
-			t.Fatalf("ListMetrics(IncludeArchive=false) error = %v", err)
-		}
-		if len(withoutArchive) != 0 {
-			t.Fatalf("ListMetrics(Since, IncludeArchive=false) = %d rows, want 0 (archived row excluded)", len(withoutArchive))
-		}
-
-		withArchive, err := s.ListMetrics(t.Context(), services.MetricsFilter{Since: old.Add(-time.Hour), Limit: 10, IncludeArchive: true})
-		if err != nil {
-			t.Fatalf("ListMetrics(IncludeArchive=true) error = %v", err)
-		}
-		if len(withArchive) != 1 {
-			t.Fatalf("ListMetrics(Since, IncludeArchive=true) = %d rows, want 1 (the archived row)", len(withArchive))
-		}
-	})
-
-	t.Run("Limit counts rows across the union", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
-
-		insertMetricAt(t, s, old, domain.CollectorCPU, "load1", 1.0, true)
-		insertMetricAt(t, s, old.Add(time.Minute), domain.CollectorCPU, "load1", 1.5, true)
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
-		insertMetricAt(t, s, now, domain.CollectorCPU, "load1", 2.0, true)
-
-		got, err := s.ListMetrics(t.Context(), services.MetricsFilter{Limit: 2, IncludeArchive: true})
+		// the only row was rolled into the archive; ListMetrics reads hot
+		// only, so even a Since reaching back before it returns nothing.
+		got, err := s.ListMetrics(t.Context(), services.MetricsFilter{Since: old.Add(-time.Hour), Limit: 10})
 		if err != nil {
 			t.Fatalf("ListMetrics() error = %v", err)
 		}
-		if len(got) != 2 {
-			t.Fatalf("ListMetrics(Limit=2, IncludeArchive) = %d rows, want 2 (limit applied over the union)", len(got))
+		if len(got) != 0 {
+			t.Fatalf("ListMetrics(Since older than hot) = %d rows, want 0 (archived row is out of scope)", len(got))
 		}
 	})
 
-	t.Run("IncludeArchive query plan merges instead of materializing and sorting", func(t *testing.T) {
+	t.Run("Since adds a sargable id floor so the scan seeks instead of running to EOF", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestStore(t)
 		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
 
-		insertMetricAt(t, s, old, domain.CollectorCPU, "load1", 1.0, true)
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
-		insertMetricAt(t, s, now, domain.CollectorCPU, "load1", 2.0, true)
-
-		// build the exact SQL ListMetrics(IncludeArchive: true) runs by
-		// calling the same spanQuery helper, so this test can never drift
-		// from the real query shape.
-		query, _ := spanQuery(tableMetrics, tableMetricsArchive, metricsColumnList, metricsFullColumnList, colMetricsID,
-			" WHERE "+colMetricsOK+" = 1", true)
-
-		rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, 100)
-		if err != nil {
-			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
-		}
-		defer rows.Close()
-
-		var plan strings.Builder
-		for rows.Next() {
-			var id, parent, notused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
-				t.Fatalf("scan query plan row: %v", err)
-			}
-			plan.WriteString(detail)
-			plan.WriteString("\n")
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatalf("query plan rows: %v", err)
-		}
-
-		got := plan.String()
-		if !strings.Contains(got, "MERGE (UNION ALL)") {
-			t.Fatalf("query plan =\n%swant it to contain %q — the archive-spanning UNION ALL must merge two pre-sorted legs, not materialize the whole result", got, "MERGE (UNION ALL)")
-		}
-		if strings.Contains(got, "TEMP B-TREE") {
-			t.Fatalf("query plan =\n%swant no %q — that would mean SQLite is fully sorting instead of merging", got, "TEMP B-TREE")
-		}
-	})
-
-	t.Run("Since adds a sargable id floor so the archive leg seeks instead of scanning to EOF", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
-
-		insertMetricAt(t, s, old, domain.CollectorCPU, "load1", 1.0, true)
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
+		insertMetricAt(t, s, now.Add(-2*time.Hour), domain.CollectorCPU, "load1", 1.0, true)
 		insertMetricAt(t, s, now, domain.CollectorCPU, "load1", 2.0, true)
 
 		// mirrors the exact WHERE clause ListMetrics builds for a Since
 		// filter (issue #4 FIX 2): id >= uuidv7Floor(since) is the sargable
 		// condition under test, ts >= since stays the exact residual, and
-		// ok = 1 is IncludeEmpty's default. since sits inside the hot
-		// window, so the archive leg matches zero rows — exactly the case
-		// that used to cost a full scan to EOF despite returning nothing.
+		// ok = 1 is IncludeEmpty's default.
 		since := now.Add(-time.Hour)
-		where := fmt.Sprintf(" WHERE %s >= ? AND %s >= ? AND %s = 1", colMetricsID, colMetricsTS, colMetricsOK)
-		query, legs := spanQuery(tableMetrics, tableMetricsArchive, metricsColumnList, metricsFullColumnList, colMetricsID, where, true)
-		if legs != 2 {
-			t.Fatalf("spanQuery() legs = %d, want 2 for IncludeArchive", legs)
-		}
+		query := fmt.Sprintf("SELECT %s FROM %s WHERE %s >= ? AND %s >= ? AND %s = 1 ORDER BY %s DESC LIMIT ?",
+			metricsColumnList, tableMetrics, colMetricsID, colMetricsTS, colMetricsOK, colMetricsID)
 
 		rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query,
-			uuidv7Floor(since), formatTime(since), uuidv7Floor(since), formatTime(since), 100)
+			uuidv7Floor(since), formatTime(since), 100)
 		if err != nil {
 			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 		}
@@ -1553,11 +1422,11 @@ func TestStore_ListMetrics(t *testing.T) {
 		}
 
 		got := plan.String()
-		wantSearch := fmt.Sprintf("SEARCH %s USING INDEX", tableMetricsArchive)
+		wantSearch := fmt.Sprintf("SEARCH %s USING INDEX", tableMetrics)
 		if !strings.Contains(got, wantSearch) {
-			t.Fatalf("query plan =\n%swant %q — the id floor must let SQLite seek instead of scanning the whole archive tier just to check ts as a residual", got, wantSearch)
+			t.Fatalf("query plan =\n%swant %q — the id floor must let SQLite seek instead of scanning the whole tier just to check ts as a residual", got, wantSearch)
 		}
-		wantNoScan := fmt.Sprintf("SCAN %s USING INDEX", tableMetricsArchive)
+		wantNoScan := fmt.Sprintf("SCAN %s USING INDEX", tableMetrics)
 		if strings.Contains(got, wantNoScan) {
 			t.Fatalf("query plan =\n%swant no %q — that is exactly the full-scan-to-EOF regression the id floor fixes", got, wantNoScan)
 		}
@@ -1680,47 +1549,7 @@ func TestStore_ListPings(t *testing.T) {
 		}
 	})
 
-	t.Run("IncludeArchive spans hot and archive, newest first even when an archived id is lower", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
-
-		oldRunID := insertPingAt(t, s, old, "1.1.1.1", 5, 5, 10, "")
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
-		// UUIDv7 is time-ordered (issue #4), so the archived id sorts lower
-		// than the later-generated hot id, pinning the assumption
-		// ORDER BY id DESC relies on across the hot/archive union.
-		newRunID := insertPingAt(t, s, now, "1.1.1.1", 5, 5, 20, "")
-		if oldRunID >= newRunID {
-			t.Fatalf("fixture invariant broken: archived run id %q must sort lower than hot run id %q", oldRunID, newRunID)
-		}
-
-		withoutArchive, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10})
-		if err != nil {
-			t.Fatalf("ListPings(IncludeArchive=false) error = %v", err)
-		}
-		if len(withoutArchive) != 1 {
-			t.Fatalf("ListPings(IncludeArchive=false) = %d rows, want 1 (hot only)", len(withoutArchive))
-		}
-
-		withArchive, err := s.ListPings(t.Context(), services.PingFilter{Limit: 10, IncludeArchive: true})
-		if err != nil {
-			t.Fatalf("ListPings(IncludeArchive=true) error = %v", err)
-		}
-		if len(withArchive) != 2 {
-			t.Fatalf("ListPings(IncludeArchive=true) = %d rows, want 2 (hot + archive)", len(withArchive))
-		}
-		if withArchive[0].RunID != newRunID || withArchive[1].RunID != oldRunID {
-			t.Fatalf("ListPings(IncludeArchive=true) run ids = [%q, %q], want [%q, %q] newest first",
-				withArchive[0].RunID, withArchive[1].RunID, newRunID, oldRunID)
-		}
-	})
-
-	t.Run("Since older than the hot window pulls archived rows only when IncludeArchive is set", func(t *testing.T) {
+	t.Run("the query is hot-only: a Since older than the hot floor returns nothing archived", func(t *testing.T) {
 		t.Parallel()
 
 		s := newTestStore(t)
@@ -1731,76 +1560,39 @@ func TestStore_ListPings(t *testing.T) {
 		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
 			t.Fatalf("RolloverToArchive() error = %v", err)
 		}
-
-		withoutArchive, err := s.ListPings(t.Context(), services.PingFilter{Since: old.Add(-time.Hour), Limit: 10})
-		if err != nil {
-			t.Fatalf("ListPings(IncludeArchive=false) error = %v", err)
-		}
-		if len(withoutArchive) != 0 {
-			t.Fatalf("ListPings(Since, IncludeArchive=false) = %d rows, want 0 (archived row excluded)", len(withoutArchive))
-		}
-
-		withArchive, err := s.ListPings(t.Context(), services.PingFilter{Since: old.Add(-time.Hour), Limit: 10, IncludeArchive: true})
-		if err != nil {
-			t.Fatalf("ListPings(IncludeArchive=true) error = %v", err)
-		}
-		if len(withArchive) != 1 {
-			t.Fatalf("ListPings(Since, IncludeArchive=true) = %d rows, want 1 (the archived row)", len(withArchive))
-		}
-	})
-
-	t.Run("Limit counts rows across the union", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
-
-		insertPingAt(t, s, old, "1.1.1.1", 5, 5, 10, "")
-		insertPingAt(t, s, old.Add(time.Minute), "1.1.1.1", 5, 5, 15, "")
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
-		insertPingAt(t, s, now, "1.1.1.1", 5, 5, 20, "")
-
-		got, err := s.ListPings(t.Context(), services.PingFilter{Limit: 2, IncludeArchive: true})
+		// the only row was rolled into the archive; ListPings reads hot only,
+		// so even a Since reaching back before it returns nothing.
+		got, err := s.ListPings(t.Context(), services.PingFilter{Since: old.Add(-time.Hour), Limit: 10})
 		if err != nil {
 			t.Fatalf("ListPings() error = %v", err)
 		}
-		if len(got) != 2 {
-			t.Fatalf("ListPings(Limit=2, IncludeArchive) = %d rows, want 2 (limit applied over the union)", len(got))
+		if len(got) != 0 {
+			t.Fatalf("ListPings(Since older than hot) = %d rows, want 0 (archived row is out of scope)", len(got))
 		}
 	})
 
-	t.Run("Since adds a sargable id floor so the archive leg seeks instead of scanning to EOF", func(t *testing.T) {
+	t.Run("Since adds a sargable id floor so the scan seeks instead of running to EOF", func(t *testing.T) {
 		t.Parallel()
 
-		// mirrors ListMetrics' equivalent subtest (issue #4 FIX 2): the
-		// same uuidv7Floor lower bound applies to ListPings' archive leg,
-		// so its query plan must show the same SEARCH-not-SCAN shape.
+		// mirrors ListMetrics' equivalent subtest (issue #4 FIX 2): the same
+		// uuidv7Floor lower bound applies here, so the query plan must show
+		// the same SEARCH-not-SCAN shape on the hot tier.
 		s := newTestStore(t)
 		now := time.Now().UTC().Truncate(time.Second)
-		old := now.Add(-40 * 24 * time.Hour)
 
-		insertPingAt(t, s, old, "1.1.1.1", 5, 5, 10, "")
-		if _, err := s.RolloverToArchive(t.Context(), now, 30); err != nil {
-			t.Fatalf("RolloverToArchive() error = %v", err)
-		}
+		insertPingAt(t, s, now.Add(-2*time.Hour), "1.1.1.1", 5, 5, 10, "")
 		insertPingAt(t, s, now, "1.1.1.1", 5, 5, 20, "")
 
-		// mirrors the exact WHERE clause ListPings builds for a Since
-		// filter with the default IncludeUnreachable=false: id >= ? is the
-		// sargable condition under test, ts >= ? stays the exact residual,
-		// received > 0 is IncludeUnreachable's default.
+		// mirrors the exact WHERE clause ListPings builds for a Since filter
+		// with the default IncludeUnreachable=false: id >= ? is the sargable
+		// condition under test, ts >= ? stays the exact residual, received > 0
+		// is IncludeUnreachable's default.
 		since := now.Add(-time.Hour)
-		where := fmt.Sprintf(" WHERE %s >= ? AND %s >= ? AND %s > 0", colPingsID, colPingsTS, colPingsReceived)
-		query, legs := spanQuery(tablePings, tablePingsArchive, pingsColumnList, pingsFullColumnList, colPingsID, where, true)
-		if legs != 2 {
-			t.Fatalf("spanQuery() legs = %d, want 2 for IncludeArchive", legs)
-		}
+		query := fmt.Sprintf("SELECT %s FROM %s WHERE %s >= ? AND %s >= ? AND %s > 0 ORDER BY %s DESC LIMIT ?",
+			pingsColumnList, tablePings, colPingsID, colPingsTS, colPingsReceived, colPingsID)
 
 		rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query,
-			uuidv7Floor(since), formatTime(since), uuidv7Floor(since), formatTime(since), 100)
+			uuidv7Floor(since), formatTime(since), 100)
 		if err != nil {
 			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 		}
@@ -1821,11 +1613,11 @@ func TestStore_ListPings(t *testing.T) {
 		}
 
 		got := plan.String()
-		wantSearch := fmt.Sprintf("SEARCH %s USING INDEX", tablePingsArchive)
+		wantSearch := fmt.Sprintf("SEARCH %s USING INDEX", tablePings)
 		if !strings.Contains(got, wantSearch) {
-			t.Fatalf("query plan =\n%swant %q — the id floor must let SQLite seek instead of scanning the whole archive tier just to check ts as a residual", got, wantSearch)
+			t.Fatalf("query plan =\n%swant %q — the id floor must let SQLite seek instead of scanning the whole tier just to check ts as a residual", got, wantSearch)
 		}
-		wantNoScan := fmt.Sprintf("SCAN %s USING INDEX", tablePingsArchive)
+		wantNoScan := fmt.Sprintf("SCAN %s USING INDEX", tablePings)
 		if strings.Contains(got, wantNoScan) {
 			t.Fatalf("query plan =\n%swant no %q — that is exactly the full-scan-to-EOF regression the id floor fixes", got, wantNoScan)
 		}
@@ -2017,6 +1809,290 @@ func TestStore_NewestRunStartedAt(t *testing.T) {
 		}
 		if !got.Equal(newer) {
 			t.Fatalf("NewestRunStartedAt() = %v, want the most recently inserted run %v", got, newer)
+		}
+	})
+}
+
+func TestStore_OverviewMetrics(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.OverviewMetrics(t.Context(), time.Time{}, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewMetrics() = %d series, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("samples straddling a bucket boundary land in separate buckets", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertMetricAt(t, s, bucketStart.Add(59*time.Minute), domain.CollectorCPU, "load1", 1.0, true) // same hour bucket
+		insertMetricAt(t, s, bucketStart.Add(61*time.Minute), domain.CollectorCPU, "load1", 2.0, true) // next hour bucket
+
+		got, err := s.OverviewMetrics(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("OverviewMetrics() = %d series, want 1 (one collector/name pair)", len(got))
+		}
+		if len(got[0].Buckets) != 2 {
+			t.Fatalf("Buckets = %+v, want 2 (the samples straddle an hour boundary)", got[0].Buckets)
+		}
+		if !got[0].Buckets[0].TS.Equal(bucketStart) {
+			t.Fatalf("Buckets[0].TS = %v, want the bucket start %v", got[0].Buckets[0].TS, bucketStart)
+		}
+		if !got[0].Buckets[1].TS.Equal(bucketStart.Add(time.Hour)) {
+			t.Fatalf("Buckets[1].TS = %v, want the next bucket start %v", got[0].Buckets[1].TS, bucketStart.Add(time.Hour))
+		}
+	})
+
+	t.Run("Min, Max, Avg, and Count aggregate every sample within a bucket", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertMetricAt(t, s, bucketStart.Add(1*time.Minute), domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, bucketStart.Add(2*time.Minute), domain.CollectorCPU, "load1", 3.0, true)
+		insertMetricAt(t, s, bucketStart.Add(3*time.Minute), domain.CollectorCPU, "load1", 2.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewMetrics() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.Min != 1.0 || b.Max != 3.0 || b.Avg != 2.0 || b.Count != 3 {
+			t.Fatalf("bucket = %+v, want Min=1 Max=3 Avg=2 Count=3", b)
+		}
+	})
+
+	t.Run("an unavailable sample (ok=false) is dropped, not aggregated", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertMetricAt(t, s, ts, domain.CollectorFans, "fans", 0, false)
+
+		got, err := s.OverviewMetrics(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewMetrics() = %+v, want 0 series (the only sample is unavailable)", got)
+		}
+	})
+
+	t.Run("distinct collector/name pairs form separate series", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertMetricAt(t, s, ts, domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, ts, domain.CollectorTemperature, "cpu-thermal", 50.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("OverviewMetrics() = %d series, want 2", len(got))
+		}
+	})
+
+	t.Run("Since excludes older rows", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+		insertMetricAt(t, s, base.Add(-2*time.Hour), domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, base, domain.CollectorCPU, "load1", 2.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), base.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewMetrics() = %+v, want 1 series with 1 bucket (the -2h sample is out of range)", got)
+		}
+	})
+}
+
+func TestStore_OverviewPings(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.OverviewPings(t.Context(), time.Time{}, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewPings() = %d series, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("samples straddling a bucket boundary land in separate buckets", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertPingAt(t, s, bucketStart.Add(59*time.Minute), "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, bucketStart.Add(61*time.Minute), "1.1.1.1", 5, 5, 20, "")
+
+		got, err := s.OverviewPings(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 2 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 2 buckets", got)
+		}
+	})
+
+	t.Run("Sent/Received sum every sample including a fully unreachable one, while AvgMS/MaxMS exclude it", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertPingAt(t, s, bucketStart.Add(1*time.Minute), "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, bucketStart.Add(2*time.Minute), "1.1.1.1", 5, 0, 0, "no route to host")
+		insertPingAt(t, s, bucketStart.Add(3*time.Minute), "1.1.1.1", 5, 5, 30, "")
+
+		got, err := s.OverviewPings(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.Sent != 15 || b.Received != 10 {
+			t.Fatalf("bucket Sent/Received = %d/%d, want 15/10 (sums include the unreachable round)", b.Sent, b.Received)
+		}
+		if b.AvgMS != 20 { // average of 10 and 30; the unreachable round's NULL avg_ms is excluded
+			t.Fatalf("bucket AvgMS = %v, want 20 (average of the two reachable rounds only)", b.AvgMS)
+		}
+		if b.MaxMS != 30 {
+			t.Fatalf("bucket MaxMS = %v, want 30", b.MaxMS)
+		}
+		if b.Samples != 3 {
+			t.Fatalf("bucket Samples = %d, want 3", b.Samples)
+		}
+	})
+
+	t.Run("a bucket where every sample is unreachable reports AvgMS/MaxMS as 0, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertPingAt(t, s, ts, "unreachable.example", 5, 0, 0, "no route to host")
+
+		got, err := s.OverviewPings(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.AvgMS != 0 || b.MaxMS != 0 {
+			t.Fatalf("bucket AvgMS/MaxMS = %v/%v, want 0/0 (SQL NULL scanned as the zero value)", b.AvgMS, b.MaxMS)
+		}
+		if b.Sent != 5 || b.Received != 0 || b.Samples != 1 {
+			t.Fatalf("bucket Sent/Received/Samples = %d/%d/%d, want 5/0/1 (the real story, per domain.PingBucket's own doc)", b.Sent, b.Received, b.Samples)
+		}
+	})
+
+	t.Run("distinct hosts form separate series", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertPingAt(t, s, ts, "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, ts, "8.8.8.8", 5, 5, 15, "")
+
+		got, err := s.OverviewPings(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("OverviewPings() = %d series, want 2", len(got))
+		}
+	})
+}
+
+func TestStore_PingSamples(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.PingSamples(t.Context(), time.Time{})
+		if err != nil {
+			t.Fatalf("PingSamples() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("PingSamples() = %d rows, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("returns every row including healthy ones, ascending by (host, id)", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+
+		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 10, "")                                   // healthy
+		insertPingAt(t, s, base.Add(time.Minute), "1.1.1.1", 5, 3, 20, "")                  // degraded
+		insertPingAt(t, s, base.Add(2*time.Minute), "8.8.8.8", 5, 0, 0, "no route to host") // unreachable, degraded
+
+		got, err := s.PingSamples(t.Context(), base.Add(-time.Hour))
+		if err != nil {
+			t.Fatalf("PingSamples() error = %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("PingSamples() = %d rows, want 3 (every sample, healthy included — collapseOutages needs the healthy one to split episodes)", len(got))
+		}
+		if got[0].Result.Host != "1.1.1.1" || got[0].Result.Received != 5 {
+			t.Fatalf("got[0] = %+v, want the 1.1.1.1 healthy round first (host sorts before 8.8.8.8, id orders within host)", got[0])
+		}
+		if got[1].Result.Host != "1.1.1.1" || got[1].Result.Received != 3 {
+			t.Fatalf("got[1] = %+v, want the 1.1.1.1 degraded round second", got[1])
+		}
+		if got[2].Result.Host != "8.8.8.8" || got[2].Result.Received != 0 {
+			t.Fatalf("got[2] = %+v, want the 8.8.8.8 unreachable round", got[2])
+		}
+	})
+
+	t.Run("Since excludes older rows", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+
+		insertPingAt(t, s, base.Add(-2*time.Hour), "1.1.1.1", 5, 2, 10, "")
+		insertPingAt(t, s, base, "1.1.1.1", 5, 3, 20, "")
+
+		got, err := s.PingSamples(t.Context(), base.Add(-time.Hour))
+		if err != nil {
+			t.Fatalf("PingSamples() error = %v", err)
+		}
+		if len(got) != 1 || got[0].Result.Received != 3 {
+			t.Fatalf("PingSamples() = %+v, want only the recent row (the -2h row is out of range)", got)
 		}
 	})
 }
