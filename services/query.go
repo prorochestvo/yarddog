@@ -95,7 +95,11 @@ func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.M
 
 // Overview returns the dashboard's server-downsampled multi-day view
 // (plans/010, GET /api/v1/overview): since defaults to the last 7 days
-// (defaultSince) and bucket is clamped to [minBucket, maxBucket]
+// (defaultSince), then is floored to now-maxOverviewWindow regardless of
+// what the caller asked for — an unclamped since (e.g. a naive client's
+// Unix-epoch default) would force every repo call below into a GROUP BY
+// over the whole hot table, which can starve the daemon's 2-connection pool
+// and its own /health/check. bucket is clamped to [minBucket, maxBucket]
 // (clampBucket, defaultBucket when unset), then every enabled metric
 // collector and configured ping host is bucketed across that window. Each
 // PingSeries' Outages come from a separate PingSamples call, collapsed
@@ -103,6 +107,9 @@ func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.M
 // host with no degraded samples in the window simply keeps a nil Outages.
 func (q *QueryService) Overview(ctx context.Context, since time.Time, bucket time.Duration) (domain.Overview, error) {
 	since = q.defaultSince(since)
+	if floor := q.clock.Now().Add(-maxOverviewWindow); since.Before(floor) {
+		since = floor
+	}
 	bucket = clampBucket(bucket)
 
 	metrics, err := q.repo.OverviewMetrics(ctx, since, bucket)
@@ -173,6 +180,12 @@ const (
 	defaultBucket = time.Hour
 	minBucket     = time.Minute
 	maxBucket     = 24 * time.Hour
+
+	// maxOverviewWindow bounds how far back Overview will ever query,
+	// regardless of an explicit caller-supplied since (plans/010): without
+	// it, an old enough value forces every repo call to GROUP BY over the
+	// entire hot table instead of a bounded slice of it.
+	maxOverviewWindow = 31 * 24 * time.Hour
 
 	defaultRunsLimit = 100
 	maxRunsLimit     = 500

@@ -240,12 +240,12 @@ func TestQueryService_Overview(t *testing.T) {
 		}
 	})
 
-	t.Run("an explicit since overrides the default window on every repo call", func(t *testing.T) {
+	t.Run("an explicit in-range since overrides the default window on every repo call", func(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeHistoryRepository{}
 		q := newQueryService(repo)
-		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		since := testNow.Add(-10 * 24 * time.Hour) // well inside the 31-day max window
 
 		got, err := q.Overview(t.Context(), since, 0)
 		if err != nil {
@@ -257,6 +257,27 @@ func TestQueryService_Overview(t *testing.T) {
 		}
 		if !got.Since.Equal(since) {
 			t.Fatalf("Overview().Since = %v, want %v", got.Since, since)
+		}
+	})
+
+	t.Run("an explicit since older than the max window is clamped to now-maxOverviewWindow on every repo call", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+		since := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		got, err := q.Overview(t.Context(), since, 0)
+		if err != nil {
+			t.Fatalf("Overview() error = %v", err)
+		}
+		want := testNow.Add(-maxOverviewWindow)
+		if !repo.overviewMetricsSince.Equal(want) || !repo.overviewPingsSince.Equal(want) || !repo.pingSamplesSince.Equal(want) {
+			t.Fatalf("repo received since = %v/%v/%v, want %v (clamped to the max window) on every call",
+				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingSamplesSince, want)
+		}
+		if !got.Since.Equal(want) {
+			t.Fatalf("Overview().Since = %v, want %v", got.Since, want)
 		}
 	})
 
