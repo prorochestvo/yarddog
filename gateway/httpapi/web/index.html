@@ -381,10 +381,12 @@
       return (t&&a!=null) ? (t-a)/t*100 : null;
     });
 
-    // disk: keys arrive as "disk" + "/ used_ratio" → "disk// used_ratio"
-    const diskRatio = g["disk// used_ratio"];
+    // disk sample names depend on the mount: the root "/" mount drops the
+    // prefix ("used_ratio"), any other keeps it ("/ used_ratio", "/data used_ratio").
+    // accept both so the card survives a mount/prefix change without a code edit.
+    const diskRatio = g["disk/used_ratio"] ?? g["disk// used_ratio"];
     const dPct = Math.round((diskRatio ?? 0)*100);
-    const dUsed = g["disk// used"], dTotal = g["disk// total"];
+    const dUsed = g["disk/used"] ?? g["disk// used"], dTotal = g["disk/total"] ?? g["disk// total"];
 
     // uptime
     up = g["uptime/uptime"];
@@ -512,7 +514,7 @@
   const GAUGES = [
     {th:"temp", collector:"temperature", name:"cpu_thermal",  label:"cpu.temp",  unit:"°C", scale:1},
     {th:"load", collector:"cpu",         name:"load1",        label:"load.avg",  unit:"",   scale:1},
-    {th:"disk", collector:"disk",        name:"/ used_ratio", label:"disk.used", unit:"%",  scale:100},
+    {th:"disk", collector:"disk",        name:"used_ratio",   label:"disk.used", unit:"%",  scale:100},
   ];
 
   // compact MM-DD HH:MM stamp for incident ranges and gauge peak captions
@@ -641,8 +643,12 @@
     if (!host) return;
     const metrics = Array.isArray(oj.metrics) ? oj.metrics : [];
     const pings   = Array.isArray(oj.pings)   ? oj.pings   : [];
+    // match on a name suffix, not equality: the disk series name carries a
+    // mount prefix for non-root mounts ("/ used_ratio", "/data used_ratio")
+    // and none for "/" ("used_ratio"), so endsWith catches every variant;
+    // temp/load names are exact and unaffected.
     const find = cfg => metrics.find(m =>
-      m.collector === cfg.collector && m.name === cfg.name && Array.isArray(m.buckets) && m.buckets.length);
+      m.collector === cfg.collector && m.name.endsWith(cfg.name) && Array.isArray(m.buckets) && m.buckets.length);
 
     const gaugeHTML = [], incidents = [];
     for (const cfg of GAUGES){
