@@ -117,7 +117,7 @@ func TestParseMetricsFilter(t *testing.T) {
 	t.Run("every param set parses correctly", func(t *testing.T) {
 		t.Parallel()
 
-		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&collector=cpu&limit=5&include_empty=true&archive=true")
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&collector=cpu&limit=5&include_empty=true")
 		if err != nil {
 			t.Fatalf("ParseQuery: %v", err)
 		}
@@ -139,9 +139,6 @@ func TestParseMetricsFilter(t *testing.T) {
 		if !f.IncludeEmpty {
 			t.Errorf("IncludeEmpty = false, want true")
 		}
-		if !f.IncludeArchive {
-			t.Errorf("IncludeArchive = false, want true")
-		}
 	})
 
 	t.Run("every param absent is the zero filter", func(t *testing.T) {
@@ -151,7 +148,7 @@ func TestParseMetricsFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseMetricsFilter() error = %v", err)
 		}
-		if !f.Since.IsZero() || f.Collector != "" || f.Limit != 0 || f.IncludeEmpty || f.IncludeArchive {
+		if !f.Since.IsZero() || f.Collector != "" || f.Limit != 0 || f.IncludeEmpty {
 			t.Fatalf("parseMetricsFilter(empty) = %+v, want the zero value", f)
 		}
 	})
@@ -162,15 +159,6 @@ func TestParseMetricsFilter(t *testing.T) {
 		q, _ := url.ParseQuery("include_empty=maybe")
 		if _, err := parseMetricsFilter(q); err == nil {
 			t.Fatal("parseMetricsFilter() error = nil, want error for an invalid include_empty")
-		}
-	})
-
-	t.Run("an unparseable archive errors", func(t *testing.T) {
-		t.Parallel()
-
-		q, _ := url.ParseQuery("archive=maybe")
-		if _, err := parseMetricsFilter(q); err == nil {
-			t.Fatal("parseMetricsFilter() error = nil, want error for an invalid archive")
 		}
 	})
 
@@ -206,7 +194,7 @@ func TestParsePingsFilter(t *testing.T) {
 	t.Run("every param set parses correctly", func(t *testing.T) {
 		t.Parallel()
 
-		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&host=1.1.1.1&limit=5&include_unreachable=true&archive=true")
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&host=1.1.1.1&limit=5&include_unreachable=true")
 		if err != nil {
 			t.Fatalf("ParseQuery: %v", err)
 		}
@@ -228,9 +216,6 @@ func TestParsePingsFilter(t *testing.T) {
 		if !f.IncludeUnreachable {
 			t.Errorf("IncludeUnreachable = false, want true")
 		}
-		if !f.IncludeArchive {
-			t.Errorf("IncludeArchive = false, want true")
-		}
 	})
 
 	t.Run("every param absent is the zero filter", func(t *testing.T) {
@@ -240,7 +225,7 @@ func TestParsePingsFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parsePingsFilter() error = %v", err)
 		}
-		if !f.Since.IsZero() || f.Host != "" || f.Limit != 0 || f.IncludeUnreachable || f.IncludeArchive {
+		if !f.Since.IsZero() || f.Host != "" || f.Limit != 0 || f.IncludeUnreachable {
 			t.Fatalf("parsePingsFilter(empty) = %+v, want the zero value", f)
 		}
 	})
@@ -251,15 +236,6 @@ func TestParsePingsFilter(t *testing.T) {
 		q, _ := url.ParseQuery("include_unreachable=maybe")
 		if _, err := parsePingsFilter(q); err == nil {
 			t.Fatal("parsePingsFilter() error = nil, want error for an invalid include_unreachable")
-		}
-	})
-
-	t.Run("an unparseable archive errors", func(t *testing.T) {
-		t.Parallel()
-
-		q, _ := url.ParseQuery("archive=maybe")
-		if _, err := parsePingsFilter(q); err == nil {
-			t.Fatal("parsePingsFilter() error = nil, want error for an invalid archive")
 		}
 	})
 
@@ -408,29 +384,6 @@ func TestServer_handlePings(t *testing.T) {
 		srv := newTestServer(&fakeRepo{}, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?include_unreachable=maybe", "tok")
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-		}
-	})
-
-	t.Run("?archive=true is parsed and forwarded", func(t *testing.T) {
-		t.Parallel()
-
-		repo := &fakeRepo{listPings: []domain.PingRecord{{RunID: "1", Result: domain.PingResult{Host: "1.1.1.1", OK: true, Received: 1}}}}
-		srv := newTestServer(repo, "tok")
-
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?archive=true", "tok")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
-		}
-	})
-
-	t.Run("bad archive is 400", func(t *testing.T) {
-		t.Parallel()
-
-		srv := newTestServer(&fakeRepo{}, "tok")
-
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/pings?archive=maybe", "tok")
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
@@ -749,29 +702,6 @@ func TestServer_handleMetrics(t *testing.T) {
 		srv := newTestServer(&fakeRepo{}, "tok")
 
 		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?include_empty=maybe", "tok")
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-		}
-	})
-
-	t.Run("?archive=true is parsed and forwarded", func(t *testing.T) {
-		t.Parallel()
-
-		repo := &fakeRepo{listMetrics: []domain.MetricRecord{{RunID: "1"}}}
-		srv := newTestServer(repo, "tok")
-
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?archive=true", "tok")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
-		}
-	})
-
-	t.Run("bad archive is 400", func(t *testing.T) {
-		t.Parallel()
-
-		srv := newTestServer(&fakeRepo{}, "tok")
-
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/metrics?archive=maybe", "tok")
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}

@@ -439,10 +439,9 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID string) ([]domain.Che
 // ListMetrics returns metrics history matching f, newest first, bounded by
 // f.Limit (a parameterized LIMIT — never string-concatenated, Risk R8).
 // f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Collector's
-// zero value omits the "collector = ?" clause. f.IncludeArchive false (the
-// default) queries the hot table only, byte-for-byte the query this method
-// has always run; true also spans metrics_archive via spanQuery's UNION
-// ALL, with the same conds bound once per leg.
+// zero value omits the "collector = ?" clause. The query is hot-only: an
+// f.Since older than the hot floor simply returns nothing older than hot
+// holds (archive history is out of scope for the list endpoints).
 func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]domain.MetricRecord, error) {
 	var (
 		conds []string
@@ -450,12 +449,10 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 	)
 	if !f.Since.IsZero() {
 		// uuidv7Floor gives the planner a sargable lower bound on the id
-		// index, so a f.IncludeArchive scan can seek and stop early instead
-		// of running to EOF (id order, not ts order, is what the archive
-		// leg's index actually supports). ts >= ? stays as the exact
-		// residual filter, since uuidv7Floor's millisecond truncation can
-		// make it a hair less restrictive than the real cutoff (issue #4
-		// FIX 2).
+		// index so the scan can seek to the cutoff and stop early instead of
+		// running to EOF. ts >= ? stays as the exact residual filter, since
+		// uuidv7Floor's millisecond truncation can make it a hair less
+		// restrictive than the real cutoff (issue #4 FIX 2).
 		conds = append(conds, colMetricsID+" >= ?", colMetricsTS+" >= ?")
 		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
 	}
@@ -472,15 +469,10 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	query, legs := spanQuery(tableMetrics, tableMetricsArchive, metricsColumnList, metricsFullColumnList, colMetricsID, where, f.IncludeArchive)
+	query := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", metricsColumnList, tableMetrics, where, colMetricsID)
+	args = append(args, f.Limit)
 
-	var queryArgs []any
-	for range legs {
-		queryArgs = append(queryArgs, args...)
-	}
-	queryArgs = append(queryArgs, f.Limit)
-
-	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list metrics: %w", err)
 	}
@@ -536,18 +528,17 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID string) ([]domain.Me
 // f.Since's zero value omits the "ts >= ?"/"id >= ?" clauses; f.Host's zero
 // value omits the "host = ?" clause; f.IncludeUnreachable false additionally
 // drops received=0 rows in SQL so LIMIT counts only returned rows.
-// f.IncludeArchive false (the default) queries the hot table only,
-// byte-for-byte the query this method has always run; true also spans
-// pings_archive via spanQuery's UNION ALL, with the same conds bound once
-// per leg.
+// The query is hot-only: an f.Since older than the hot floor simply returns
+// nothing older than hot holds (archive history is out of scope for the list
+// endpoints).
 func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.PingRecord, error) {
 	var (
 		conds []string
 		args  []any
 	)
 	if !f.Since.IsZero() {
-		// see ListMetrics: uuidv7Floor gives the planner a sargable id
-		// lower bound so the archive leg can seek and stop early; ts >= ?
+		// see ListMetrics: uuidv7Floor gives the planner a sargable id lower
+		// bound so the scan can seek to the cutoff and stop early; ts >= ?
 		// stays as the exact residual filter (issue #4 FIX 2).
 		conds = append(conds, colPingsID+" >= ?", colPingsTS+" >= ?")
 		args = append(args, uuidv7Floor(f.Since), formatTime(f.Since))
@@ -565,15 +556,10 @@ func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 
-	query, legs := spanQuery(tablePings, tablePingsArchive, pingsColumnList, pingsFullColumnList, colPingsID, where, f.IncludeArchive)
+	query := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", pingsColumnList, tablePings, where, colPingsID)
+	args = append(args, f.Limit)
 
-	var queryArgs []any
-	for range legs {
-		queryArgs = append(queryArgs, args...)
-	}
-	queryArgs = append(queryArgs, f.Limit)
-
-	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list pings: %w", err)
 	}
@@ -1923,48 +1909,4 @@ func (s *Store) seedUUIDv7WatermarkFromDB(ctx context.Context) error {
 		seedUUIDv7Watermark(ms, counter)
 	}
 	return nil
-}
-
-// spanQuery builds the full SELECT for a history list query (ListMetrics,
-// ListPings), including its own trailing ORDER BY/LIMIT. includeArchive
-// false returns "SELECT cols FROM hotTable<where> ORDER BY idCol DESC LIMIT
-// ?" — today's shape, byte-identical to before archive-spanning existed.
-// includeArchive true unions hotTable and archiveTable (each projected
-// through fullCols, with the identical where fragment applied to both
-// legs); legs reports how many times the caller must append its bound args
-// (1 or 2), since the archive leg repeats the exact same WHERE conditions
-// against a second table.
-//
-// ORDER BY/LIMIT must live INSIDE the compound (UNION ALL ... ORDER BY ...
-// LIMIT ?), never wrapped around it. Pushing them there lets SQLite apply
-// its MERGE(UNION ALL) optimization: id is a TEXT PRIMARY KEY (a UUIDv7
-// string, issue #4, not an autoincrement rowid alias), so each leg is
-// already ordered via the implicit unique index SQLite creates for that
-// constraint ("SCAN ... USING INDEX sqlite_autoindex_..._1" in EXPLAIN QUERY
-// PLAN) — the two pre-sorted streams are merged and cut off at LIMIT
-// without ever materializing the full result. An outer "SELECT ... FROM
-// (union) ORDER BY ... LIMIT ?" instead defeats that — SQLite must SCAN and
-// fully sort both tiers before the outer LIMIT can apply (EXPLAIN QUERY PLAN
-// showed a COMPOUND scan of both tables plus a temp b-tree sort; measured
-// two orders of magnitude slower against tens of thousands of archive rows,
-// both before and after the switch to UUIDv7 ids — the MERGE property comes
-// from the primary-key index, not from any particular id encoding). The
-// outer SELECT here exists only to re-narrow the projection from fullCols
-// (id included, needed for the inner ORDER BY) down to cols (id excluded,
-// matching the hot-only shape); its own ORDER BY re-asserts the final order
-// over what is by then an already LIMIT-bounded, already-sorted handful of
-// rows, so it costs nothing extra.
-func spanQuery(hotTable, archiveTable, cols, fullCols, idCol, where string, includeArchive bool) (query string, legs int) {
-	if !includeArchive {
-		return fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s DESC LIMIT ?", cols, hotTable, where, idCol), 1
-	}
-	return fmt.Sprintf(
-		`SELECT %[1]s FROM (
-			SELECT %[2]s FROM %[3]s%[4]s
-			UNION ALL
-			SELECT %[2]s FROM %[5]s%[4]s
-			ORDER BY %[6]s DESC LIMIT ?
-		) ORDER BY %[6]s DESC`,
-		cols, fullCols, hotTable, where, archiveTable, idCol,
-	), 2
 }

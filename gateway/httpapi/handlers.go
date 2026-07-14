@@ -224,10 +224,10 @@ func parseIntParam(q url.Values, key string, def int) (int, error) {
 
 // parseMetricsFilter builds a services.MetricsFilter from the request's
 // query params: since (RFC3339), collector (one of domain's seven), and
-// limit (int) are all optional. archive (bool, issue #4) opts into spanning
-// the metrics_archive twin; omitted or false stays hot-only. An unparseable
-// value is reported as an error the handler turns into a 400, never
-// silently ignored or coerced into "no filter".
+// limit (int) are all optional. An absent since is defaulted to the last 7
+// days downstream in services.QueryService, not here. An unparseable value is
+// reported as an error the handler turns into a 400, never silently ignored
+// or coerced into "no filter".
 func parseMetricsFilter(q url.Values) (services.MetricsFilter, error) {
 	var f services.MetricsFilter
 
@@ -259,21 +259,15 @@ func parseMetricsFilter(q url.Values) (services.MetricsFilter, error) {
 	}
 	f.IncludeEmpty = includeEmpty
 
-	includeArchive, err := parseBoolParam(q, "archive")
-	if err != nil {
-		return services.MetricsFilter{}, err
-	}
-	f.IncludeArchive = includeArchive
-
 	return f, nil
 }
 
 // parsePingsFilter builds a services.PingFilter from the request's query
 // params (issue #2): since (RFC3339), host, limit (int), and
-// include_unreachable (bool) are all optional. archive (bool, issue #4)
-// opts into spanning the pings_archive twin; omitted or false stays
-// hot-only. An unparseable value is reported as an error the handler turns
-// into a 400, never silently ignored or coerced into "no filter".
+// include_unreachable (bool) are all optional. An absent since is defaulted
+// to the last 7 days downstream in services.QueryService, not here. An
+// unparseable value is reported as an error the handler turns into a 400,
+// never silently ignored or coerced into "no filter".
 func parsePingsFilter(q url.Values) (services.PingFilter, error) {
 	var f services.PingFilter
 
@@ -298,12 +292,6 @@ func parsePingsFilter(q url.Values) (services.PingFilter, error) {
 		return services.PingFilter{}, err
 	}
 	f.IncludeUnreachable = includeUnreachable
-
-	includeArchive, err := parseBoolParam(q, "archive")
-	if err != nil {
-		return services.PingFilter{}, err
-	}
-	f.IncludeArchive = includeArchive
 
 	return f, nil
 }

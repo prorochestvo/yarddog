@@ -11,6 +11,16 @@ import (
 
 var _ HistoryRepository = (*fakeHistoryRepository)(nil)
 
+// testNow is the fixed instant the query-service tests resolve the default
+// 7-day window against, so defaultSince is deterministic.
+var testNow = time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+
+// newQueryService builds a QueryService over repo with a clock frozen at
+// testNow.
+func newQueryService(repo HistoryRepository) *QueryService {
+	return NewQueryService(repo, &fakeClock{now: testNow})
+}
+
 func TestQueryService_LatestHost(t *testing.T) {
 	t.Parallel()
 
@@ -19,7 +29,7 @@ func TestQueryService_LatestHost(t *testing.T) {
 
 		want := domain.HostRecord{RunID: "5", Host: domain.HostInfo{Hostname: "pi5", OS: "linux", Arch: "arm64"}}
 		repo := &fakeHistoryRepository{latestHostResult: want, latestHostOK: true}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		got, ok, err := q.LatestHost(t.Context())
 		if err != nil {
@@ -37,7 +47,7 @@ func TestQueryService_LatestHost(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeHistoryRepository{latestHostOK: false}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, ok, err := q.LatestHost(t.Context())
 		if err != nil {
@@ -53,7 +63,7 @@ func TestQueryService_LatestHost(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{latestHostErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, _, err := q.LatestHost(t.Context())
 		if !errors.Is(err, wantErr) {
@@ -69,7 +79,7 @@ func TestQueryService_LatestMetrics(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeHistoryRepository{latestMetricsResult: []domain.MetricRecord{{RunID: "5"}}}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		got, err := q.LatestMetrics(t.Context())
 		if err != nil {
@@ -85,7 +95,7 @@ func TestQueryService_LatestMetrics(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{latestMetricsErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, err := q.LatestMetrics(t.Context())
 		if !errors.Is(err, wantErr) {
@@ -112,7 +122,7 @@ func TestQueryService_Metrics(t *testing.T) {
 			t.Parallel()
 
 			repo := &fakeHistoryRepository{}
-			q := NewQueryService(repo)
+			q := newQueryService(repo)
 			since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 
 			_, err := q.Metrics(t.Context(), MetricsFilter{Since: since, Collector: domain.CollectorCPU, Limit: tt.limit})
@@ -136,7 +146,7 @@ func TestQueryService_Metrics(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{listMetricsErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, err := q.Metrics(t.Context(), MetricsFilter{})
 		if !errors.Is(err, wantErr) {
@@ -144,19 +154,33 @@ func TestQueryService_Metrics(t *testing.T) {
 		}
 	})
 
-	t.Run("IncludeArchive is forwarded untouched", func(t *testing.T) {
+	t.Run("an absent Since defaults to the last 7 days", func(t *testing.T) {
 		t.Parallel()
 
-		for _, want := range []bool{true, false} {
-			repo := &fakeHistoryRepository{}
-			q := NewQueryService(repo)
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
 
-			if _, err := q.Metrics(t.Context(), MetricsFilter{IncludeArchive: want}); err != nil {
-				t.Fatalf("Metrics() error = %v", err)
-			}
-			if repo.listMetricsFilter.IncludeArchive != want {
-				t.Fatalf("repo received IncludeArchive = %v, want %v (forwarded untouched)", repo.listMetricsFilter.IncludeArchive, want)
-			}
+		if _, err := q.Metrics(t.Context(), MetricsFilter{}); err != nil {
+			t.Fatalf("Metrics() error = %v", err)
+		}
+		want := testNow.Add(-defaultWindow)
+		if !repo.listMetricsFilter.Since.Equal(want) {
+			t.Fatalf("repo received Since = %v, want %v (now-7d default)", repo.listMetricsFilter.Since, want)
+		}
+	})
+
+	t.Run("an explicit Since overrides the default window", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		if _, err := q.Metrics(t.Context(), MetricsFilter{Since: since}); err != nil {
+			t.Fatalf("Metrics() error = %v", err)
+		}
+		if !repo.listMetricsFilter.Since.Equal(since) {
+			t.Fatalf("repo received Since = %v, want %v (untouched)", repo.listMetricsFilter.Since, since)
 		}
 	})
 }
@@ -179,7 +203,7 @@ func TestQueryService_Pings(t *testing.T) {
 			t.Parallel()
 
 			repo := &fakeHistoryRepository{}
-			q := NewQueryService(repo)
+			q := newQueryService(repo)
 			since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 
 			_, err := q.Pings(t.Context(), PingFilter{Since: since, Host: "1.1.1.1", Limit: tt.limit})
@@ -203,7 +227,7 @@ func TestQueryService_Pings(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{listPingsErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, err := q.Pings(t.Context(), PingFilter{})
 		if !errors.Is(err, wantErr) {
@@ -211,19 +235,33 @@ func TestQueryService_Pings(t *testing.T) {
 		}
 	})
 
-	t.Run("IncludeArchive is forwarded untouched", func(t *testing.T) {
+	t.Run("an absent Since defaults to the last 7 days", func(t *testing.T) {
 		t.Parallel()
 
-		for _, want := range []bool{true, false} {
-			repo := &fakeHistoryRepository{}
-			q := NewQueryService(repo)
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
 
-			if _, err := q.Pings(t.Context(), PingFilter{IncludeArchive: want}); err != nil {
-				t.Fatalf("Pings() error = %v", err)
-			}
-			if repo.listPingsFilter.IncludeArchive != want {
-				t.Fatalf("repo received IncludeArchive = %v, want %v (forwarded untouched)", repo.listPingsFilter.IncludeArchive, want)
-			}
+		if _, err := q.Pings(t.Context(), PingFilter{}); err != nil {
+			t.Fatalf("Pings() error = %v", err)
+		}
+		want := testNow.Add(-defaultWindow)
+		if !repo.listPingsFilter.Since.Equal(want) {
+			t.Fatalf("repo received Since = %v, want %v (now-7d default)", repo.listPingsFilter.Since, want)
+		}
+	})
+
+	t.Run("an explicit Since overrides the default window", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		if _, err := q.Pings(t.Context(), PingFilter{Since: since}); err != nil {
+			t.Fatalf("Pings() error = %v", err)
+		}
+		if !repo.listPingsFilter.Since.Equal(since) {
+			t.Fatalf("repo received Since = %v, want %v (untouched)", repo.listPingsFilter.Since, since)
 		}
 	})
 }
@@ -237,7 +275,7 @@ func TestQueryService_Run(t *testing.T) {
 			runByIDOK:        true,
 			listChecksResult: []domain.Check{{RunID: "7", Target: "1.1.1.1:443"}},
 		}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		run, checks, found, err := q.Run(t.Context(), "7")
 		if err != nil {
@@ -261,7 +299,7 @@ func TestQueryService_Run(t *testing.T) {
 		t.Parallel()
 
 		repo := &fakeHistoryRepository{runByIDOK: false}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, checks, found, err := q.Run(t.Context(), "999")
 		if err != nil {
@@ -283,7 +321,7 @@ func TestQueryService_Run(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{runByIDErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, checks, found, err := q.Run(t.Context(), "1")
 		if !errors.Is(err, wantErr) {
@@ -309,7 +347,7 @@ func TestQueryService_Run(t *testing.T) {
 			runByIDOK:     true,
 			listChecksErr: wantErr,
 		}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, _, found, err := q.Run(t.Context(), "7")
 		if !found {
@@ -339,7 +377,7 @@ func TestQueryService_Runs(t *testing.T) {
 			t.Parallel()
 
 			repo := &fakeHistoryRepository{listRunsResult: []domain.Run{{ID: "1"}}}
-			q := NewQueryService(repo)
+			q := newQueryService(repo)
 
 			got, err := q.Runs(t.Context(), tt.limit)
 			if err != nil {
@@ -359,7 +397,7 @@ func TestQueryService_Runs(t *testing.T) {
 
 		wantErr := errors.New("db exploded")
 		repo := &fakeHistoryRepository{listRunsErr: wantErr}
-		q := NewQueryService(repo)
+		q := newQueryService(repo)
 
 		_, err := q.Runs(t.Context(), 10)
 		if !errors.Is(err, wantErr) {

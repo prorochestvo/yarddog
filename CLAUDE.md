@@ -121,8 +121,10 @@ At collector startup, in order: a **run-boundary roll-over** moves runs (and all
 children) older than `HOT_WINDOW_DAYS` from hot → archive in one transaction;
 `RETENTION_DAYS` then prunes whole aged runs from the archive (`0` = keep forever); a
 weekly, cadence-gated `VACUUM` (tracked in `meta`) compacts the file after the
-connectivity check. Reads hit hot only by default; `runs/{id}` spans both tiers
-transparently and `metrics`/`pings` history spans on `?archive=true`. The real runtime DB
+connectivity check. The list endpoints read hot only (an absent `since` on
+`metrics`/`pings` defaults to the last 7 days, well inside the hot window); only
+`runs/{id}` spans both tiers transparently. Archive browsing is not exposed on the list
+endpoints yet (a later cursor-pagination pass reintroduces it). The real runtime DB
 lives at `/var/lib/yarddog/yarddog.db` (outside the repo); tests use `:memory:`.
 
 ### Health checks — collector N/A, daemon has the pair

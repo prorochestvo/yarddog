@@ -115,7 +115,7 @@ func run() int {
 	}
 
 	insp := services.NewInspector(cfg.HealthTimeout, probes...)
-	srv := httpapi.NewServer(services.NewQueryService(st), insp, cfg.Token, version, clk.Now())
+	srv := httpapi.NewServer(services.NewQueryService(st, clk), insp, cfg.Token, version, clk.Now())
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,

@@ -15,7 +15,17 @@ import (
 var (
 	_ services.HistoryRepository = (*fakeRepo)(nil)
 	_ services.HealthProbe       = (*fakeHealthProbe)(nil)
+	_ services.Clock             = testClock{}
 )
+
+// testClock is a real-time services.Clock for the handler tests; the default
+// 7-day window resolves against wall-clock now, which no handler test asserts
+// to the instant.
+type testClock struct{}
+
+func (testClock) Now() time.Time { return time.Now() }
+
+func (testClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 // decodeJSON decodes rec's body into v, failing the test on any decode
 // error so a malformed response surfaces at the assertion site instead of
@@ -48,7 +58,7 @@ func doRequest(t *testing.T, srv *Server, method, path, token string) *httptest.
 // sit in front of the fakes, so only the repository/probe layer is faked —
 // no DB, no network (plans/004-query-daemon.md Task 8).
 func newTestServer(repo services.HistoryRepository, token string, probes ...services.HealthProbe) *Server {
-	q := services.NewQueryService(repo)
+	q := services.NewQueryService(repo, testClock{})
 	insp := services.NewInspector(time.Second, probes...)
 	return NewServer(q, insp, token, "v0.0.0-test", time.Now())
 }

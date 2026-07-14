@@ -8,36 +8,32 @@ import (
 )
 
 // MetricsFilter narrows HistoryRepository.ListMetrics (plans/004-query-daemon.md).
-// Since's zero value means "no lower bound"; Collector's zero value ("")
-// means "every collector"; Limit<=0 means "use QueryService's default", and
+// Since's zero value means "no lower bound", which QueryService.Metrics fills
+// with a default last-7-days window; Collector's zero value ("") means "every
+// collector"; Limit<=0 means "use QueryService's default", and
 // QueryService.Metrics clamps whatever it receives to a hard maximum.
 // IncludeEmpty false (the default) drops unavailable rows (ok=false) in SQL so
 // LIMIT counts only returned rows; true keeps them (?include_empty=true).
-// IncludeArchive false (the default, issue #4) queries the hot table only;
-// true also spans the metrics_archive twin (?archive=true).
 type MetricsFilter struct {
-	Since          time.Time
-	Collector      domain.Collector
-	Limit          int
-	IncludeEmpty   bool
-	IncludeArchive bool
+	Since        time.Time
+	Collector    domain.Collector
+	Limit        int
+	IncludeEmpty bool
 }
 
 // PingFilter narrows HistoryRepository.ListPings (issue #2), mirroring
-// MetricsFilter. Since's zero value means "no lower bound"; Host's zero
+// MetricsFilter. Since's zero value means "no lower bound", which
+// QueryService.Pings fills with a default last-7-days window; Host's zero
 // value ("") means "every host"; Limit<=0 means "use QueryService's
 // default", and QueryService.Pings clamps whatever it receives to a hard
 // maximum. IncludeUnreachable false (the default) drops rows with no
 // received replies (received=0) in SQL so LIMIT counts only returned rows;
-// true keeps them (?include_unreachable=true). IncludeArchive false (the
-// default, issue #4) queries the hot table only; true also spans the
-// pings_archive twin (?archive=true).
+// true keeps them (?include_unreachable=true).
 type PingFilter struct {
 	Since              time.Time
 	Host               string
 	Limit              int
 	IncludeUnreachable bool
-	IncludeArchive     bool
 }
 
 // HistoryRepository is the read-only persistence port the query daemon
@@ -55,18 +51,21 @@ type HistoryRepository interface {
 	ListChecksByRun(ctx context.Context, runID string) ([]domain.Check, error)
 }
 
-// NewQueryService builds a QueryService over repo.
-func NewQueryService(repo HistoryRepository) *QueryService {
-	return &QueryService{repo: repo}
+// NewQueryService builds a QueryService over repo, using clock to resolve the
+// default last-7-days window on a filter that carries no explicit Since.
+func NewQueryService(repo HistoryRepository, clock Clock) *QueryService {
+	return &QueryService{repo: repo, clock: clock}
 }
 
 // QueryService is the thin application layer between gateway/httpapi's
 // handlers and HistoryRepository (Trade-off T3): it clamps every
 // caller-supplied limit to a safe range (Risk R8 — an unbounded limit could
-// scan the whole table) and assembles a run together with its checks in one
-// call, so handlers stay pure marshalling.
+// scan the whole table), defaults an absent time window to the last 7 days,
+// and assembles a run together with its checks in one call, so handlers stay
+// pure marshalling.
 type QueryService struct {
-	repo HistoryRepository
+	repo  HistoryRepository
+	clock Clock
 }
 
 // LatestHost returns the newest host row, or ok=false if the collector has
@@ -82,16 +81,20 @@ func (q *QueryService) LatestMetrics(ctx context.Context) ([]domain.MetricRecord
 }
 
 // Metrics returns metrics history matching f, with f.Limit clamped to
-// [1, maxMetricsLimit] (defaultMetricsLimit when f.Limit<=0).
+// [1, maxMetricsLimit] (defaultMetricsLimit when f.Limit<=0) and an absent
+// f.Since defaulted to the last 7 days.
 func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.MetricRecord, error) {
 	f.Limit = clampLimit(f.Limit, defaultMetricsLimit, maxMetricsLimit)
+	f.Since = q.defaultSince(f.Since)
 	return q.repo.ListMetrics(ctx, f)
 }
 
 // Pings returns ping history matching f, with f.Limit clamped to
-// [1, maxPingsLimit] (defaultPingsLimit when f.Limit<=0).
+// [1, maxPingsLimit] (defaultPingsLimit when f.Limit<=0) and an absent
+// f.Since defaulted to the last 7 days.
 func (q *QueryService) Pings(ctx context.Context, f PingFilter) ([]domain.PingRecord, error) {
 	f.Limit = clampLimit(f.Limit, defaultPingsLimit, maxPingsLimit)
+	f.Since = q.defaultSince(f.Since)
 	return q.repo.ListPings(ctx, f)
 }
 
@@ -116,7 +119,11 @@ func (q *QueryService) Runs(ctx context.Context, limit int) ([]domain.Run, error
 }
 
 const (
-	defaultRunsLimit = 50
+	// defaultWindow is the last-N span a metrics/pings list falls back to when
+	// the caller supplies no since.
+	defaultWindow = 7 * 24 * time.Hour
+
+	defaultRunsLimit = 100
 	maxRunsLimit     = 500
 
 	defaultMetricsLimit = 100
@@ -139,4 +146,17 @@ func clampLimit(limit, def, max int) int {
 		return max
 	}
 	return limit
+}
+
+// defaultSince resolves an absent (zero) time window to the last 7 days; a
+// caller-supplied since passes through untouched. The list endpoints read the
+// hot tables only, and the 7-day default sits well inside the hot span
+// (HOT_WINDOW_DAYS, default 30), so the default view is always served from hot.
+// An explicit since reaching before the hot floor returns only what hot still
+// holds — archive history is not exposed on these endpoints.
+func (q *QueryService) defaultSince(since time.Time) time.Time {
+	if since.IsZero() {
+		return q.clock.Now().Add(-defaultWindow)
+	}
+	return since
 }

@@ -278,8 +278,8 @@ internet.
 | `GET /health/check` | token | readiness: per-dependency probe report, `200` / `503` |
 | `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
 | `GET /api/v1/metrics/latest` | token | every metric of the newest run that has any (`404` if none) |
-| `GET /api/v1/metrics?since=&collector=&limit=&archive=` | token | metrics history, newest first (`200`+`[]` when empty) |
-| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=&archive=` | token | ping history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/metrics?since=&collector=&limit=&include_empty=` | token | metrics history, newest first (`200`+`[]` when empty) |
+| `GET /api/v1/pings?host=&since=&limit=&include_unreachable=` | token | ping history, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` empty id, `404` unknown) |
 
@@ -288,17 +288,21 @@ Every `id`/`run_id` — `runs.id`, `checks`/`metrics`/`pings`' own row ids, and 
 autoincrement value: it is time-ordered, so lexicographic order already matches
 chronological order (newest-first listings need no separate sort key), and it
 stays globally unique even if a future host ever aggregates records from more
-than one collector. `since` is RFC3339 UTC; `collector` is one of
+than one collector. `since` is RFC3339 UTC and, when omitted from
+`/api/v1/metrics` or `/api/v1/pings`, defaults to the **last 7 days**; an
+explicit `since` overrides it. `collector` is one of
 `temperature`/`fans`/`cpu`/`memory`/`disk`/`uptime`/`network`; `limit` is capped
-server-side (runs 500, metrics 1000, pings 1000). `/api/v1/pings` rows carry
+server-side (runs 500, metrics 1000, pings 1000) and defaults to 100 when
+absent (runs default 100, metrics/pings 100). `/api/v1/pings` rows carry
 `{run_id, ts, host, sent, received, avg_ms, ok, error}`; `avg_ms` is `null`
 unless `ok` (a host with zero replies has no round trip to average).
 `include_unreachable=true` keeps those null-avg rows, which the default
-response omits. `archive=true` additionally spans the `*_archive` tables (see
-[History](#history)) for `/api/v1/metrics` and `/api/v1/pings`; omitted or
-`false` stays within the hot, last-`HOT_WINDOW_DAYS` window. `/api/v1/runs/{id}`
-needs no such flag — it transparently resolves a run whether it is still hot
-or has already been archived. `/health/check` probes the SQLite handle
+response omits. The list endpoints read the hot tables only — the default
+7-day window sits well inside the `HOT_WINDOW_DAYS` (default 30) hot span, and
+an explicit `since` reaching before the hot floor simply returns what hot
+holds (archive browsing is not yet exposed on the list endpoints).
+`/api/v1/runs/{id}` still transparently resolves a run whether it is hot or
+already archived. `/health/check` probes the SQLite handle
 (`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
 than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
 it is token-gated because its body names internal dependencies.
