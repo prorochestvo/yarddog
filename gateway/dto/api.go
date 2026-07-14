@@ -203,7 +203,7 @@ type PingSeriesDTO struct {
 }
 
 // PingBucketDTO is one time bucket of a PingSeriesDTO. LossPct is derived
-// from Sent/Received (100 when Sent is 0). AvgMS and MaxMS are nil (JSON
+// from Sent/Received (0 when Sent is 0, per domain.LossPercent). AvgMS and MaxMS are nil (JSON
 // null) exactly when Received is 0 for the whole bucket — no reply ever came
 // back, so there is no round trip to report.
 type PingBucketDTO struct {
