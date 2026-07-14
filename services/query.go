@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/prorochestvo/yarddog/domain"
@@ -264,7 +263,7 @@ func collapseOutages(samples []domain.PingRecord) map[string][]domain.PingOutage
 			continue
 		}
 
-		lossPct := lossPercent(s.Result.Sent, s.Result.Received)
+		lossPct := domain.LossPercent(s.Result.Sent, s.Result.Received)
 		if cur == nil {
 			cur = &domain.PingOutage{Start: s.TS, End: s.TS, WorstLossPct: lossPct, Unreachable: s.Result.Received == 0}
 			continue
@@ -294,16 +293,4 @@ func (q *QueryService) defaultSince(since time.Time) time.Time {
 		return q.clock.Now().Add(-defaultWindow)
 	}
 	return since
-}
-
-// lossPercent rounds a sample's loss to the nearest whole percent. sent<=0
-// reports 0 rather than dividing by zero — collapseOutages only calls this
-// on a sample it has already classified as degraded (received < sent), so
-// sent>=1 for every real row this ever sees; the guard only protects a
-// future or test caller passing in a degenerate sample directly.
-func lossPercent(sent, received int) int {
-	if sent <= 0 {
-		return 0
-	}
-	return int(math.Round((1 - float64(received)/float64(sent)) * 100))
 }

@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"math"
 	"time"
 
 	"github.com/prorochestvo/yarddog/domain"
@@ -191,19 +190,19 @@ func overviewResponse(o domain.Overview) dto.OverviewResponse {
 	}
 }
 
-// pingBucketDTO maps one domain.PingBucket onto its wire shape. LossPct is
-// computed here (Sent>0 ? round((1-Received/Sent)*100) : 0) rather than
-// stored on the domain type, since it is a presentation detail derived from
-// Sent/Received, not a value the domain layer itself needs. AvgMS/MaxMS are
-// nil (JSON null) exactly when Received is 0 for the whole bucket — no reply
-// ever came back, so there is no round trip to report — mirroring pingDTO's
-// AvgMS handling.
+// pingBucketDTO maps one domain.PingBucket onto its wire shape. LossPct
+// comes from domain.LossPercent rather than a field stored on the domain
+// type, since it is a presentation detail derived from Sent/Received, not a
+// value the domain layer itself needs to hold. AvgMS/MaxMS are nil (JSON
+// null) exactly when Received is 0 for the whole bucket — no reply ever came
+// back, so there is no round trip to report — mirroring pingDTO's AvgMS
+// handling.
 func pingBucketDTO(b domain.PingBucket) dto.PingBucketDTO {
 	d := dto.PingBucketDTO{
 		TS:       formatTime(b.TS),
 		Sent:     b.Sent,
 		Received: b.Received,
-		LossPct:  pingLossPct(b.Sent, b.Received),
+		LossPct:  domain.LossPercent(b.Sent, b.Received),
 		Samples:  b.Samples,
 	}
 	if b.Received > 0 {
@@ -254,19 +253,6 @@ func pingDTOs(records []domain.PingRecord) []dto.PingDTO {
 		out = append(out, pingDTO(r))
 	}
 	return out
-}
-
-// pingLossPct computes a bucket's loss percentage from sent/received,
-// rounded to the nearest whole percent; sent<=0 reports 0 rather than
-// dividing by zero. A separate copy from services.lossPercent's per-sample
-// version: this one summarizes an entire bucket, not one sample, and lives
-// in mapping because LossPct is purely a wire-shape presentation detail with
-// no field on domain.PingBucket to compute it from ahead of time.
-func pingLossPct(sent, received int) int {
-	if sent <= 0 {
-		return 0
-	}
-	return int(math.Round((1 - float64(received)/float64(sent)) * 100))
 }
 
 // pingOutageDTO maps one domain.PingOutage onto its wire shape. Kind is

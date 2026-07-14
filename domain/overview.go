@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // MetricBucket is one time-bucketed aggregate of a metric series: Min, Max,
 // and Avg are computed only over the samples that landed in this bucket, and
@@ -67,4 +70,16 @@ type Overview struct {
 	Bucket  time.Duration
 	Metrics []MetricSeries
 	Pings   []PingSeries
+}
+
+// LossPercent rounds a ping sample's or bucket's packet loss to the nearest
+// whole percent, given how many probes were sent and how many replies came
+// back. sent<=0 reports 0 rather than dividing by zero, protecting a caller
+// that passes in a degenerate (zero-sent) value directly rather than one
+// already produced by a real ping round.
+func LossPercent(sent, received int) int {
+	if sent <= 0 {
+		return 0
+	}
+	return int(math.Round((1 - float64(received)/float64(sent)) * 100))
 }
