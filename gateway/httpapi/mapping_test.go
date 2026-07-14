@@ -413,3 +413,152 @@ func TestRunDTOs(t *testing.T) {
 		}
 	})
 }
+
+func TestMetricBucketDTO(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+
+	got := metricBucketDTO(domain.MetricBucket{TS: ts, Min: 1, Max: 3, Avg: 2, Count: 5})
+
+	if got.TS != "2026-07-07T04:07:00Z" || got.Min != 1 || got.Max != 3 || got.Avg != 2 || got.Count != 5 {
+		t.Fatalf("metricBucketDTO() = %+v, unexpected mapping", got)
+	}
+}
+
+func TestMetricSeriesDTO(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+	s := domain.MetricSeries{
+		Collector: domain.CollectorCPU,
+		Name:      "load1",
+		Unit:      "load",
+		Buckets:   []domain.MetricBucket{{TS: ts, Min: 1, Max: 3, Avg: 2, Count: 2}},
+	}
+
+	got := metricSeriesDTO(s)
+
+	if got.Collector != "cpu" || got.Name != "load1" || got.Unit != "load" {
+		t.Fatalf("metricSeriesDTO() = %+v, unexpected mapping", got)
+	}
+	if len(got.Buckets) != 1 || got.Buckets[0].Count != 2 {
+		t.Fatalf("metricSeriesDTO().Buckets = %+v, want the 1 bucket carried through", got.Buckets)
+	}
+}
+
+func TestPingBucketDTO(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 7, 7, 4, 7, 0, 0, time.UTC)
+
+	t.Run("a reachable bucket carries its avg_ms/max_ms", func(t *testing.T) {
+		t.Parallel()
+
+		b := domain.PingBucket{TS: ts, Sent: 5, Received: 5, AvgMS: 12.5, MaxMS: 20, Samples: 3}
+
+		got := pingBucketDTO(b)
+
+		if got.AvgMS == nil || *got.AvgMS != 12.5 {
+			t.Fatalf("pingBucketDTO().AvgMS = %v, want 12.5", got.AvgMS)
+		}
+		if got.MaxMS == nil || *got.MaxMS != 20 {
+			t.Fatalf("pingBucketDTO().MaxMS = %v, want 20", got.MaxMS)
+		}
+		if got.Sent != 5 || got.Received != 5 || got.Samples != 3 || got.LossPct != 0 {
+			t.Fatalf("pingBucketDTO() = %+v, unexpected mapping", got)
+		}
+	})
+
+	t.Run("Received==0 leaves avg_ms/max_ms nil even though the domain fields are non-zero", func(t *testing.T) {
+		t.Parallel()
+
+		b := domain.PingBucket{TS: ts, Sent: 5, Received: 0, AvgMS: 12.5, MaxMS: 20, Samples: 3}
+
+		got := pingBucketDTO(b)
+
+		if got.AvgMS != nil {
+			t.Fatalf("pingBucketDTO().AvgMS = %v, want nil (Received==0)", *got.AvgMS)
+		}
+		if got.MaxMS != nil {
+			t.Fatalf("pingBucketDTO().MaxMS = %v, want nil (Received==0)", *got.MaxMS)
+		}
+		if got.LossPct != 100 {
+			t.Fatalf("pingBucketDTO().LossPct = %d, want 100", got.LossPct)
+		}
+	})
+}
+
+func TestPingOutageDTO(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 7, 7, 4, 0, 0, 0, time.UTC)
+	end := start.Add(10 * time.Minute)
+
+	t.Run("Unreachable maps to kind unreachable", func(t *testing.T) {
+		t.Parallel()
+
+		got := pingOutageDTO(domain.PingOutage{Start: start, End: end, WorstLossPct: 100, Unreachable: true})
+
+		if got.Kind != "unreachable" {
+			t.Fatalf("pingOutageDTO().Kind = %q, want %q", got.Kind, "unreachable")
+		}
+		if got.Start != "2026-07-07T04:00:00Z" || got.End != "2026-07-07T04:10:00Z" || got.WorstLossPct != 100 {
+			t.Fatalf("pingOutageDTO() = %+v, unexpected mapping", got)
+		}
+	})
+
+	t.Run("sustained partial loss (Unreachable false) maps to kind loss", func(t *testing.T) {
+		t.Parallel()
+
+		got := pingOutageDTO(domain.PingOutage{Start: start, End: end, WorstLossPct: 40, Unreachable: false})
+
+		if got.Kind != "loss" {
+			t.Fatalf("pingOutageDTO().Kind = %q, want %q", got.Kind, "loss")
+		}
+	})
+}
+
+func TestOverviewResponse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("maps the window and every series", func(t *testing.T) {
+		t.Parallel()
+
+		since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+		until := time.Date(2026, 7, 7, 0, 0, 0, 0, time.UTC)
+		o := domain.Overview{
+			Since:  since,
+			Until:  until,
+			Bucket: time.Hour,
+			Metrics: []domain.MetricSeries{
+				{Collector: domain.CollectorCPU, Name: "load1", Unit: "load"},
+			},
+			Pings: []domain.PingSeries{
+				{Host: "1.1.1.1"},
+			},
+		}
+
+		got := overviewResponse(o)
+
+		if got.Window.Since != "2026-07-01T00:00:00Z" || got.Window.Until != "2026-07-07T00:00:00Z" || got.Window.Bucket != "1h0m0s" {
+			t.Fatalf("overviewResponse().Window = %+v, unexpected mapping", got.Window)
+		}
+		if len(got.Metrics) != 1 || got.Metrics[0].Name != "load1" {
+			t.Fatalf("overviewResponse().Metrics = %+v, want the one series carried through", got.Metrics)
+		}
+		if len(got.Pings) != 1 || got.Pings[0].Host != "1.1.1.1" {
+			t.Fatalf("overviewResponse().Pings = %+v, want the one series carried through", got.Pings)
+		}
+	})
+
+	t.Run("no metrics/pings still marshal as non-nil empty slices", func(t *testing.T) {
+		t.Parallel()
+
+		got := overviewResponse(domain.Overview{})
+
+		if got.Metrics == nil || got.Pings == nil {
+			t.Fatalf("overviewResponse(empty).Metrics/Pings = %v/%v, want non-nil empty slices (must marshal as [] not null)", got.Metrics, got.Pings)
+		}
+	})
+}
