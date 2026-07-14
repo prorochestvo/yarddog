@@ -14,7 +14,8 @@ const (
 	bearerPrefix = "bearer "
 )
 
-// withAuth gates every route but pingPath behind a Bearer-token check. The
+// withAuth gates every route but pingPath and rootPath (the secret-free
+// dashboard, see ui.go) behind a Bearer-token check. The
 // static shared secret travels in the Authorization header as
 // "Bearer <token>" (RFC 6750 §2.1 format, though the token is NOT
 // OAuth-issued — it is a static LAN secret set via DAEMON_TOKEN, never
@@ -30,7 +31,7 @@ const (
 // caller wires it up some other way.
 func withAuth(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == pingPath {
+		if r.URL.Path == pingPath || r.URL.Path == rootPath {
 			next.ServeHTTP(w, r)
 			return
 		}

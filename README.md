@@ -257,10 +257,14 @@ sqlite3 /var/lib/yarddog/yarddog.db \
 ## Daemon / query API
 
 `yarddog` records everything locally; `yarddogd` is an optional long-running
-companion that serves that record as a read-only JSON REST API, so a dashboard,
-an uptime monitor, or another host on the LAN can read the runs, checks and host
-telemetry without touching the SQLite file directly. The collector stays the
-sole writer — the daemon only ever reads.
+companion that serves that record as a read-only JSON REST API — plus its own
+embedded, read-only status dashboard at `/` — so the built-in page, an uptime
+monitor, or another host on the LAN can read the runs, checks and host telemetry
+without touching the SQLite file directly. The dashboard is a static asset
+compiled into the binary (its version therefore always equals the daemon's, and
+the same value appears in `/health/check`'s `server.version`); it holds no secret
+and is the one route besides `/ping` served without the token. The collector
+stays the sole writer — the daemon only ever reads.
 
 ```bash
 YARDDOG_DAEMON_TOKEN=$(openssl rand -hex 32) YARDDOG_DAEMON_ADDR=192.168.1.10:8420 yarddogd
@@ -268,12 +272,13 @@ YARDDOG_DAEMON_TOKEN=$(openssl rand -hex 32) YARDDOG_DAEMON_ADDR=192.168.1.10:84
 
 It binds `YARDDOG_DAEMON_ADDR` (loopback `127.0.0.1:8420` by default — set a LAN
 `ip:port` to expose it) and requires `YARDDOG_DAEMON_TOKEN`: every route but `/ping`
-demands that secret in the `Authorization: Bearer <token>` header. There is no TLS and no
+and `/` (the secret-free dashboard) demands that secret in the `Authorization: Bearer <token>` header. There is no TLS and no
 per-user auth, so bind it to the LAN behind your firewall, never the open
 internet.
 
 | Method & path | Auth | Returns |
 |---|---|---|
+| `GET /` | — | embedded read-only status dashboard (HTML) |
 | `GET /ping` | — | liveness, always `200 {"status":"ok"}` |
 | `GET /health/check` | token | readiness: per-dependency probe report, `200` / `503` |
 | `GET /api/v1/host` | token | newest host-identity snapshot (`404` until one is recorded) |
