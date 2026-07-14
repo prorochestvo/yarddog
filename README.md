@@ -287,6 +287,7 @@ internet.
 | `GET /api/v1/pings?host=&since=&limit=&include_unreachable=` | token | ping history, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs?limit=` | token | runs, newest first (`200`+`[]` when empty) |
 | `GET /api/v1/runs/{id}` | token | one run plus its checks (`400` empty id, `404` unknown) |
+| `GET /api/v1/overview?since=&bucket=` | token | server-downsampled multi-day view: bucketed metrics + ping reachability with server-detected outage episodes (`200`+`[]` series when empty) |
 
 Every `id`/`run_id` — `runs.id`, `checks`/`metrics`/`pings`' own row ids, and the
 `host`/`host_archive` `run_id` — is a UUIDv7 string (RFC 9562), not a numeric
@@ -311,6 +312,24 @@ already archived. `/health/check` probes the SQLite handle
 (`PING` + `SELECT 1`) and collector freshness (the newest run must be younger
 than `DAEMON_STALE_AFTER` — a stale value means the cron collector has stopped);
 it is token-gated because its body names internal dependencies.
+
+`GET /api/v1/overview` serves the dashboard's retrospective view: every
+enabled metric collector and configured ping host, bucketed across a window
+instead of returned as raw per-run rows. `since` (RFC3339 UTC) and `bucket`
+(a Go duration, e.g. `2h`) are both optional — omitted, they default to the
+same last-7-days window and a 1-hour bucket, and an out-of-range `bucket` is
+clamped to `[1m, 24h]` rather than rejected. Each `metrics[]` entry is one
+collector/name pair's `{ts, min, max, avg, count}` buckets; each `pings[]`
+entry is one host's `{ts, sent, received, loss_pct, avg_ms, max_ms, samples}`
+buckets (`avg_ms`/`max_ms` are `null` when every sample in the bucket was
+unreachable) plus its own `outages[]` — contiguous runs of degraded samples
+the server has already detected and classified `loss`/`unreachable`, so the
+dashboard never has to recompute them. Metric presentation stays
+gauge-uniform across every collector for now; richer, collector-specific
+presentation (e.g. network throughput, memory breakdown) is deferred to a
+later pass. Everything past that — value thresholds, coloring, alerting — is
+a client-side/dashboard concern; only ping outage detection happens
+server-side.
 
 ```bash
 curl -s -H "Authorization: Bearer $YARDDOG_DAEMON_TOKEN" \

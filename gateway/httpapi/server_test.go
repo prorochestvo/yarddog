@@ -51,8 +51,10 @@ func TestServer_ServeHTTP(t *testing.T) {
 			"/api/v1/host",
 			"/api/v1/metrics/latest",
 			"/api/v1/metrics",
+			"/api/v1/pings",
 			"/api/v1/runs",
 			"/api/v1/runs/1",
+			"/api/v1/overview",
 		} {
 			rec := doRequest(t, srv, http.MethodGet, path, "tok")
 			if rec.Code >= http.StatusInternalServerError {

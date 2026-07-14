@@ -1813,6 +1813,287 @@ func TestStore_NewestRunStartedAt(t *testing.T) {
 	})
 }
 
+func TestStore_OverviewMetrics(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.OverviewMetrics(t.Context(), time.Time{}, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewMetrics() = %d series, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("samples straddling a bucket boundary land in separate buckets", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertMetricAt(t, s, bucketStart.Add(59*time.Minute), domain.CollectorCPU, "load1", 1.0, true) // same hour bucket
+		insertMetricAt(t, s, bucketStart.Add(61*time.Minute), domain.CollectorCPU, "load1", 2.0, true) // next hour bucket
+
+		got, err := s.OverviewMetrics(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("OverviewMetrics() = %d series, want 1 (one collector/name pair)", len(got))
+		}
+		if len(got[0].Buckets) != 2 {
+			t.Fatalf("Buckets = %+v, want 2 (the samples straddle an hour boundary)", got[0].Buckets)
+		}
+		if !got[0].Buckets[0].TS.Equal(bucketStart) {
+			t.Fatalf("Buckets[0].TS = %v, want the bucket start %v", got[0].Buckets[0].TS, bucketStart)
+		}
+		if !got[0].Buckets[1].TS.Equal(bucketStart.Add(time.Hour)) {
+			t.Fatalf("Buckets[1].TS = %v, want the next bucket start %v", got[0].Buckets[1].TS, bucketStart.Add(time.Hour))
+		}
+	})
+
+	t.Run("Min, Max, Avg, and Count aggregate every sample within a bucket", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertMetricAt(t, s, bucketStart.Add(1*time.Minute), domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, bucketStart.Add(2*time.Minute), domain.CollectorCPU, "load1", 3.0, true)
+		insertMetricAt(t, s, bucketStart.Add(3*time.Minute), domain.CollectorCPU, "load1", 2.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewMetrics() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.Min != 1.0 || b.Max != 3.0 || b.Avg != 2.0 || b.Count != 3 {
+			t.Fatalf("bucket = %+v, want Min=1 Max=3 Avg=2 Count=3", b)
+		}
+	})
+
+	t.Run("an unavailable sample (ok=false) is dropped, not aggregated", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertMetricAt(t, s, ts, domain.CollectorFans, "fans", 0, false)
+
+		got, err := s.OverviewMetrics(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewMetrics() = %+v, want 0 series (the only sample is unavailable)", got)
+		}
+	})
+
+	t.Run("distinct collector/name pairs form separate series", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertMetricAt(t, s, ts, domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, ts, domain.CollectorTemperature, "cpu-thermal", 50.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("OverviewMetrics() = %d series, want 2", len(got))
+		}
+	})
+
+	t.Run("Since excludes older rows", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+		insertMetricAt(t, s, base.Add(-2*time.Hour), domain.CollectorCPU, "load1", 1.0, true)
+		insertMetricAt(t, s, base, domain.CollectorCPU, "load1", 2.0, true)
+
+		got, err := s.OverviewMetrics(t.Context(), base.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewMetrics() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewMetrics() = %+v, want 1 series with 1 bucket (the -2h sample is out of range)", got)
+		}
+	})
+}
+
+func TestStore_OverviewPings(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.OverviewPings(t.Context(), time.Time{}, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("OverviewPings() = %d series, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("samples straddling a bucket boundary land in separate buckets", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertPingAt(t, s, bucketStart.Add(59*time.Minute), "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, bucketStart.Add(61*time.Minute), "1.1.1.1", 5, 5, 20, "")
+
+		got, err := s.OverviewPings(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 2 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 2 buckets", got)
+		}
+	})
+
+	t.Run("Sent/Received sum every sample including a fully unreachable one, while AvgMS/MaxMS exclude it", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		bucketStart := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		insertPingAt(t, s, bucketStart.Add(1*time.Minute), "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, bucketStart.Add(2*time.Minute), "1.1.1.1", 5, 0, 0, "no route to host")
+		insertPingAt(t, s, bucketStart.Add(3*time.Minute), "1.1.1.1", 5, 5, 30, "")
+
+		got, err := s.OverviewPings(t.Context(), bucketStart, time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.Sent != 15 || b.Received != 10 {
+			t.Fatalf("bucket Sent/Received = %d/%d, want 15/10 (sums include the unreachable round)", b.Sent, b.Received)
+		}
+		if b.AvgMS != 20 { // average of 10 and 30; the unreachable round's NULL avg_ms is excluded
+			t.Fatalf("bucket AvgMS = %v, want 20 (average of the two reachable rounds only)", b.AvgMS)
+		}
+		if b.MaxMS != 30 {
+			t.Fatalf("bucket MaxMS = %v, want 30", b.MaxMS)
+		}
+		if b.Samples != 3 {
+			t.Fatalf("bucket Samples = %d, want 3", b.Samples)
+		}
+	})
+
+	t.Run("a bucket where every sample is unreachable reports AvgMS/MaxMS as 0, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertPingAt(t, s, ts, "unreachable.example", 5, 0, 0, "no route to host")
+
+		got, err := s.OverviewPings(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 1 || len(got[0].Buckets) != 1 {
+			t.Fatalf("OverviewPings() = %+v, want 1 series with 1 bucket", got)
+		}
+		b := got[0].Buckets[0]
+		if b.AvgMS != 0 || b.MaxMS != 0 {
+			t.Fatalf("bucket AvgMS/MaxMS = %v/%v, want 0/0 (SQL NULL scanned as the zero value)", b.AvgMS, b.MaxMS)
+		}
+		if b.Sent != 5 || b.Received != 0 || b.Samples != 1 {
+			t.Fatalf("bucket Sent/Received/Samples = %d/%d/%d, want 5/0/1 (the real story, per domain.PingBucket's own doc)", b.Sent, b.Received, b.Samples)
+		}
+	})
+
+	t.Run("distinct hosts form separate series", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		ts := time.Now().UTC()
+		insertPingAt(t, s, ts, "1.1.1.1", 5, 5, 10, "")
+		insertPingAt(t, s, ts, "8.8.8.8", 5, 5, 15, "")
+
+		got, err := s.OverviewPings(t.Context(), ts.Add(-time.Hour), time.Hour)
+		if err != nil {
+			t.Fatalf("OverviewPings() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("OverviewPings() = %d series, want 2", len(got))
+		}
+	})
+}
+
+func TestStore_PingOutageSamples(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.PingOutageSamples(t.Context(), time.Time{})
+		if err != nil {
+			t.Fatalf("PingOutageSamples() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("PingOutageSamples() = %d rows, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("returns only received<sent rows, ascending by (host, id)", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+
+		insertPingAt(t, s, base, "1.1.1.1", 5, 5, 10, "")                                   // healthy, excluded
+		insertPingAt(t, s, base.Add(time.Minute), "1.1.1.1", 5, 3, 20, "")                  // degraded
+		insertPingAt(t, s, base.Add(2*time.Minute), "8.8.8.8", 5, 0, 0, "no route to host") // unreachable, degraded
+
+		got, err := s.PingOutageSamples(t.Context(), base.Add(-time.Hour))
+		if err != nil {
+			t.Fatalf("PingOutageSamples() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("PingOutageSamples() = %d rows, want 2 (the healthy round excluded)", len(got))
+		}
+		if got[0].Result.Host != "1.1.1.1" || got[0].Result.Received != 3 {
+			t.Fatalf("got[0] = %+v, want the 1.1.1.1 degraded round (host sorts before 8.8.8.8)", got[0])
+		}
+		if got[1].Result.Host != "8.8.8.8" || got[1].Result.Received != 0 {
+			t.Fatalf("got[1] = %+v, want the 8.8.8.8 unreachable round", got[1])
+		}
+	})
+
+	t.Run("Since excludes older rows", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		base := time.Now().UTC().Truncate(time.Second)
+
+		insertPingAt(t, s, base.Add(-2*time.Hour), "1.1.1.1", 5, 2, 10, "")
+		insertPingAt(t, s, base, "1.1.1.1", 5, 3, 20, "")
+
+		got, err := s.PingOutageSamples(t.Context(), base.Add(-time.Hour))
+		if err != nil {
+			t.Fatalf("PingOutageSamples() error = %v", err)
+		}
+		if len(got) != 1 || got[0].Result.Received != 3 {
+			t.Fatalf("PingOutageSamples() = %+v, want only the recent row (the -2h row is out of range)", got)
+		}
+	})
+}
+
 func TestStore_RolloverToArchive(t *testing.T) {
 	t.Run("an aged run with every child type moves wholly to archive; a fresh run is untouched", func(t *testing.T) {
 		t.Parallel()

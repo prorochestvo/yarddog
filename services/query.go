@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/prorochestvo/yarddog/domain"
@@ -49,6 +50,9 @@ type HistoryRepository interface {
 	ListRuns(ctx context.Context, limit int) ([]domain.Run, error)
 	RunByID(ctx context.Context, id string) (domain.Run, bool, error)
 	ListChecksByRun(ctx context.Context, runID string) ([]domain.Check, error)
+	OverviewMetrics(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.MetricSeries, error)
+	OverviewPings(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.PingSeries, error)
+	PingOutageSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error)
 }
 
 // NewQueryService builds a QueryService over repo, using clock to resolve the
@@ -89,6 +93,46 @@ func (q *QueryService) Metrics(ctx context.Context, f MetricsFilter) ([]domain.M
 	return q.repo.ListMetrics(ctx, f)
 }
 
+// Overview returns the dashboard's server-downsampled multi-day view
+// (plans/010, GET /api/v1/overview): since defaults to the last 7 days
+// (defaultSince) and bucket is clamped to [minBucket, maxBucket]
+// (clampBucket, defaultBucket when unset), then every enabled metric
+// collector and configured ping host is bucketed across that window. Each
+// PingSeries' Outages come from a separate PingOutageSamples call, collapsed
+// by collapseOutages and attached to its matching host by a map lookup — a
+// host with no degraded samples in the window simply keeps a nil Outages.
+func (q *QueryService) Overview(ctx context.Context, since time.Time, bucket time.Duration) (domain.Overview, error) {
+	since = q.defaultSince(since)
+	bucket = clampBucket(bucket)
+
+	metrics, err := q.repo.OverviewMetrics(ctx, since, bucket)
+	if err != nil {
+		return domain.Overview{}, err
+	}
+
+	pings, err := q.repo.OverviewPings(ctx, since, bucket)
+	if err != nil {
+		return domain.Overview{}, err
+	}
+
+	samples, err := q.repo.PingOutageSamples(ctx, since)
+	if err != nil {
+		return domain.Overview{}, err
+	}
+	outages := collapseOutages(samples)
+	for i := range pings {
+		pings[i].Outages = outages[pings[i].Host]
+	}
+
+	return domain.Overview{
+		Since:   since,
+		Until:   q.clock.Now(),
+		Bucket:  bucket,
+		Metrics: metrics,
+		Pings:   pings,
+	}, nil
+}
+
 // Pings returns ping history matching f, with f.Limit clamped to
 // [1, maxPingsLimit] (defaultPingsLimit when f.Limit<=0) and an absent
 // f.Since defaulted to the last 7 days.
@@ -123,6 +167,13 @@ const (
 	// the caller supplies no since.
 	defaultWindow = 7 * 24 * time.Hour
 
+	// defaultBucket, minBucket, and maxBucket bound Overview's bucket width
+	// (plans/010): clampBucket resolves a caller-supplied bucket to
+	// [minBucket, maxBucket], defaultBucket when unset (bucket<=0).
+	defaultBucket = time.Hour
+	minBucket     = time.Minute
+	maxBucket     = 24 * time.Hour
+
 	defaultRunsLimit = 100
 	maxRunsLimit     = 500
 
@@ -132,6 +183,24 @@ const (
 	defaultPingsLimit = 100
 	maxPingsLimit     = 1000
 )
+
+// clampBucket resolves a caller-supplied bucket width to a safe range,
+// mirroring clampLimit: bucket<=0 (unset) becomes defaultBucket; outside
+// [minBucket, maxBucket] is silently clamped to the nearer bound rather than
+// rejected as an error, matching clampLimit's "too large/small ⇒ clamped,
+// not an error" API surface.
+func clampBucket(bucket time.Duration) time.Duration {
+	if bucket <= 0 {
+		return defaultBucket
+	}
+	if bucket < minBucket {
+		return minBucket
+	}
+	if bucket > maxBucket {
+		return maxBucket
+	}
+	return bucket
+}
 
 // clampLimit resolves a caller-supplied limit to a safe range: limit<=0
 // (unset) becomes def; limit>max is silently capped to max rather than
@@ -148,6 +217,49 @@ func clampLimit(limit, def, max int) int {
 	return limit
 }
 
+// collapseOutages groups samples — already ordered (host, id) by
+// PingOutageSamples' own contract — into one domain.PingOutage per maximal
+// run of consecutive same-host entries (plans/010). Adjacency is purely the
+// sequence itself: there is no time-gap heuristic, so a healthy sample that
+// once separated two degraded runs for the same host — already excluded
+// from samples by PingOutageSamples' "received < sent" filter — leaves no
+// trace here, and the two runs merge into a single episode. Returns a map
+// keyed by host so Overview can attach each PingSeries' own episodes by a
+// plain lookup; a host absent from samples is simply absent from the map.
+func collapseOutages(samples []domain.PingRecord) map[string][]domain.PingOutage {
+	out := make(map[string][]domain.PingOutage)
+
+	var cur *domain.PingOutage
+	var curHost string
+	flush := func() {
+		if cur != nil {
+			out[curHost] = append(out[curHost], *cur)
+		}
+	}
+
+	for _, s := range samples {
+		lossPct := lossPercent(s.Result.Sent, s.Result.Received)
+
+		if cur == nil || s.Result.Host != curHost {
+			flush()
+			curHost = s.Result.Host
+			cur = &domain.PingOutage{Start: s.TS, End: s.TS, WorstLossPct: lossPct, Unreachable: s.Result.Received == 0}
+			continue
+		}
+
+		cur.End = s.TS
+		if lossPct > cur.WorstLossPct {
+			cur.WorstLossPct = lossPct
+		}
+		if s.Result.Received == 0 {
+			cur.Unreachable = true
+		}
+	}
+	flush() // the final run never sees a host change to trigger its own flush
+
+	return out
+}
+
 // defaultSince resolves an absent (zero) time window to the last 7 days; a
 // caller-supplied since passes through untouched. The list endpoints read the
 // hot tables only, and the 7-day default sits well inside the hot span
@@ -159,4 +271,16 @@ func (q *QueryService) defaultSince(since time.Time) time.Time {
 		return q.clock.Now().Add(-defaultWindow)
 	}
 	return since
+}
+
+// lossPercent rounds a sample's loss to the nearest whole percent. sent<=0
+// reports 0 rather than dividing by zero — PingOutageSamples' own
+// "received < sent" filter guarantees sent>received>=0 (so sent>=1) for
+// every real row this ever sees, so the guard only protects a future or
+// test caller passing in a degenerate sample directly.
+func lossPercent(sent, received int) int {
+	if sent <= 0 {
+		return 0
+	}
+	return int(math.Round((1 - float64(received)/float64(sent)) * 100))
 }

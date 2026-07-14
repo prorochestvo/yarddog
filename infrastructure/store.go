@@ -767,6 +767,167 @@ func (s *Store) NewestRunStartedAt(ctx context.Context) (t time.Time, ok bool, e
 	return parsed, true, nil
 }
 
+// OverviewMetrics returns every hot metrics row from since onward, bucketed
+// at bucket-wide intervals and grouped into one domain.MetricSeries per
+// (collector, name): the dashboard's server-downsampled retrospective view
+// (plans/010, GET /api/v1/overview). Mirrors ListMetrics' sargable
+// "id >= ? AND ts >= ?" since floor (uuidv7Floor), but always drops
+// unavailable samples (ok=1, no IncludeEmpty knob here) — an unavailable
+// reading contributes nothing to a MIN/MAX/AVG bucket. bucket is assumed
+// already clamped by services.QueryService.Overview; bucketEpochExpr floors
+// a non-positive value defensively rather than dividing by zero.
+func (s *Store) OverviewMetrics(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.MetricSeries, error) {
+	query := fmt.Sprintf(
+		`SELECT %s, %s, %s, %s AS b, MIN(%s), MAX(%s), AVG(%s), COUNT(%s)
+		 FROM %s
+		 WHERE %s >= ? AND %s >= ? AND %s = 1
+		 GROUP BY %s, %s, b
+		 ORDER BY %s, %s, b`,
+		colMetricsCollector, colMetricsName, colMetricsUnit, bucketEpochExpr(colMetricsTS, bucket),
+		colMetricsValue, colMetricsValue, colMetricsValue, colMetricsValue,
+		tableMetrics,
+		colMetricsID, colMetricsTS, colMetricsOK,
+		colMetricsCollector, colMetricsName,
+		colMetricsCollector, colMetricsName,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("overview metrics: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.MetricSeries
+	var cur *domain.MetricSeries
+	for rows.Next() {
+		var (
+			collector, name, unit string
+			epoch                 int64
+			min, max, avg         float64
+			count                 int
+		)
+		if err := rows.Scan(&collector, &name, &unit, &epoch, &min, &max, &avg, &count); err != nil {
+			return nil, fmt.Errorf("overview metrics: scan: %w", err)
+		}
+
+		// each row's own collector/name is authoritative for whether it starts
+		// a new series — GROUP BY ... ORDER BY collector, name, b already
+		// guarantees every row of one series arrives contiguously.
+		if cur == nil || cur.Collector != domain.Collector(collector) || cur.Name != name {
+			out = append(out, domain.MetricSeries{Collector: domain.Collector(collector), Name: name, Unit: unit})
+			cur = &out[len(out)-1]
+		}
+		cur.Buckets = append(cur.Buckets, domain.MetricBucket{
+			TS:    time.Unix(epoch, 0).UTC(),
+			Min:   min,
+			Max:   max,
+			Avg:   avg,
+			Count: count,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("overview metrics: %w", err)
+	}
+
+	return out, nil
+}
+
+// OverviewPings returns every hot pings row from since onward, bucketed at
+// bucket-wide intervals and grouped into one domain.PingSeries per host
+// (Outages left nil — services.QueryService.Overview attaches those
+// separately from PingOutageSamples): the dashboard's server-downsampled
+// retrospective view (plans/010, GET /api/v1/overview). Mirrors ListPings'
+// sargable "id >= ? AND ts >= ?" since floor (uuidv7Floor). Unlike
+// ListPings, sent/received are summed over EVERY sample including fully
+// unreachable ones — a loss percentage needs the unreachable rows counted —
+// while avg_ms is averaged only over reachable samples (received>0); an
+// all-unreachable bucket leaves both the average and the max SQL NULL,
+// scanned into sql.NullFloat64 and reported as 0 with Samples/Received
+// telling the real story (domain.PingBucket's own doc).
+func (s *Store) OverviewPings(ctx context.Context, since time.Time, bucket time.Duration) ([]domain.PingSeries, error) {
+	query := fmt.Sprintf(
+		`SELECT %s, %s AS b, SUM(%s), SUM(%s), AVG(CASE WHEN %s > 0 THEN %s END), MAX(%s), COUNT(*)
+		 FROM %s
+		 WHERE %s >= ? AND %s >= ?
+		 GROUP BY %s, b
+		 ORDER BY %s, b`,
+		colPingsHost, bucketEpochExpr(colPingsTS, bucket), colPingsSent, colPingsReceived,
+		colPingsReceived, colPingsAvgMS, colPingsAvgMS,
+		tablePings,
+		colPingsID, colPingsTS,
+		colPingsHost,
+		colPingsHost,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("overview pings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.PingSeries
+	var cur *domain.PingSeries
+	for rows.Next() {
+		var (
+			host       string
+			epoch      int64
+			sent, recv int
+			avgMS      sql.NullFloat64
+			maxMS      sql.NullFloat64
+			samples    int
+		)
+		if err := rows.Scan(&host, &epoch, &sent, &recv, &avgMS, &maxMS, &samples); err != nil {
+			return nil, fmt.Errorf("overview pings: scan: %w", err)
+		}
+
+		// each row's own host is authoritative for whether it starts a new
+		// series — GROUP BY ... ORDER BY host, b already guarantees every row
+		// of one series arrives contiguously.
+		if cur == nil || cur.Host != host {
+			out = append(out, domain.PingSeries{Host: host})
+			cur = &out[len(out)-1]
+		}
+		cur.Buckets = append(cur.Buckets, domain.PingBucket{
+			TS:       time.Unix(epoch, 0).UTC(),
+			Sent:     sent,
+			Received: recv,
+			AvgMS:    avgMS.Float64,
+			MaxMS:    maxMS.Float64,
+			Samples:  samples,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("overview pings: %w", err)
+	}
+
+	return out, nil
+}
+
+// PingOutageSamples returns every hot pings row from since onward where the
+// host lost at least one reply (received < sent), ascending by (host, id) so
+// services.QueryService.Overview can walk each host's samples in
+// chronological order and collapse consecutive degraded runs into
+// domain.PingOutage episodes. Mirrors ListPings' sargable "id >= ? AND
+// ts >= ?" since floor (uuidv7Floor); hot-only and unbounded by any LIMIT —
+// the 7-day default window this is scoped to is already bounded by since.
+func (s *Store) PingOutageSamples(ctx context.Context, since time.Time) ([]domain.PingRecord, error) {
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s >= ? AND %s >= ? AND %s < %s ORDER BY %s, %s`,
+		pingsColumnList, tablePings, colPingsID, colPingsTS, colPingsReceived, colPingsSent, colPingsHost, colPingsID,
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, uuidv7Floor(since), formatTime(since))
+	if err != nil {
+		return nil, fmt.Errorf("ping outage samples: %w", err)
+	}
+	defer rows.Close()
+
+	out, err := scanPingRecords(rows)
+	if err != nil {
+		return nil, fmt.Errorf("ping outage samples: %w", err)
+	}
+	return out, nil
+}
+
 // PruneArchive deletes every archived run (started_at older than
 // now - retentionDays days) and all its archived children, in one
 // transaction, run-boundary — never by a child's own ts, which would
@@ -1210,6 +1371,23 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// bucketEpochExpr renders the portable "bucket-start epoch seconds" SQL
+// expression for tsCol at the given bucket width (plans/010): strftime('%s',
+// tsCol) converts the stored RFC3339 string to a Unix-epoch second count —
+// portable across any SQLite build, unlike the newer unixepoch() function —
+// integer-divided by the bucket width in seconds and multiplied back rounds
+// it down to that bucket's start. services.QueryService.Overview always
+// clamps bucket to a positive range before calling OverviewMetrics/
+// OverviewPings; a non-positive bucket here is floored to one second so the
+// division can never be by zero.
+func bucketEpochExpr(tsCol string, bucket time.Duration) string {
+	secs := int(bucket / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return fmt.Sprintf(`(CAST(strftime('%%s', %s) AS INTEGER) / %d) * %d`, tsCol, secs, secs)
 }
 
 // chmodStoreFiles restricts path and its WAL-mode -wal/-shm siblings to

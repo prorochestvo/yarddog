@@ -401,6 +401,214 @@ func TestServer_handlePings(t *testing.T) {
 	})
 }
 
+func TestParseOverviewParams(t *testing.T) {
+	t.Run("both params set parse correctly", func(t *testing.T) {
+		t.Parallel()
+
+		q, err := url.ParseQuery("since=2026-07-01T00:00:00Z&bucket=2h")
+		if err != nil {
+			t.Fatalf("ParseQuery: %v", err)
+		}
+
+		since, bucket, err := parseOverviewParams(q)
+		if err != nil {
+			t.Fatalf("parseOverviewParams() error = %v", err)
+		}
+		wantSince := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+		if !since.Equal(wantSince) {
+			t.Errorf("since = %v, want %v", since, wantSince)
+		}
+		if bucket != 2*time.Hour {
+			t.Errorf("bucket = %v, want %v", bucket, 2*time.Hour)
+		}
+	})
+
+	t.Run("both params absent is the zero value", func(t *testing.T) {
+		t.Parallel()
+
+		since, bucket, err := parseOverviewParams(url.Values{})
+		if err != nil {
+			t.Fatalf("parseOverviewParams() error = %v", err)
+		}
+		if !since.IsZero() || bucket != 0 {
+			t.Fatalf("parseOverviewParams(empty) = (%v, %v), want the zero value", since, bucket)
+		}
+	})
+
+	t.Run("an unparseable since errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("since=not-a-date")
+		if _, _, err := parseOverviewParams(q); err == nil {
+			t.Fatal("parseOverviewParams() error = nil, want error for an invalid since")
+		}
+	})
+
+	t.Run("an unparseable bucket errors", func(t *testing.T) {
+		t.Parallel()
+
+		q, _ := url.ParseQuery("bucket=not-a-duration")
+		if _, _, err := parseOverviewParams(q); err == nil {
+			t.Fatal("parseOverviewParams() error = nil, want error for an invalid bucket")
+		}
+	})
+}
+
+func TestServer_handleOverview(t *testing.T) {
+	t.Run("empty result is 200 with empty metrics/pings arrays, not 404", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if !strings.Contains(rec.Body.String(), `"metrics":[]`) || !strings.Contains(rec.Body.String(), `"pings":[]`) {
+			t.Fatalf("body = %s, want empty metrics/pings arrays, not null", rec.Body.String())
+		}
+	})
+
+	t.Run("returns the mapped overview shape, with outage samples assembled into episodes", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 7, 4, 0, 0, 0, time.UTC)
+		repo := &fakeRepo{
+			overviewMetrics: []domain.MetricSeries{
+				{Collector: domain.CollectorCPU, Name: "load1", Unit: "load", Buckets: []domain.MetricBucket{
+					{TS: ts, Min: 1, Max: 3, Avg: 2, Count: 2},
+				}},
+			},
+			overviewPings: []domain.PingSeries{
+				{Host: "1.1.1.1", Buckets: []domain.PingBucket{
+					{TS: ts, Sent: 5, Received: 5, AvgMS: 10, MaxMS: 12, Samples: 1},
+				}},
+			},
+			pingOutageSamples: []domain.PingRecord{
+				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+			},
+		}
+		srv := newTestServer(repo, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var body dto.OverviewResponse
+		decodeJSON(t, rec, &body)
+		if len(body.Metrics) != 1 || len(body.Metrics[0].Buckets) != 1 {
+			t.Fatalf("body.Metrics = %+v, want 1 series with 1 bucket", body.Metrics)
+		}
+		if len(body.Pings) != 1 || len(body.Pings[0].Buckets) != 1 {
+			t.Fatalf("body.Pings = %+v, want 1 series with 1 bucket", body.Pings)
+		}
+		if len(body.Pings[0].Outages) != 1 {
+			t.Fatalf("body.Pings[0].Outages = %+v, want 1 episode assembled from the outage samples", body.Pings[0].Outages)
+		}
+		if body.Window.Since == "" || body.Window.Until == "" || body.Window.Bucket == "" {
+			t.Fatalf("body.Window = %+v, want every field populated", body.Window)
+		}
+	})
+
+	t.Run("?since= and ?bucket= are parsed and forwarded", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview?since=2026-07-01T00:00:00Z&bucket=2h", "tok")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var body dto.OverviewResponse
+		decodeJSON(t, rec, &body)
+		if body.Window.Since != "2026-07-01T00:00:00Z" {
+			t.Fatalf("Window.Since = %q, want the forwarded since", body.Window.Since)
+		}
+		if body.Window.Bucket != "2h0m0s" {
+			t.Fatalf("Window.Bucket = %q, want %q", body.Window.Bucket, "2h0m0s")
+		}
+	})
+
+	t.Run("bad since is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview?since=not-a-date", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("bad bucket is 400", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview?bucket=not-a-duration", "tok")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("requires the token like every other gated route", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("wrong method is 405", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{}, "tok")
+
+		rec := doRequest(t, srv, http.MethodPost, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+	})
+
+	t.Run("an OverviewMetrics repo error is 500 with a generic body", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{overviewMetricsErr: errors.New("boom")}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("an OverviewPings repo error is 500 with a generic body", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{overviewPingsErr: errors.New("boom")}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("a PingOutageSamples repo error is 500 with a generic body", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newTestServer(&fakeRepo{pingOutageSamplesErr: errors.New("boom")}, "tok")
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview", "tok")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	})
+}
+
 func TestServer_handleHealth(t *testing.T) {
 	t.Run("all probes healthy is 200 status:true", func(t *testing.T) {
 		t.Parallel()

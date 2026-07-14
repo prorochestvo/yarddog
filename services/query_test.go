@@ -185,6 +185,163 @@ func TestQueryService_Metrics(t *testing.T) {
 	})
 }
 
+func TestQueryService_Overview(t *testing.T) {
+	t.Parallel()
+
+	bucketTests := []struct {
+		name       string
+		bucket     time.Duration
+		wantBucket time.Duration
+	}{
+		{"zero uses the default", 0, defaultBucket},
+		{"negative uses the default", -time.Hour, defaultBucket},
+		{"below the minimum is clamped up", 30 * time.Second, minBucket},
+		{"above the maximum is clamped down", 48 * time.Hour, maxBucket},
+		{"in range passes through", 6 * time.Hour, 6 * time.Hour},
+	}
+	for _, tt := range bucketTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &fakeHistoryRepository{}
+			q := newQueryService(repo)
+
+			got, err := q.Overview(t.Context(), time.Time{}, tt.bucket)
+			if err != nil {
+				t.Fatalf("Overview() error = %v", err)
+			}
+			if repo.overviewMetricsBucket != tt.wantBucket || repo.overviewPingsBucket != tt.wantBucket {
+				t.Fatalf("repo received bucket = %v/%v, want %v", repo.overviewMetricsBucket, repo.overviewPingsBucket, tt.wantBucket)
+			}
+			if got.Bucket != tt.wantBucket {
+				t.Fatalf("Overview().Bucket = %v, want %v", got.Bucket, tt.wantBucket)
+			}
+		})
+	}
+
+	t.Run("an absent since defaults to the last 7 days on every repo call", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+
+		got, err := q.Overview(t.Context(), time.Time{}, 0)
+		if err != nil {
+			t.Fatalf("Overview() error = %v", err)
+		}
+
+		want := testNow.Add(-defaultWindow)
+		if !repo.overviewMetricsSince.Equal(want) || !repo.overviewPingsSince.Equal(want) || !repo.pingOutageSamplesSince.Equal(want) {
+			t.Fatalf("repo received since = %v/%v/%v, want %v (now-7d default) on every call",
+				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingOutageSamplesSince, want)
+		}
+		if !got.Since.Equal(want) {
+			t.Fatalf("Overview().Since = %v, want %v", got.Since, want)
+		}
+	})
+
+	t.Run("an explicit since overrides the default window on every repo call", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		got, err := q.Overview(t.Context(), since, 0)
+		if err != nil {
+			t.Fatalf("Overview() error = %v", err)
+		}
+		if !repo.overviewMetricsSince.Equal(since) || !repo.overviewPingsSince.Equal(since) || !repo.pingOutageSamplesSince.Equal(since) {
+			t.Fatalf("repo received since not forwarded untouched: %v/%v/%v, want %v",
+				repo.overviewMetricsSince, repo.overviewPingsSince, repo.pingOutageSamplesSince, since)
+		}
+		if !got.Since.Equal(since) {
+			t.Fatalf("Overview().Since = %v, want %v", got.Since, since)
+		}
+	})
+
+	t.Run("Until is the clock's current time", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &fakeHistoryRepository{}
+		q := newQueryService(repo)
+
+		got, err := q.Overview(t.Context(), time.Time{}, 0)
+		if err != nil {
+			t.Fatalf("Overview() error = %v", err)
+		}
+		if !got.Until.Equal(testNow) {
+			t.Fatalf("Overview().Until = %v, want the clock's now %v", got.Until, testNow)
+		}
+	})
+
+	t.Run("attaches each host's outages by a map lookup, leaving an unaffected host nil", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+		repo := &fakeHistoryRepository{
+			overviewPingsResult: []domain.PingSeries{{Host: "1.1.1.1"}, {Host: "8.8.8.8"}},
+			pingOutageSamplesResult: []domain.PingRecord{
+				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+			},
+		}
+		q := newQueryService(repo)
+
+		got, err := q.Overview(t.Context(), time.Time{}, 0)
+		if err != nil {
+			t.Fatalf("Overview() error = %v", err)
+		}
+		if len(got.Pings) != 2 {
+			t.Fatalf("Overview().Pings = %d series, want 2", len(got.Pings))
+		}
+		if len(got.Pings[0].Outages) != 1 {
+			t.Fatalf("Pings[0] (%s) Outages = %+v, want 1 episode", got.Pings[0].Host, got.Pings[0].Outages)
+		}
+		if got.Pings[1].Outages != nil {
+			t.Fatalf("Pings[1] (%s) Outages = %+v, want nil (no degraded samples for this host)", got.Pings[1].Host, got.Pings[1].Outages)
+		}
+	})
+
+	t.Run("an OverviewMetrics repo error propagates", func(t *testing.T) {
+		t.Parallel()
+
+		wantErr := errors.New("db exploded")
+		repo := &fakeHistoryRepository{overviewMetricsErr: wantErr}
+		q := newQueryService(repo)
+
+		_, err := q.Overview(t.Context(), time.Time{}, 0)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Overview() error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("an OverviewPings repo error propagates", func(t *testing.T) {
+		t.Parallel()
+
+		wantErr := errors.New("db exploded")
+		repo := &fakeHistoryRepository{overviewPingsErr: wantErr}
+		q := newQueryService(repo)
+
+		_, err := q.Overview(t.Context(), time.Time{}, 0)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Overview() error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("a PingOutageSamples repo error propagates", func(t *testing.T) {
+		t.Parallel()
+
+		wantErr := errors.New("db exploded")
+		repo := &fakeHistoryRepository{pingOutageSamplesErr: wantErr}
+		q := newQueryService(repo)
+
+		_, err := q.Overview(t.Context(), time.Time{}, 0)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Overview() error = %v, want %v", err, wantErr)
+		}
+	})
+}
+
 func TestQueryService_Pings(t *testing.T) {
 	t.Parallel()
 
@@ -406,6 +563,139 @@ func TestQueryService_Runs(t *testing.T) {
 	})
 }
 
+func TestCollapseOutages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty input returns an empty map", func(t *testing.T) {
+		t.Parallel()
+
+		if got := collapseOutages(nil); len(got) != 0 {
+			t.Fatalf("collapseOutages(nil) = %+v, want empty", got)
+		}
+	})
+
+	t.Run("a single degraded sample is its own one-sample episode", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+		})
+
+		outages := got["1.1.1.1"]
+		if len(outages) != 1 {
+			t.Fatalf("outages = %+v, want 1 episode", outages)
+		}
+		if !outages[0].Start.Equal(ts) || !outages[0].End.Equal(ts) {
+			t.Fatalf("outage Start/End = %v/%v, want both %v", outages[0].Start, outages[0].End, ts)
+		}
+	})
+
+	t.Run("the last sample in the input still closes its episode (window edge)", func(t *testing.T) {
+		t.Parallel()
+
+		ts1 := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+		ts2 := ts1.Add(time.Minute)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: ts1, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+			{TS: ts2, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 2}},
+		})
+
+		outages := got["1.1.1.1"]
+		if len(outages) != 1 {
+			t.Fatalf("outages = %+v, want 1 merged episode", outages)
+		}
+		if !outages[0].End.Equal(ts2) {
+			t.Fatalf("outage End = %v, want the final sample's ts %v (the trailing run must not be dropped)", outages[0].End, ts2)
+		}
+	})
+
+	t.Run("consecutive degraded samples for one host merge across a filtered-out healthy gap (no gap heuristic)", func(t *testing.T) {
+		t.Parallel()
+
+		// PingOutageSamples' own "received < sent" filter already excludes any
+		// healthy sample that separated these two clusters in the real pings
+		// history, so collapseOutages never sees it and has no other signal to
+		// split on (adjacency is the filtered sequence itself) — the two
+		// clusters below, however far apart in wall-clock time, merge into one
+		// spanning episode rather than two.
+		morning := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+		evening := time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: morning, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+			{TS: evening, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 4}},
+		})
+
+		outages := got["1.1.1.1"]
+		if len(outages) != 1 {
+			t.Fatalf("outages = %+v, want exactly 1 merged episode, not one per cluster", outages)
+		}
+		if !outages[0].Start.Equal(morning) || !outages[0].End.Equal(evening) {
+			t.Fatalf("outage Start/End = %v/%v, want %v/%v (spanning both clusters)", outages[0].Start, outages[0].End, morning, evening)
+		}
+	})
+
+	t.Run("a different host starts its own separate episode", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+			{TS: ts, Result: domain.PingResult{Host: "8.8.8.8", Sent: 5, Received: 4}},
+		})
+
+		if len(got) != 2 {
+			t.Fatalf("collapseOutages() = %d hosts, want 2", len(got))
+		}
+		if len(got["1.1.1.1"]) != 1 || len(got["8.8.8.8"]) != 1 {
+			t.Fatalf("got = %+v, want exactly one episode per host", got)
+		}
+	})
+
+	t.Run("Unreachable", func(t *testing.T) {
+		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+
+		t.Run("sustained partial loss never sets Unreachable", func(t *testing.T) {
+			t.Parallel()
+
+			got := collapseOutages([]domain.PingRecord{
+				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+				{TS: ts.Add(time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 4}},
+			})
+			if got["1.1.1.1"][0].Unreachable {
+				t.Fatal("Unreachable = true, want false (every sample kept at least a partial reply)")
+			}
+		})
+
+		t.Run("one zero-reply sample sets Unreachable for the whole episode", func(t *testing.T) {
+			t.Parallel()
+
+			got := collapseOutages([]domain.PingRecord{
+				{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}},
+				{TS: ts.Add(time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 0}},
+			})
+			if !got["1.1.1.1"][0].Unreachable {
+				t.Fatal("Unreachable = false, want true (one sample had zero replies)")
+			}
+		})
+	})
+
+	t.Run("WorstLossPct is the maximum loss percentage seen across the run", func(t *testing.T) {
+		t.Parallel()
+
+		ts := time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC)
+		got := collapseOutages([]domain.PingRecord{
+			{TS: ts, Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 4}},                      // 20% loss
+			{TS: ts.Add(time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 1}},     // 80% loss, the worst
+			{TS: ts.Add(2 * time.Minute), Result: domain.PingResult{Host: "1.1.1.1", Sent: 5, Received: 3}}, // 40% loss
+		})
+
+		if got["1.1.1.1"][0].WorstLossPct != 80 {
+			t.Fatalf("WorstLossPct = %d, want 80 (the worst single-sample loss in the run)", got["1.1.1.1"][0].WorstLossPct)
+		}
+	})
+}
+
 // fakeHistoryRepository is a settable in-memory stand-in for
 // HistoryRepository: each method returns its canned "*Result"/"*OK"/"*Err"
 // fields and records the arguments it was called with (the last filter/limit,
@@ -438,6 +728,20 @@ type fakeHistoryRepository struct {
 	listChecksResult     []domain.Check
 	listChecksErr        error
 	listChecksByRunCalls int
+
+	overviewMetricsResult []domain.MetricSeries
+	overviewMetricsErr    error
+	overviewMetricsSince  time.Time
+	overviewMetricsBucket time.Duration
+
+	overviewPingsResult []domain.PingSeries
+	overviewPingsErr    error
+	overviewPingsSince  time.Time
+	overviewPingsBucket time.Duration
+
+	pingOutageSamplesResult []domain.PingRecord
+	pingOutageSamplesErr    error
+	pingOutageSamplesSince  time.Time
 }
 
 func (f *fakeHistoryRepository) LatestHost(context.Context) (domain.HostRecord, bool, error) {
@@ -470,4 +774,21 @@ func (f *fakeHistoryRepository) ListRuns(_ context.Context, limit int) ([]domain
 
 func (f *fakeHistoryRepository) RunByID(context.Context, string) (domain.Run, bool, error) {
 	return f.runByIDResult, f.runByIDOK, f.runByIDErr
+}
+
+func (f *fakeHistoryRepository) OverviewMetrics(_ context.Context, since time.Time, bucket time.Duration) ([]domain.MetricSeries, error) {
+	f.overviewMetricsSince = since
+	f.overviewMetricsBucket = bucket
+	return f.overviewMetricsResult, f.overviewMetricsErr
+}
+
+func (f *fakeHistoryRepository) OverviewPings(_ context.Context, since time.Time, bucket time.Duration) ([]domain.PingSeries, error) {
+	f.overviewPingsSince = since
+	f.overviewPingsBucket = bucket
+	return f.overviewPingsResult, f.overviewPingsErr
+}
+
+func (f *fakeHistoryRepository) PingOutageSamples(_ context.Context, since time.Time) ([]domain.PingRecord, error) {
+	f.pingOutageSamplesSince = since
+	return f.pingOutageSamplesResult, f.pingOutageSamplesErr
 }

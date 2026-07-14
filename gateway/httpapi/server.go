@@ -67,6 +67,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/pings", s.handlePings)
 	mux.HandleFunc("GET /api/v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.handleRunByID)
+	mux.HandleFunc("GET /api/v1/overview", s.handleOverview)
 }
 
 // loggingMiddleware logs each request's method, path, status, and duration

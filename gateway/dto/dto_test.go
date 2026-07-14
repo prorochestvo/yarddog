@@ -295,6 +295,84 @@ func TestHealthResponse_JSON(t *testing.T) {
 	})
 }
 
+func TestOverviewResponse_JSON(t *testing.T) {
+	t.Parallel()
+
+	t.Run("marshals nested window/metrics/pings/outages with the expected key names", func(t *testing.T) {
+		t.Parallel()
+
+		avg, max := 12.5, 20.0
+		resp := OverviewResponse{
+			Window: OverviewWindowDTO{Since: "2026-07-01T00:00:00Z", Until: "2026-07-08T00:00:00Z", Bucket: "1h0m0s"},
+			Metrics: []MetricSeriesDTO{
+				{Collector: "cpu", Name: "load1", Unit: "load", Buckets: []MetricBucketDTO{
+					{TS: "2026-07-01T00:00:00Z", Min: 0.1, Max: 0.5, Avg: 0.3, Count: 4},
+				}},
+			},
+			Pings: []PingSeriesDTO{
+				{
+					Host: "1.1.1.1",
+					Buckets: []PingBucketDTO{
+						{TS: "2026-07-01T00:00:00Z", Sent: 20, Received: 18, LossPct: 10, AvgMS: &avg, MaxMS: &max, Samples: 4},
+					},
+					Outages: []PingOutageDTO{
+						{Start: "2026-07-01T00:10:00Z", End: "2026-07-01T00:20:00Z", Kind: "loss", WorstLossPct: 40},
+					},
+				},
+			},
+		}
+
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+
+		want := `{"window":{"since":"2026-07-01T00:00:00Z","until":"2026-07-08T00:00:00Z","bucket":"1h0m0s"},` +
+			`"metrics":[{"collector":"cpu","name":"load1","unit":"load","buckets":[{"ts":"2026-07-01T00:00:00Z","min":0.1,"max":0.5,"avg":0.3,"count":4}]}],` +
+			`"pings":[{"host":"1.1.1.1","buckets":[{"ts":"2026-07-01T00:00:00Z","sent":20,"received":18,"loss_pct":10,"avg_ms":12.5,"max_ms":20,"samples":4}],` +
+			`"outages":[{"start":"2026-07-01T00:10:00Z","end":"2026-07-01T00:20:00Z","kind":"loss","worst_loss_pct":40}]}]}`
+		if string(body) != want {
+			t.Fatalf("Marshal() = %s, want %s", body, want)
+		}
+	})
+
+	t.Run("PingBucketDTO's avg_ms/max_ms are null when the whole bucket was unreachable", func(t *testing.T) {
+		t.Parallel()
+
+		b := PingBucketDTO{TS: "2026-07-01T00:00:00Z", Sent: 5, Received: 0, LossPct: 100, Samples: 1}
+
+		body, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+
+		want := `{"ts":"2026-07-01T00:00:00Z","sent":5,"received":0,"loss_pct":100,"avg_ms":null,"max_ms":null,"samples":1}`
+		if string(body) != want {
+			t.Fatalf("Marshal() = %s, want %s", body, want)
+		}
+	})
+
+	t.Run("empty Metrics/Pings marshal as [], not null", func(t *testing.T) {
+		t.Parallel()
+
+		resp := OverviewResponse{
+			Window:  OverviewWindowDTO{Since: "2026-07-01T00:00:00Z", Until: "2026-07-08T00:00:00Z", Bucket: "1h0m0s"},
+			Metrics: []MetricSeriesDTO{},
+			Pings:   []PingSeriesDTO{},
+		}
+
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+
+		want := `{"window":{"since":"2026-07-01T00:00:00Z","until":"2026-07-08T00:00:00Z","bucket":"1h0m0s"},"metrics":[],"pings":[]}`
+		if string(body) != want {
+			t.Fatalf("Marshal() = %s, want %s", body, want)
+		}
+	})
+}
+
 func TestErrorResponse_JSON(t *testing.T) {
 	t.Parallel()
 
