@@ -329,7 +329,9 @@ gauge-uniform across every collector for now; richer, collector-specific
 presentation (e.g. network throughput, memory breakdown) is deferred to a
 later pass. Everything past that — value thresholds, coloring, alerting — is
 a client-side/dashboard concern; only ping outage detection happens
-server-side.
+server-side. This endpoint is heavier than the row-capped list endpoints — an
+unbounded `GROUP BY` over the whole window — so clients should call it on
+dashboard load or occasional refresh, not on a tight poll.
 
 ```bash
 curl -s -H "Authorization: Bearer $YARDDOG_DAEMON_TOKEN" \
