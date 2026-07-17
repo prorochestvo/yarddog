@@ -264,11 +264,6 @@ accept.
   it and to host its `var _ services.Port = (*impl)(nil)` assertion.
 - **Add a device, don't fork one.** A new reboot target is a new driver in
   `gateway/router` plus a `ROUTER_KIND` case in the factory — nothing else moves.
-- **Deduplication is not a goal in itself.** Distinguish coincidental similarity (let it
-  diverge — duplicate the few trivial lines) from a genuine cross-cutting invariant
-  (centralize once, in the layer that owns it). Premature extraction imposes a contract
-  where code should be free to change. An abstraction can re-introduce the complexity it
-  pretends to hide.
 - **No speculative structure — even within the layers.** No new package, sub-package,
   interface, or binary until a real consumer or test seam needs it. The eleven ports and
   the layered packages earn their place from the layering, the device-driver family, and
@@ -282,158 +277,52 @@ accept.
   copy the trivial `resolveEnvPath` helper rather than share one. Any third binary follows
   the same rule.
 
-## File Declaration Order
+## Conventions
 
-Order top-level declarations in each `*.go` file public-surface-first — a reader should
-see everything important without digging:
-
-1. Exported `const`/`var` and the `New<Object>` constructor(s).
-2. The object's struct definition.
-3. The object's methods (prefer alphabetical).
-4. Unexported `const`/`var`.
-5. Auxiliary (unexported) support structs.
-6. Unexported methods/functions (prefer alphabetical).
-
-Multiple structs in one file: same layout, primary struct first. Files with no object
-(free functions + a data type): exported type(s)/function(s) on top, then unexported
-consts/vars, then helpers. Treat a file that buries its public surface as something to
-fix.
-
-## Constraints
+Generic Go conventions (style, file declaration order, test-only code placement,
+godoc, error discipline) come from the `stack-go` plugin skills. **Where this file
+contradicts them, this file wins** — notably testing below. Project-specific
+constraints:
 
 - **Stdlib-only, one exception.** The *only* permitted third-party dependency is
   `modernc.org/sqlite`. Forbidden: `github.com/stretchr/testify` (and any assertion
   lib), cgo SQLite drivers (`github.com/mattn/go-sqlite3`), Telegram/bot SDKs, `.env`
   parsing libraries. Enforced by `make lint`.
+- **Testing: stdlib `testing` only — no testify (overrides the stack-go default).**
+  Test structure still follows the canon: one `Test*` per tested method, scenarios as
+  `t.Run` subtests, `t.Parallel()` where safe, `t.Helper()` in helpers. Router and
+  Telegram are tested with `httptest` servers; the store on `:memory:`; the recovery
+  loop on injected fake clock/checker — no real network, no real sleep.
 - **No CGO for builds.** `CGO_ENABLED=0` on every build/vet, **including `darwin`** — the
   host-metrics collectors stay pure-Go (sysfs/procfs on Linux; `syscall.Statfs` + `os/exec`
   of `sysctl`/`vm_stat` on macOS, where temperature/fans are unsupported). Build targets are
   **`linux` and `darwin` only** (`arm64`/`amd64`): `NewMetricsCollector` is defined solely in
   `metrics_{linux,darwin}.go`, so any other GOOS is an intentional, unsupported build — do not
   add a stub fallback. (`make test-race` is the one cgo-using command, and it is opt-in.)
-- **Testing: stdlib `testing` only.** No testify. One `Test*` per tested
-  method/function, every scenario a `t.Run("descriptive name", …)` subtest inside it —
-  `TestEncode` with subtests, never `TestEncode_Empty` / `TestEncode_Unicode`. Methods
-  on a type use `TestType_Method`. `t.Parallel()` where there is no shared mutable
-  state; `t.Helper()` in helpers. Router and Telegram are tested with `httptest`
-  servers; the store on `:memory:`; the recovery loop on injected fake clock/checker —
-  no real network, no real sleep.
-- **Compile-time interface checks.** Every adapter impl and every fake/stub gets a
-  `var _ services.Checker = (*fakeChecker)(nil)`-style assertion next to it.
-- **No skipped errors.** Never `_`-discard an error in production or test code. The only
-  exceptions: `fmt.Fprint*` to loggers, `Rollback()` in error-recovery paths, and
-  resource `.Close()` in `defer` / `t.Cleanup`.
-- **No section-divider comments** (`// --- foo ---`). Let structure speak.
-- **Comments**: lowercase first word (e.g. `// wrap the driver error so callers can match on it`).
-  Explain the non-obvious *why*, never narrate what the code plainly says.
-- **Godoc on exported identifiers**: start with the identifier name, end with a period.
-  The root package doc is `// Command yarddog …` (a `main` package); each layer package
-  carries its own `// Package <name> …` doc. Skip a comment when it would only restate
-  the signature.
-- **Build outputs live in `./build/`, scratch in `./tmp/`, logs in `./logs/`** — the
-  only root dirs gitignored. Never `go build` without `-o build/…` (a bare build drops
-  a `yarddog` binary in the root). Runtime `*.db` files are gitignored too.
+- **Build outputs in `./build/`, scratch in `./tmp/`, logs in `./logs/`** — the only
+  root dirs gitignored; runtime `*.db` files are gitignored too.
 - **Times are UTC, RFC3339.** Message copy and logs are English, tag-first
   (`#REBOOT {LABEL} …`).
 
-## Planning Workflow
+## Working agreement
 
-All non-trivial work is tracked as a Markdown plan file in `plans/` before
-implementation begins.
+All non-trivial work follows the plan-first pipeline:
 
-### Directory layout
+1. **Plan** — the `architect` agent writes `plans/NNN-slug.md` (create via the
+   `pipeline:new-plan` skill). No source edits before a plan exists.
+2. **Implement** — the `engineer` agent executes the plan's tasks with tests.
+3. **Review** — three `reviewer` agents launched in parallel in ONE message, each
+   prompt naming its lens (A: correctness & tests, B: security & operations,
+   C: performance & architecture) and the changed files. Full three-lens fan-out is
+   mandatory on the first review; the post-fix re-review is ONE solo reviewer scoped
+   to the changed lines.
+4. **Gate** — `go vet ./... && go test ./...` must be green before review (`-race` is
+   opt-in via `make test-race`, needs a C toolchain); a red tree goes to the
+   `testdoctor` agent first, at any stage.
+5. **Complete** — the orchestrator merges the three reports, deduplicates, resolves
+   conflicting verdicts (naming what was rejected and why; the user has final say).
+   P0/P1 findings loop back to the engineer. Only when every P0/P1 is fixed or
+   explicitly accepted: move the plan via the `pipeline:complete-plan` skill.
 
-```
-plans/
-├── NNN-task-slug.md     # active / in-progress plans (e.g. 001-env-loader.md)
-├── completed/           # plans for fully shipped tasks (e.g. 260706.0001.env-loader.md)
-└── history/             # archived / cancelled plans
-```
-
-### File naming
-
-- **Active (`plans/`)** — zero-padded sequential index + kebab-case slug:
-  `NNN-description.md`. Pick the next number from the highest existing prefix across
-  `plans/`, `plans/completed/`, and `plans/history/`.
-- **Completed (`plans/completed/`)** — date prefix + zero-padded daily index:
-  `YYMMDD.NNNN.description.md`. `NNNN` resets to `0001` each day.
-- **Archived (`plans/history/`)** — keep the original `NNN-` filename.
-
-### Lifecycle
-
-1. **Create** — before touching code, produce `plans/NNN-slug.md` (use `/new-plan <slug>`).
-2. **Implement** — work the plan; it stays in `plans/` while in progress.
-3. **Complete** — once every acceptance criterion is met and the test gate is green,
-   `git mv` it to `plans/completed/YYMMDD.NNNN.slug.md` (use `/complete-plan <NNN|slug>`).
-4. **Archive** — if abandoned/superseded, move it to `plans/history/` instead.
-
-### Plan file format
-
-```markdown
-# Task Breakdown
-## Overview
-## Assumptions
-## Tasks
-### Task N: <Title>
-- Description:
-- Acceptance Criteria:
-- Pitfalls & edge cases:
-- Complexity: Easy / Medium / Hard
-## Execution Order
-## Risks
-## Trade-offs
-```
-
-One plan per concern. If implementation diverges, update the plan before moving it to
-`completed/`.
-
-## Agent Pipeline
-
-All non-trivial tasks follow a three-stage pipeline using specialized agents. The review
-stage fans out to **three `gocode-reviewer` instances running in parallel**, each with a
-distinct lens. A separate `gocode-testdoctor` is invoked on-demand whenever tests fail,
-at any stage.
-
-```
-User describes task
-    ↓
-1. gocode-architect   → writes plans/NNN-slug.md (see Planning Workflow)
-    ↓
-2. gocode-engineer    → implements the tasks in the plan
-    ↓
-3. gocode-reviewer × 3 (parallel — single message, three tool calls)
-    Lens A: correctness & tests — bugs, races, edge cases, error paths,
-            context propagation, resource cleanup, test coverage,
-            test structure (one Test* per method with subtests), fixtures
-    Lens B: security & operations — input validation, auth boundaries,
-            secrets handling, injection, observability, log volume,
-            operator/runbook UX
-    Lens C: performance & architecture — allocations, blocking I/O,
-            goroutine/resource leaks, layer/file boundaries, API contracts,
-            interface scope, future-proofing
-    ↓
-   Orchestrator synthesises all three reports, deduplicates, resolves conflicts,
-   and presents the merged punch list.
-    ↓
-  ❌ P0/P1 found?   → back to gocode-engineer with the consolidated findings; after
-                      the fix, run ONE targeted reviewer pass on the changed lines.
-  ⚠️  Tests failing? → gocode-testdoctor diagnoses and patches, then rerun the targeted pass.
-  ✅ All three approve? → move the plan: git mv plans/NNN-slug.md
-                          plans/completed/YYMMDD.NNNN.slug.md
-```
-
-Priority scale: **P0** (must fix before merge — data loss, security, state-corrupting
-race, broken contract) / **P1** (should fix — correctness, leaks, missing tests for a
-tested branch) / **P2** (nice to fix — maintainability, naming) / **P3** (pure style).
-
-### Rules
-
-- First review is always the full three-lens fan-out; the post-fix re-review is a single
-  pass scoped to the changed lines.
-- Each lens prompt is self-contained: lens name, what to SKIP (the other lenses), file
-  list, deliverable shape (P0–P3 + `file:line` + patch sketch), ~600-word cap.
-- The test gate (`go vet ./... && go test ./...`) must be green before review; a red
-  tree goes to `gocode-testdoctor` first.
-- On conflicting verdicts the orchestrator decides, names the rejected suggestion and
-  its reasoning; the user has final say.
-- The plan moves to `completed/` only once every P0/P1 is fixed or explicitly accepted.
+Plans live in `plans/` (active), `plans/completed/` (shipped, `YYMMDD.NNNN.slug.md`),
+`plans/history/` (abandoned/superseded). One plan per concern.
