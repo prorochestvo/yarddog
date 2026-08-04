@@ -2,9 +2,11 @@ package infrastructure
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
@@ -93,7 +95,11 @@ func (c *Checker) Gateway(ctx context.Context) domain.TargetResult {
 // probeHTTP GETs target within c.timeout and accepts any 2xx status (204 for
 // generate_204, 200 for cdn-cgi/trace) as success; anything else — including
 // a redirect, which CheckRedirect stops the client from following — is a
-// failure with the response status recorded in Error.
+// failure with the response status recorded in Error. A failure is tagged with
+// the request stage it stalled in (issue #6): every recorded domain failure to
+// date reads "context deadline exceeded", which does not say whether name
+// resolution, the TCP connect, or the TLS handshake was what hung — and those
+// have different causes and different fixes.
 func (c *Checker) probeHTTP(ctx context.Context, target string) domain.TargetResult {
 	start := time.Now()
 
@@ -102,10 +108,13 @@ func (c *Checker) probeHTTP(ctx context.Context, target string) domain.TargetRes
 		return domain.TargetResult{Target: target, Kind: domain.CheckKindDomain, OK: false, Latency: time.Since(start), Error: err.Error()}
 	}
 
+	stage := newStageTracker()
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), stage.trace()))
+
 	resp, err := c.httpClient.Do(req)
 	latency := time.Since(start)
 	if err != nil {
-		return domain.TargetResult{Target: target, Kind: domain.CheckKindDomain, OK: false, Latency: latency, Error: err.Error()}
+		return domain.TargetResult{Target: target, Kind: domain.CheckKindDomain, OK: false, Latency: latency, Error: stage.annotate(err)}
 	}
 	defer resp.Body.Close()
 
@@ -160,4 +169,79 @@ func hostPortFromURL(rawURL string) (string, error) {
 	}
 
 	return net.JoinHostPort(u.Hostname(), port), nil
+}
+
+// stageDNS, stageConnect, stageTLS, stageRequest, stageResponse, and
+// stageBody name the phases of one HTTP probe request, in the order a request
+// passes through them.
+const (
+	stageDNS      = "dns"
+	stageConnect  = "connect"
+	stageTLS      = "tls"
+	stageRequest  = "request"
+	stageResponse = "response"
+	stageBody     = "body"
+)
+
+// newStageTracker returns a tracker parked in stageDNS, the first phase a
+// fresh request enters. A request served from the connection pool skips
+// straight past it via GotConn.
+func newStageTracker() *stageTracker {
+	return &stageTracker{stage: stageDNS}
+}
+
+// stageTracker records how far one HTTP probe request got before it failed
+// (issue #6). "context deadline exceeded" alone cannot distinguish a stalled
+// resolver from a blackholed TCP connect or a hung TLS handshake, and those
+// are different faults with different remedies — the tracker turns the
+// recorded error into evidence. Its callbacks fire on whichever goroutine the
+// transport is using (parallel dials during Happy Eyeballs included), hence
+// the mutex.
+type stageTracker struct {
+	mu    sync.Mutex
+	stage string
+}
+
+// annotate tags err with the stage the request was in when it failed.
+func (s *stageTracker) annotate(err error) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fmt.Sprintf("%s (stage=%s)", err, s.stage)
+}
+
+// set advances the tracker to stage.
+func (s *stageTracker) set(stage string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stage = stage
+}
+
+// trace builds the ClientTrace that drives the tracker. Each hook records the
+// phase the request is entering, so a request that dies mid-phase leaves that
+// phase behind as its epitaph; the *Done hooks that carry an error leave the
+// failed phase in place rather than advancing past it.
+func (s *stageTracker) trace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) { s.set(stageDNS) },
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			if info.Err == nil {
+				s.set(stageConnect)
+			}
+		},
+		ConnectStart: func(string, string) { s.set(stageConnect) },
+		ConnectDone: func(_, _ string, err error) {
+			if err == nil {
+				s.set(stageTLS)
+			}
+		},
+		TLSHandshakeStart: func() { s.set(stageTLS) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err == nil {
+				s.set(stageRequest)
+			}
+		},
+		GotConn:              func(httptrace.GotConnInfo) { s.set(stageRequest) },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { s.set(stageResponse) },
+		GotFirstResponseByte: func() { s.set(stageBody) },
+	}
 }

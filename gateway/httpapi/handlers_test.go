@@ -516,15 +516,20 @@ func TestServer_handleOverview(t *testing.T) {
 
 		srv := newTestServer(&fakeRepo{}, "tok")
 
-		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview?since=2026-07-01T00:00:00Z&bucket=2h", "tok")
+		// relative to now, not a literal date: QueryService floors ?since= at
+		// now-31d, so a hardcoded timestamp forwards intact only until the
+		// wall clock walks past it.
+		since := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second).Format(time.RFC3339)
+
+		rec := doRequest(t, srv, http.MethodGet, "/api/v1/overview?since="+since+"&bucket=2h", "tok")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 		}
 
 		var body dto.OverviewResponse
 		decodeJSON(t, rec, &body)
-		if body.Window.Since != "2026-07-01T00:00:00Z" {
-			t.Fatalf("Window.Since = %q, want the forwarded since", body.Window.Since)
+		if body.Window.Since != since {
+			t.Fatalf("Window.Since = %q, want the forwarded since %q", body.Window.Since, since)
 		}
 		if body.Window.Bucket != "2h0m0s" {
 			t.Fatalf("Window.Bucket = %q, want %q", body.Window.Bucket, "2h0m0s")

@@ -12,6 +12,11 @@ import (
 // ExitConfigError and ExitLockHeld are produced by main itself before Execute
 // is ever called (a bad .env, or a lock already held) and are declared here
 // only so every code in the design's table has one canonical home.
+// ExitNoAction (issue #6) reports the state the original table had no honest
+// code for: the run observed a real failure — a degraded application path, or
+// an outage that did not survive the confirmation guards — and deliberately
+// took no action. It is not ExitOK, which claims nothing was wrong, and not
+// ExitSkippedCooldown, which means a reboot was due and suppressed.
 const (
 	ExitOK              = 0
 	ExitConfigError     = 1
@@ -19,6 +24,7 @@ const (
 	ExitRebootFailed    = 3
 	ExitRecoveryTimeout = 4
 	ExitSkippedCooldown = 5
+	ExitNoAction        = 6
 )
 
 // ReasonNoInternet and ReasonScheduledHardReboot are the two reasons the

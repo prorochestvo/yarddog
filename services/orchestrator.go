@@ -155,6 +155,79 @@ func (r *runner) collectTelemetry(ctx context.Context, runID string) {
 	wg.Wait()
 }
 
+// confirmDown re-probes a down verdict CHECK_CONFIRMATIONS more times,
+// CHECK_CONFIRM_DELAY apart, and returns the last result (issue #6): a single
+// five-second sample must never cost the whole LAN a router reboot. It returns
+// early on the first sample that is no longer down, and every attempt is
+// persisted under domain.PhaseConfirm so the record shows what the decision
+// was actually made on. The waiting goes through clock.After, so tests advance
+// virtual time instead of sleeping. When the re-check clears the verdict it
+// also corrects internet_ok, which InsertRun wrote from the mistaken first
+// sample.
+func (r *runner) confirmDown(ctx context.Context, runID string, initial domain.Result) domain.Result {
+	result := initial
+	for i := 0; i < r.settings.CheckConfirmations; i++ {
+		<-r.clock.After(r.settings.CheckConfirmDelay)
+
+		result = r.checker.Check(ctx)
+		r.persistChecks(ctx, runID, domain.PhaseConfirm, result.Targets)
+		if !result.IsDown() {
+			break
+		}
+	}
+
+	if !result.IsDown() {
+		internetOK := true
+		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{InternetOK: &internetOK}); err != nil {
+			r.logf("update run %s: %v", runID, err)
+		}
+		r.logf("run %s: down verdict not confirmed on re-check (state now %s): not rebooting", runID, result.State)
+	}
+
+	return result
+}
+
+// finishDegraded records a run whose domain (HTTPS) targets all failed while
+// raw ip connectivity held (issue #6). The router is never rebooted for this:
+// on 2026-07-30 four reboots in seven hours did not stop the same domain
+// probes from stalling. The operator is told once per episode — shouldAnnounce
+// suppresses the repeat while the state persists — because the fault is real
+// (name resolution or the HTTPS path is broken for everything on the LAN) even
+// though rebooting is not the answer to it.
+func (r *runner) finishDegraded(ctx context.Context, runID string) int {
+	if r.shouldAnnounce(ctx, runID, domain.OutcomeDegraded) {
+		r.notify(ctx, "domain checks failing while raw connectivity holds (no reboot)")
+	}
+	if err := r.notifier.Flush(ctx); err != nil {
+		r.logf("flush outbox: %v", err)
+	}
+
+	outcome := domain.OutcomeDegraded
+	finishedAt := r.clock.Now()
+	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
+		r.logf("update run %s: %v", runID, err)
+	}
+	return domain.ExitNoAction
+}
+
+// finishNoOutage closes a run that reached no reboot: outcome ok (the internet
+// was up), unconfirmed (a down verdict the in-run re-check cleared), or
+// unsustained (a confirmed outage the preceding runs did not corroborate). The
+// last two send no Telegram message by design — silence is the point of the
+// guards, and the run row plus the log line carry the record instead (issue
+// #6).
+func (r *runner) finishNoOutage(ctx context.Context, runID, outcome string, exitCode int) int {
+	if outcome == domain.OutcomeUnsustained {
+		r.logf("run %s: outage not corroborated by the previous %d run(s): not rebooting", runID, r.settings.RebootMinStreak-1)
+	}
+
+	finishedAt := r.clock.Now()
+	if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
+		r.logf("update run %s: %v", runID, err)
+	}
+	return exitCode
+}
+
 // finishRebootDisabled records a run that would otherwise have rebooted but
 // REBOOT_ENABLED is off (plans/003-host-telemetry.md: monitor-only mode).
 // Exit stays domain.ExitOK: the reboot path was never entered, so none of
@@ -288,6 +361,37 @@ func (r *runner) notify(ctx context.Context, text string) {
 	}
 }
 
+// outageSustained reports whether the REBOOT_MIN_STREAK-1 runs before runID
+// also saw the internet as down (issue #6). One five-minute cron sample is not
+// an outage: in 21 days of recorded history exactly one down verdict had a
+// down predecessor, while 11 reboots fired on isolated samples. A run with no
+// verdict at all (a hard-mode run, internet_ok NULL) does not corroborate — it
+// never probed — and neither does a history too short to fill the streak. A
+// failed query is fail-closed for the same reason as the cooldown guard: an
+// unreadable history must not fall through to an unconditional reboot.
+func (r *runner) outageSustained(ctx context.Context, runID string) bool {
+	need := r.settings.RebootMinStreak - 1
+	if need <= 0 {
+		return true
+	}
+
+	previous, err := r.repo.RecentRuns(ctx, runID, need)
+	if err != nil {
+		r.logf("recent runs: %v", err)
+		return false
+	}
+	if len(previous) < need {
+		return false
+	}
+
+	for _, p := range previous {
+		if p.InternetOK == nil || *p.InternetOK {
+			return false
+		}
+	}
+	return true
+}
+
 // persistCheck writes one probed target as a checks row (design §9).
 func (r *runner) persistCheck(ctx context.Context, runID, phase string, tr domain.TargetResult) {
 	latencyMS := tr.Latency.Milliseconds()
@@ -361,7 +465,11 @@ func (r *runner) recoveryLoop(ctx context.Context, runID string, rebootStartedAt
 		inet := r.checker.Check(ctx)
 		r.persistChecks(ctx, runID, domain.PhaseRecovery, inet.Targets)
 
-		if !inet.Down {
+		// anything short of a down verdict ends the loop: a degraded state
+		// (issue #6) means the link the reboot was meant to restore is back,
+		// and waiting out the full RECOVERY_TIMEOUT for DNS to also recover
+		// would only hold the process open for a fault a reboot cannot fix.
+		if !inet.IsDown() {
 			return r.finishRecoverySuccess(ctx, runID, now)
 		}
 		if now.Sub(rebootStartedAt) >= r.settings.RecoveryTimeout {
@@ -380,11 +488,34 @@ func (r *runner) run(ctx context.Context, mode string) int {
 	return r.softFlow(ctx, startedAt)
 }
 
+// shouldAnnounce reports whether a repeating state is worth another Telegram
+// message: true only when the run before runID did not already end in the same
+// outcome (issue #6). A cron collector runs every few minutes, so a state that
+// lasts an hour would otherwise send a message per run — the storm visible in
+// issue #6's screenshot, where five identical cooldown notices arrived between
+// 01:50 and 03:05. A failed history query announces: a duplicate message costs
+// the operator far less than a silent outage.
+func (r *runner) shouldAnnounce(ctx context.Context, runID, outcome string) bool {
+	previous, err := r.repo.RecentRuns(ctx, runID, 1)
+	if err != nil {
+		r.logf("recent runs: %v", err)
+		return true
+	}
+	if len(previous) == 0 {
+		return true
+	}
+	return previous[0].Outcome != outcome
+}
+
 // skipCooldown records a reboot skipped because the last one is still within
 // REBOOT_COOLDOWN (design §6) — rebooting through a provider-side outage
-// would otherwise cycle the router every run for no benefit.
+// would otherwise cycle the router every run for no benefit. The notice is
+// edge-triggered (shouldAnnounce): the skip repeats every run for as long as
+// the cooldown lasts, but it is only news the first time.
 func (r *runner) skipCooldown(ctx context.Context, runID string, age time.Duration) int {
-	r.notify(ctx, fmt.Sprintf("no internet, skipping reboot (cooldown: last reboot %s ago)", humanDuration(age)))
+	if r.shouldAnnounce(ctx, runID, domain.OutcomeSkipped) {
+		r.notify(ctx, fmt.Sprintf("no internet, skipping reboot (cooldown: last reboot %s ago)", humanDuration(age)))
+	}
 
 	action := domain.ActionSkippedCooldown
 	outcome := domain.OutcomeSkipped
@@ -416,13 +547,16 @@ func (r *runner) skipCooldownUnknown(ctx context.Context, runID string, queryErr
 }
 
 // softFlow probes the internet first (design §6): up means nothing to do;
-// down checks REBOOT_ENABLED before ever consulting the cooldown query, so a
-// monitor-only host never touches the router (plans/003-host-telemetry.md).
+// down goes through the issue #6 guards — re-probe within the run, then
+// require the preceding runs to agree — before REBOOT_ENABLED and the
+// cooldown query are ever consulted, so a monitor-only host never touches the
+// router (plans/003-host-telemetry.md) and a five-second blip never reboots
+// anything.
 func (r *runner) softFlow(ctx context.Context, startedAt time.Time) int {
 	result := r.checker.Check(ctx)
-	internetOK := !result.Down
+	initialOK := !result.IsDown()
 
-	runID, err := r.repo.InsertRun(ctx, startedAt, domain.ModeSoft, &internetOK)
+	runID, err := r.repo.InsertRun(ctx, startedAt, domain.ModeSoft, &initialOK)
 	if err != nil {
 		r.logf("insert run: %v", err)
 		return domain.ExitConfigError
@@ -430,17 +564,25 @@ func (r *runner) softFlow(ctx context.Context, startedAt time.Time) int {
 	r.persistChecks(ctx, runID, domain.PhaseInitial, result.Targets)
 	r.collectTelemetry(ctx, runID)
 
-	if internetOK {
-		outcome := domain.OutcomeOK
-		finishedAt := r.clock.Now()
-		if err := r.repo.UpdateRun(ctx, runID, domain.RunUpdate{Outcome: &outcome, FinishedAt: &finishedAt}); err != nil {
-			r.logf("update run %s: %v", runID, err)
-		}
-		return domain.ExitOK
+	if result.IsDown() {
+		result = r.confirmDown(ctx, runID, result)
+	}
+
+	switch {
+	case result.IsDegraded():
+		return r.finishDegraded(ctx, runID)
+	case !result.IsDown() && !initialOK:
+		return r.finishNoOutage(ctx, runID, domain.OutcomeUnconfirmed, domain.ExitOK)
+	case !result.IsDown():
+		return r.finishNoOutage(ctx, runID, domain.OutcomeOK, domain.ExitOK)
 	}
 
 	if !r.settings.RebootEnabled {
 		return r.finishRebootDisabled(ctx, runID, "no internet, reboot disabled (monitor-only)")
+	}
+
+	if !r.outageSustained(ctx, runID) {
+		return r.finishNoOutage(ctx, runID, domain.OutcomeUnsustained, domain.ExitNoAction)
 	}
 
 	lastRebootStartedAt, ok, err := r.repo.GetLastRebootStartedAt(ctx)

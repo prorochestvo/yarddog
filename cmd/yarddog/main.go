@@ -128,13 +128,16 @@ func run() int {
 	}
 
 	settings := services.Settings{
-		Label:            cfg.Label,
-		RebootCooldown:   cfg.RebootCooldown,
-		RecoveryInterval: cfg.RecoveryInterval,
-		RecoveryTimeout:  cfg.RecoveryTimeout,
-		RebootEnabled:    cfg.RebootEnabled,
-		MetricsEnabled:   cfg.MetricsEnabled,
-		PingEnabled:      len(cfg.PingHosts) > 0,
+		Label:              cfg.Label,
+		RebootCooldown:     cfg.RebootCooldown,
+		RecoveryInterval:   cfg.RecoveryInterval,
+		RecoveryTimeout:    cfg.RecoveryTimeout,
+		CheckConfirmations: cfg.CheckConfirmations,
+		CheckConfirmDelay:  cfg.CheckConfirmDelay,
+		RebootMinStreak:    cfg.RebootMinStreak,
+		RebootEnabled:      cfg.RebootEnabled,
+		MetricsEnabled:     cfg.MetricsEnabled,
+		PingEnabled:        len(cfg.PingHosts) > 0,
 	}
 
 	code := services.Execute(ctx, settings, st, st, st, chk, rb, nt, mc, pc, clk, mode)

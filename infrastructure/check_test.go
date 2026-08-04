@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,8 +73,8 @@ func TestChecker_Check(t *testing.T) {
 		c := newTestChecker(t, []string{up, down}, []string{domainUp}, time.Second)
 		result := c.Check(t.Context())
 
-		if result.Down {
-			t.Fatalf("Down = true, want false (only one ip target failed): %+v", result.Targets)
+		if result.State != domain.StateUp {
+			t.Fatalf("State = %q, want %q (only one ip target failed): %+v", result.State, domain.StateUp, result.Targets)
 		}
 	})
 
@@ -87,12 +88,12 @@ func TestChecker_Check(t *testing.T) {
 		c := newTestChecker(t, []string{down1, down2}, []string{domainUp}, time.Second)
 		result := c.Check(t.Context())
 
-		if !result.Down {
-			t.Fatalf("Down = false, want true (all ip targets failed): %+v", result.Targets)
+		if !result.IsDown() {
+			t.Fatalf("State = %q, want %q (all ip targets failed): %+v", result.State, domain.StateDown, result.Targets)
 		}
 	})
 
-	t.Run("ip up but all domains down is a down verdict", func(t *testing.T) {
+	t.Run("ip up but all domains down is degraded, not down", func(t *testing.T) {
 		t.Parallel()
 
 		up := newReachableListener(t)
@@ -102,8 +103,8 @@ func TestChecker_Check(t *testing.T) {
 		c := newTestChecker(t, []string{up}, []string{domainDown1, domainDown2}, time.Second)
 		result := c.Check(t.Context())
 
-		if !result.Down {
-			t.Fatalf("Down = false, want true (all domain targets failed): %+v", result.Targets)
+		if !result.IsDegraded() {
+			t.Fatalf("State = %q, want %q (all domain targets failed while an ip target answered): %+v", result.State, domain.StateDegraded, result.Targets)
 		}
 	})
 
@@ -118,8 +119,8 @@ func TestChecker_Check(t *testing.T) {
 		c := newTestChecker(t, []string{up, down}, []string{domainUp, domainDown}, time.Second)
 		result := c.Check(t.Context())
 
-		if result.Down {
-			t.Fatalf("Down = true, want false: %+v", result.Targets)
+		if result.State != domain.StateUp {
+			t.Fatalf("State = %q, want %q: %+v", result.State, domain.StateUp, result.Targets)
 		}
 	})
 
@@ -206,6 +207,60 @@ func TestChecker_Check(t *testing.T) {
 		}
 		if elapsed > 5*timeout {
 			t.Fatalf("Check took %v, want it bounded near the %v timeout", elapsed, timeout)
+		}
+	})
+
+	t.Run("a failed domain probe records the request stage it stalled in", func(t *testing.T) {
+		t.Parallel()
+
+		const timeout = 50 * time.Millisecond
+		hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+				w.WriteHeader(http.StatusNoContent)
+			}
+		}))
+		t.Cleanup(hung.Close)
+
+		cases := []struct {
+			name      string
+			target    string
+			wantStage string
+		}{
+			{
+				// RFC 2606 reserves .invalid, so this name resolves nowhere.
+				name:      "unresolvable host stalls in dns",
+				target:    "http://yarddog-issue-6.invalid/",
+				wantStage: "stage=" + stageDNS,
+			},
+			{
+				name:      "refused connection stalls in connect",
+				target:    "http://" + newClosedAddr(t) + "/",
+				wantStage: "stage=" + stageConnect,
+			},
+			{
+				name:      "a server that never answers stalls awaiting the response",
+				target:    hung.URL,
+				wantStage: "stage=" + stageResponse,
+			},
+		}
+
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+
+				chk := newTestChecker(t, nil, []string{c.target}, timeout)
+				result := chk.Check(t.Context())
+
+				got := result.Targets[0]
+				if got.OK {
+					t.Fatalf("OK = true, want false: %+v", got)
+				}
+				if !strings.Contains(got.Error, c.wantStage) {
+					t.Fatalf("Error = %q, want it to carry %q", got.Error, c.wantStage)
+				}
+			})
 		}
 	})
 

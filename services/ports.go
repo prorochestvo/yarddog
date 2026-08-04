@@ -56,11 +56,18 @@ type Clock interface {
 // infrastructure.Store satisfies it. InsertRun's returned id and UpdateRun's
 // id parameter are opaque UUIDv7 strings (issue #4) that the orchestrator
 // only ever threads through, never inspects.
+// RecentRuns returns the runs immediately preceding beforeID, newest first,
+// at most limit of them — the history the issue #6 guards corroborate a
+// present outage against. beforeID is the caller's own run id: ids are
+// time-ordered UUIDv7 strings (issue #4), so "preceding" is a plain id
+// comparison and the caller's own freshly inserted row is never returned to
+// it. Fewer than limit rows simply means the history is that short.
 type RunRepository interface {
 	InsertRun(ctx context.Context, startedAt time.Time, mode string, internetOK *bool) (string, error)
 	UpdateRun(ctx context.Context, id string, u domain.RunUpdate) error
 	InsertCheck(ctx context.Context, c domain.Check) error
 	GetLastRebootStartedAt(ctx context.Context) (time.Time, bool, error)
+	RecentRuns(ctx context.Context, beforeID string, limit int) ([]domain.RunSummary, error)
 }
 
 // MetricsCollector takes one host telemetry snapshot (design
@@ -118,12 +125,21 @@ type Sender interface {
 // domain types (plans/003-host-telemetry.md Trade-off T1): domain owns the
 // vocabulary the toggles drive (ActionSkippedDisabled, OutcomeRebootDisabled,
 // the Collector consts), not the toggle itself.
+// CheckConfirmations, CheckConfirmDelay, and RebootMinStreak (issue #6) are
+// the two independent guards between a down verdict and a reboot: the first
+// pair re-probes within the run, the third requires the preceding runs to have
+// seen the outage too. Both are counted in samples rather than wall time
+// because the collector is a cron process with no memory of its own — the
+// interval between runs is cron's business, not the orchestrator's.
 type Settings struct {
-	Label            string
-	RebootCooldown   time.Duration
-	RecoveryInterval time.Duration
-	RecoveryTimeout  time.Duration
-	RebootEnabled    bool
-	MetricsEnabled   bool
-	PingEnabled      bool
+	Label              string
+	RebootCooldown     time.Duration
+	RecoveryInterval   time.Duration
+	RecoveryTimeout    time.Duration
+	CheckConfirmations int
+	CheckConfirmDelay  time.Duration
+	RebootMinStreak    int
+	RebootEnabled      bool
+	MetricsEnabled     bool
+	PingEnabled        bool
 }

@@ -60,6 +60,7 @@ func LoadConfig(envPath string) (*Config, error) {
 		{"RECOVERY_INTERVAL", &cfg.RecoveryInterval, defaultRecoveryInterval},
 		{"RECOVERY_TIMEOUT", &cfg.RecoveryTimeout, defaultRecoveryTimeout},
 		{"REBOOT_COOLDOWN", &cfg.RebootCooldown, defaultRebootCooldown},
+		{"CHECK_CONFIRM_DELAY", &cfg.CheckConfirmDelay, defaultCheckConfirmDelay},
 	}
 	for _, d := range durations {
 		raw := getOrDefault(get, d.key, d.def)
@@ -69,6 +70,24 @@ func LoadConfig(envPath string) (*Config, error) {
 		}
 		*d.dst = parsed
 	}
+	cfg.CheckConfirmDelay = clampCheckConfirmDelay(cfg.CheckConfirmDelay)
+
+	// CheckConfirmations and RebootMinStreak are the two issue #6 guards
+	// between a down verdict and a reboot; both are sample counts, and both
+	// clamp rather than fail startup, matching PING_COUNT's philosophy.
+	rawConfirmations := getOrDefault(get, "CHECK_CONFIRMATIONS", defaultCheckConfirmations)
+	confirmations, err := strconv.Atoi(rawConfirmations)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"CHECK_CONFIRMATIONS", rawConfirmations, err)
+	}
+	cfg.CheckConfirmations = clampCheckConfirmations(confirmations)
+
+	rawMinStreak := getOrDefault(get, "REBOOT_MIN_STREAK", defaultRebootMinStreak)
+	minStreak, err := strconv.Atoi(rawMinStreak)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", envPrefix+"REBOOT_MIN_STREAK", rawMinStreak, err)
+	}
+	cfg.RebootMinStreak = clampRebootMinStreak(minStreak)
 
 	// RetentionDays now governs the *archive* tier only (issue #4): a run
 	// stays hot for HotWindowDays regardless of this value, and
@@ -165,6 +184,13 @@ type Config struct {
 	PingHosts        []string
 	PingCount        int
 	PingTimeout      time.Duration
+
+	// CheckConfirmations, CheckConfirmDelay, and RebootMinStreak are issue
+	// #6's false-positive guards; see services.Settings for what each one
+	// buys.
+	CheckConfirmations int
+	CheckConfirmDelay  time.Duration
+	RebootMinStreak    int
 }
 
 const (
@@ -182,6 +208,17 @@ const (
 	defaultPingHosts        = ""
 	defaultPingCount        = "5"
 	defaultPingTimeout      = "4s"
+
+	// defaultCheckConfirmations and defaultCheckConfirmDelay re-probe a down
+	// verdict twice, 20s apart, so a reboot decision rests on ~45s of evidence
+	// instead of one 5s sample and still lands well inside a 5-minute cron
+	// slot. defaultRebootMinStreak then requires the previous run to have seen
+	// the outage too (issue #6): in 21 days of recorded history exactly one
+	// down verdict had a down predecessor, and 11 reboots fired on isolated
+	// samples with the ip targets answering normally throughout.
+	defaultCheckConfirmations = "2"
+	defaultCheckConfirmDelay  = "20s"
+	defaultRebootMinStreak    = "2"
 
 	// minHotWindowDays floors HOT_WINDOW_DAYS (issue #4): there is no
 	// "disable roll-over" mode — unbounded hot growth is the bug this knob
@@ -214,6 +251,28 @@ const (
 	// every run, making the operator's setting a no-op.
 	minPingTimeout = 1 * time.Second
 	maxPingTimeout = 10 * time.Second
+
+	// minCheckConfirmations bounds CHECK_CONFIRMATIONS at 0 — "act on the
+	// first sample", the pre-issue-#6 behaviour, which stays available to an
+	// operator who wants it — and the ceiling keeps the whole confirmation
+	// window (attempts x delay, plus each attempt's own CHECK_TIMEOUT) inside
+	// a single cron slot, so a run can never still be confirming when the next
+	// one starts and hits the flock.
+	minCheckConfirmations = 0
+	maxCheckConfirmations = 5
+
+	// minCheckConfirmDelay and maxCheckConfirmDelay bound the gap between
+	// re-probes: below a second the "re-check" would sample the same stalled
+	// moment it just failed on, and above a minute the guard would outlast the
+	// cron cadence it is nested inside.
+	minCheckConfirmDelay = 1 * time.Second
+	maxCheckConfirmDelay = 60 * time.Second
+
+	// minRebootMinStreak bounds REBOOT_MIN_STREAK at 1 ("this run alone is
+	// enough", no cross-run corroboration). The ceiling stops a typo from
+	// demanding a streak so long the watchdog would never reboot at all.
+	minRebootMinStreak = 1
+	maxRebootMinStreak = 10
 )
 
 // clampHotWindowDays floors HOT_WINDOW_DAYS at minHotWindowDays (1) rather
@@ -240,6 +299,42 @@ func clampHotWindowDays(n int) int {
 func clampRetentionDays(n int) int {
 	if n > maxRetentionDays {
 		return maxRetentionDays
+	}
+	return n
+}
+
+// clampCheckConfirmations bounds CHECK_CONFIRMATIONS to [minCheckConfirmations,
+// maxCheckConfirmations], clamping rather than refusing to start (issue #6).
+func clampCheckConfirmations(n int) int {
+	if n < minCheckConfirmations {
+		return minCheckConfirmations
+	}
+	if n > maxCheckConfirmations {
+		return maxCheckConfirmations
+	}
+	return n
+}
+
+// clampCheckConfirmDelay bounds CHECK_CONFIRM_DELAY to [minCheckConfirmDelay,
+// maxCheckConfirmDelay] (issue #6).
+func clampCheckConfirmDelay(d time.Duration) time.Duration {
+	if d < minCheckConfirmDelay {
+		return minCheckConfirmDelay
+	}
+	if d > maxCheckConfirmDelay {
+		return maxCheckConfirmDelay
+	}
+	return d
+}
+
+// clampRebootMinStreak bounds REBOOT_MIN_STREAK to [minRebootMinStreak,
+// maxRebootMinStreak] (issue #6).
+func clampRebootMinStreak(n int) int {
+	if n < minRebootMinStreak {
+		return minRebootMinStreak
+	}
+	if n > maxRebootMinStreak {
+		return maxRebootMinStreak
 	}
 	return n
 }

@@ -396,6 +396,92 @@ func TestLoadConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("issue #6 guards default to two re-checks 20s apart and a two-run streak", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeConfigFixture(t, requiredOnlyEnv())
+
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v", err)
+		}
+		if cfg.CheckConfirmations != 2 {
+			t.Errorf("CheckConfirmations = %d, want 2", cfg.CheckConfirmations)
+		}
+		if cfg.CheckConfirmDelay != 20*time.Second {
+			t.Errorf("CheckConfirmDelay = %v, want 20s", cfg.CheckConfirmDelay)
+		}
+		if cfg.RebootMinStreak != 2 {
+			t.Errorf("RebootMinStreak = %d, want 2", cfg.RebootMinStreak)
+		}
+	})
+
+	t.Run("issue #6 guard values are clamped, never fatal", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name               string
+			env                map[string]string
+			wantConfirmations  int
+			wantConfirmDelay   time.Duration
+			wantRebootMinStrek int
+		}{
+			{
+				name:               "below the floor",
+				env:                map[string]string{"CHECK_CONFIRMATIONS": "-1", "CHECK_CONFIRM_DELAY": "10ms", "REBOOT_MIN_STREAK": "0"},
+				wantConfirmations:  minCheckConfirmations,
+				wantConfirmDelay:   minCheckConfirmDelay,
+				wantRebootMinStrek: minRebootMinStreak,
+			},
+			{
+				name:               "above the ceiling",
+				env:                map[string]string{"CHECK_CONFIRMATIONS": "99", "CHECK_CONFIRM_DELAY": "10m", "REBOOT_MIN_STREAK": "99"},
+				wantConfirmations:  maxCheckConfirmations,
+				wantConfirmDelay:   maxCheckConfirmDelay,
+				wantRebootMinStrek: maxRebootMinStreak,
+			},
+		}
+
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+
+				env := requiredOnlyEnv()
+				for k, v := range c.env {
+					env[k] = v
+				}
+				path := writeConfigFixture(t, env)
+
+				cfg, err := LoadConfig(path)
+				if err != nil {
+					t.Fatalf("LoadConfig() error = %v", err)
+				}
+				if cfg.CheckConfirmations != c.wantConfirmations {
+					t.Errorf("CheckConfirmations = %d, want %d", cfg.CheckConfirmations, c.wantConfirmations)
+				}
+				if cfg.CheckConfirmDelay != c.wantConfirmDelay {
+					t.Errorf("CheckConfirmDelay = %v, want %v", cfg.CheckConfirmDelay, c.wantConfirmDelay)
+				}
+				if cfg.RebootMinStreak != c.wantRebootMinStrek {
+					t.Errorf("RebootMinStreak = %d, want %d", cfg.RebootMinStreak, c.wantRebootMinStrek)
+				}
+			})
+		}
+	})
+
+	t.Run("non-integer CHECK_CONFIRMATIONS returns an error", func(t *testing.T) {
+		t.Parallel()
+
+		env := requiredOnlyEnv()
+		env["CHECK_CONFIRMATIONS"] = "twice"
+		path := writeConfigFixture(t, env)
+
+		_, err := LoadConfig(path)
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil, want error for non-integer CHECK_CONFIRMATIONS")
+		}
+	})
+
 	t.Run("PING_COUNT below the floor is clamped to 4", func(t *testing.T) {
 		t.Parallel()
 
