@@ -989,6 +989,49 @@ func (s *Store) PruneArchive(ctx context.Context, now time.Time, retentionDays i
 	return pruned, nil
 }
 
+// RecentRuns returns the hot runs immediately preceding beforeID, newest
+// first, at most limit of them (issue #6). Ordering and the "preceding"
+// predicate both ride on the UUIDv7 primary key (issue #4), which is
+// time-ordered, so no secondary index on started_at is needed and the caller's
+// own row is excluded by a plain id comparison. It reads the hot table only:
+// the guards corroborate against the last few minutes, never against history
+// old enough to have rolled into the archive.
+func (s *Store) RecentRuns(ctx context.Context, beforeID string, limit int) ([]domain.RunSummary, error) {
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s, %s FROM %s WHERE %s < ? ORDER BY %s DESC LIMIT ?`,
+			colRunsInternetOK, colRunsOutcome, tableRuns, colRunsID, colRunsID),
+		beforeID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("recent runs before %s: %w", beforeID, err)
+	}
+	defer rows.Close()
+
+	var out []domain.RunSummary
+	for rows.Next() {
+		var (
+			internetOK sql.NullBool
+			outcome    sql.NullString
+		)
+		if err := rows.Scan(&internetOK, &outcome); err != nil {
+			return nil, fmt.Errorf("recent runs before %s: %w", beforeID, err)
+		}
+
+		var summary domain.RunSummary
+		if internetOK.Valid {
+			ok := internetOK.Bool
+			summary.InternetOK = &ok
+		}
+		summary.Outcome = outcome.String
+		out = append(out, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recent runs before %s: %w", beforeID, err)
+	}
+
+	return out, nil
+}
+
 // RolloverToArchive moves every run (and all its children) with
 // started_at older than now - hotWindowDays days from the hot tables into
 // their *_archive twins, in one transaction (issue #4): this run-boundary
@@ -1888,6 +1931,9 @@ func runUpdateAssignments(u domain.RunUpdate) ([]string, []any) {
 		args = append(args, v)
 	}
 
+	if u.InternetOK != nil {
+		add(colRunsInternetOK, boolToInt(*u.InternetOK))
+	}
 	if u.Action != nil {
 		add(colRunsAction, *u.Action)
 	}

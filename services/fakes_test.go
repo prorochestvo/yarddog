@@ -115,11 +115,15 @@ func newFakeRunRepo() *fakeRunRepo {
 // real against SQLite in infrastructure/store_test.go.
 type fakeRunRepo struct {
 	runs   map[string]*domain.Run
+	checks []domain.Check
 	nextID int64
 
 	lastRebootStartedAt time.Time
 	lastRebootOK        bool
 	lastRebootErr       error
+
+	recentRuns    []domain.RunSummary
+	recentRunsErr error
 }
 
 func (f *fakeRunRepo) GetLastRebootStartedAt(context.Context) (time.Time, bool, error) {
@@ -129,8 +133,20 @@ func (f *fakeRunRepo) GetLastRebootStartedAt(context.Context) (time.Time, bool, 
 	return f.lastRebootStartedAt, f.lastRebootOK, nil
 }
 
-func (f *fakeRunRepo) InsertCheck(_ context.Context, _ domain.Check) error {
+func (f *fakeRunRepo) InsertCheck(_ context.Context, c domain.Check) error {
+	f.checks = append(f.checks, c)
 	return nil
+}
+
+// phases returns the phase of every persisted check in insert order, so a
+// test can assert what a run actually recorded (issue #6: the confirmation
+// re-probes must land in the record as domain.PhaseConfirm, not vanish).
+func (f *fakeRunRepo) phases() []string {
+	out := make([]string, 0, len(f.checks))
+	for _, c := range f.checks {
+		out = append(out, c.Phase)
+	}
+	return out
 }
 
 func (f *fakeRunRepo) InsertRun(_ context.Context, startedAt time.Time, mode string, internetOK *bool) (string, error) {
@@ -138,6 +154,21 @@ func (f *fakeRunRepo) InsertRun(_ context.Context, startedAt time.Time, mode str
 	id := strconv.FormatInt(f.nextID, 10)
 	f.runs[id] = &domain.Run{ID: id, StartedAt: startedAt, Mode: mode, InternetOK: internetOK, Action: domain.ActionNone}
 	return id, nil
+}
+
+// RecentRuns serves the canned recentRuns slice (newest first), truncated to
+// limit, rather than deriving history from inserted rows — the same "dumb and
+// settable" stance as GetLastRebootStartedAt, so a guard test scripts exactly
+// the history it wants to exercise. The real id-ordered query is exercised
+// against SQLite in infrastructure/store_test.go.
+func (f *fakeRunRepo) RecentRuns(_ context.Context, _ string, limit int) ([]domain.RunSummary, error) {
+	if f.recentRunsErr != nil {
+		return nil, f.recentRunsErr
+	}
+	if limit < len(f.recentRuns) {
+		return f.recentRuns[:limit], nil
+	}
+	return f.recentRuns, nil
 }
 
 // run returns a copy of the in-memory row id for readback assertions,
@@ -158,6 +189,9 @@ func (f *fakeRunRepo) UpdateRun(_ context.Context, id string, u domain.RunUpdate
 		return fmt.Errorf("fakeRunRepo: no run %s", id)
 	}
 
+	if u.InternetOK != nil {
+		run.InternetOK = u.InternetOK
+	}
 	if u.Action != nil {
 		run.Action = *u.Action
 	}

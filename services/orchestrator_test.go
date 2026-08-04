@@ -16,7 +16,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, Latency: 5 * time.Millisecond}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, Latency: 5 * time.Millisecond}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -60,7 +60,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.settings.RebootCooldown = 2 * time.Hour
-		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
 		env.repo.lastRebootStartedAt = env.clk.now.Add(-40 * time.Minute)
 		env.repo.lastRebootOK = true
 
@@ -100,7 +100,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
 		// fakeRunRepo.lastRebootErr stands in for any transient store error
 		// that makes the cooldown state genuinely unknown (e.g. a corrupted
 		// reboot_started_at column) — the real SQL failure mode is covered
@@ -142,8 +142,8 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.chk.checkResults = []domain.Result{
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "down"}}},
-			{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "down"}}},
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},
 		}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
 
@@ -173,7 +173,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeHard)
@@ -203,11 +203,11 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.chk.checkResults = []domain.Result{
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial soft check
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 1
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 2
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 3
-			{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}, // tick 4
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial soft check
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 1
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 2
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 3
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},    // tick 4
 		}
 		env.chk.gatewayResults = []domain.TargetResult{
 			{Target: "gw", Kind: domain.CheckKindGateway, OK: false}, // tick 1: went down
@@ -261,9 +261,9 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.chk.checkResults = []domain.Result{
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 1
-			{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}, // tick 2
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // tick 1
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},    // tick 2
 		}
 		// gateway never observed down: the router cycled between polls.
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
@@ -306,7 +306,7 @@ func TestExecute(t *testing.T) {
 		env := newTestEnv(t)
 		env.settings.RecoveryInterval = time.Minute
 		env.settings.RecoveryTimeout = 15 * time.Minute
-		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: false}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
@@ -334,7 +334,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
 		env.rb.err = errRebootFailed
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
@@ -366,7 +366,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.settings.RebootEnabled = false
-		env.chk.checkResults = []domain.Result{{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false, Error: "dial timeout"}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -435,7 +435,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.settings.RebootEnabled = false
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -461,8 +461,8 @@ func TestExecute(t *testing.T) {
 		env := newTestEnv(t)
 		env.settings.MetricsEnabled = false
 		env.chk.checkResults = []domain.Result{
-			{Down: true, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}},
-			{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}},
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},
 		}
 		env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
 
@@ -484,7 +484,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.mr.err = errors.New("disk full")
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -505,7 +505,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		// Built directly rather than through Execute (which has no way to
 		// inject a shorter-than-production metricsTimeout): r.run is the
@@ -557,7 +557,7 @@ func TestExecute(t *testing.T) {
 
 			env := newTestEnv(t)
 			env.pc.results = []domain.PingResult{{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
-			env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+			env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 			code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -577,7 +577,7 @@ func TestExecute(t *testing.T) {
 
 			env := newTestEnv(t)
 			env.pc.results = []domain.PingResult{{Host: "1.1.1.1", Sent: 5, Received: 5, AvgMS: 12.5, OK: true}}
-			env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+			env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 			env.chk.gatewayResults = []domain.TargetResult{{Target: "gw", Kind: domain.CheckKindGateway, OK: true}}
 
 			code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeHard)
@@ -599,7 +599,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.settings.PingEnabled = false
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -619,7 +619,7 @@ func TestExecute(t *testing.T) {
 
 		env := newTestEnv(t)
 		env.pr.err = errors.New("disk full")
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
 
@@ -640,7 +640,7 @@ func TestExecute(t *testing.T) {
 		t.Parallel()
 
 		env := newTestEnv(t)
-		env.chk.checkResults = []domain.Result{{Down: false, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}}
 
 		// Built directly rather than through Execute (which has no way to
 		// inject a shorter-than-production pingTimeout): r.run is the same
@@ -683,6 +683,278 @@ func TestExecute(t *testing.T) {
 			t.Fatalf("ping saves = %+v, want none (the collector never returned within the timeout)", env.pr.calls)
 		}
 	})
+
+	t.Run("soft, down verdict cleared by the re-check: no reboot, recorded as unconfirmed", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.CheckConfirmations = 2
+		env.settings.CheckConfirmDelay = 20 * time.Second
+		env.chk.checkResults = []domain.Result{
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},    // re-check clears it
+		}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK (the outage was noise)", code)
+		}
+		if env.rb.calls != 0 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 0 (a single sample must never reboot)", env.rb.calls)
+		}
+		if len(env.nt.messages) != 0 {
+			t.Fatalf("messages sent = %v, want none (silence is the point of the guard)", env.nt.messages)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.Outcome != domain.OutcomeUnconfirmed {
+			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeUnconfirmed)
+		}
+		if run.InternetOK == nil || !*run.InternetOK {
+			t.Fatalf("InternetOK = %v, want true (the initial sample's verdict was corrected)", run.InternetOK)
+		}
+		if got, want := env.repo.phases(), []string{domain.PhaseInitial, domain.PhaseConfirm}; !equalStrings(got, want) {
+			t.Fatalf("check phases = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("soft, down verdict survives the re-check: reboots on the confirmed outage", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.CheckConfirmations = 2
+		env.settings.CheckConfirmDelay = 20 * time.Second
+		env.chk.checkResults = []domain.Result{
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial + both re-checks
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}},
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}},
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}}, // recovery tick
+		}
+		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK (reboot completed, internet restored)", code)
+		}
+		if env.rb.calls != 1 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 1 (three samples agreed)", env.rb.calls)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.InternetOK == nil || *run.InternetOK {
+			t.Fatalf("InternetOK = %v, want false (the outage was real)", run.InternetOK)
+		}
+		if got, want := env.repo.phases()[:3], []string{domain.PhaseInitial, domain.PhaseConfirm, domain.PhaseConfirm}; !equalStrings(got, want) {
+			t.Fatalf("check phases = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("soft, all domain targets down while raw ip holds: degraded, never rebooted", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.CheckConfirmations = 2
+		env.settings.CheckConfirmDelay = 20 * time.Second
+		env.chk.checkResults = []domain.Result{{State: domain.StateDegraded, Targets: []domain.TargetResult{
+			{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true, Latency: 24 * time.Millisecond},
+			{Target: "https://a.example/", Kind: domain.CheckKindDomain, OK: false, Error: "context deadline exceeded (stage=dns)"},
+		}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitNoAction {
+			t.Fatalf("Execute() = %d, want ExitNoAction", code)
+		}
+		if env.rb.calls != 0 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 0 (a reboot does not fix a broken DNS path)", env.rb.calls)
+		}
+		if env.chk.checkCalls != 1 {
+			t.Fatalf("checker.Check calls = %d, want 1 (degraded is not a down verdict to re-confirm)", env.chk.checkCalls)
+		}
+		if len(env.nt.messages) != 1 || !strings.Contains(env.nt.messages[0], "domain checks failing") {
+			t.Fatalf("messages = %v, want one degraded notice", env.nt.messages)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.Outcome != domain.OutcomeDegraded {
+			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeDegraded)
+		}
+		if run.Action != domain.ActionNone {
+			t.Fatalf("Action = %q, want %q", run.Action, domain.ActionNone)
+		}
+	})
+
+	t.Run("soft, degraded again right after a degraded run: no repeat message", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.repo.recentRuns = []domain.RunSummary{{Outcome: domain.OutcomeDegraded}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDegraded, Targets: []domain.TargetResult{
+			{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true},
+			{Target: "https://a.example/", Kind: domain.CheckKindDomain, OK: false},
+		}}}
+
+		Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if len(env.nt.messages) != 0 {
+			t.Fatalf("messages = %v, want none (the previous run already announced this state)", env.nt.messages)
+		}
+	})
+
+	t.Run("soft, confirmed outage the previous run did not see: unsustained, no reboot", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.RebootMinStreak = 2
+		healthy := true
+		env.repo.recentRuns = []domain.RunSummary{{InternetOK: &healthy, Outcome: domain.OutcomeOK}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitNoAction {
+			t.Fatalf("Execute() = %d, want ExitNoAction", code)
+		}
+		if env.rb.calls != 0 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 0 (one five-minute sample is not an outage)", env.rb.calls)
+		}
+		if len(env.nt.messages) != 0 {
+			t.Fatalf("messages = %v, want none", env.nt.messages)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.Outcome != domain.OutcomeUnsustained {
+			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeUnsustained)
+		}
+		if run.InternetOK == nil || *run.InternetOK {
+			t.Fatalf("InternetOK = %v, want false (the verdict stands, only the action is withheld)", run.InternetOK)
+		}
+	})
+
+	t.Run("soft, confirmed outage the previous run also saw: reboots", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.RebootMinStreak = 2
+		outage := false
+		env.repo.recentRuns = []domain.RunSummary{{InternetOK: &outage, Outcome: domain.OutcomeUnsustained}}
+		env.chk.checkResults = []domain.Result{
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}},
+			{State: domain.StateUp, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true}}},
+		}
+		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK", code)
+		}
+		if env.rb.calls != 1 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 1 (the outage spans two runs)", env.rb.calls)
+		}
+	})
+
+	t.Run("soft, a hard-mode run in the history does not corroborate an outage", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.RebootMinStreak = 2
+		env.repo.recentRuns = []domain.RunSummary{{InternetOK: nil, Outcome: domain.OutcomeOK}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitNoAction {
+			t.Fatalf("Execute() = %d, want ExitNoAction (a run that never probed cannot corroborate)", code)
+		}
+		if env.rb.calls != 0 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 0", env.rb.calls)
+		}
+	})
+
+	t.Run("soft, unreadable history is fail-closed: no reboot", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.settings.RebootMinStreak = 2
+		env.repo.recentRunsErr = errors.New("store: disk i/o error")
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitNoAction {
+			t.Fatalf("Execute() = %d, want ExitNoAction", code)
+		}
+		if env.rb.calls != 0 {
+			t.Fatalf("rebooter.Reboot calls = %d, want 0 (an unreadable history must not fall through to a reboot)", env.rb.calls)
+		}
+	})
+
+	t.Run("soft, cooldown skip repeated after a skipped run: no repeat message", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.repo.lastRebootStartedAt = env.clk.now.Add(-30 * time.Minute)
+		env.repo.lastRebootOK = true
+		env.repo.recentRuns = []domain.RunSummary{{Outcome: domain.OutcomeSkipped}}
+		env.chk.checkResults = []domain.Result{{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitSkippedCooldown {
+			t.Fatalf("Execute() = %d, want ExitSkippedCooldown", code)
+		}
+		if len(env.nt.messages) != 0 {
+			t.Fatalf("messages = %v, want none (the cooldown skip was already announced)", env.nt.messages)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.Outcome != domain.OutcomeSkipped {
+			t.Fatalf("Outcome = %q, want %q", run.Outcome, domain.OutcomeSkipped)
+		}
+	})
+
+	t.Run("soft, recovery ends on a degraded verdict rather than waiting out the timeout", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t)
+		env.chk.checkResults = []domain.Result{
+			{State: domain.StateDown, Targets: []domain.TargetResult{{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: false}}}, // initial
+			{State: domain.StateDegraded, Targets: []domain.TargetResult{ // tick 1: link back, DNS still broken
+				{Target: "1.1.1.1:443", Kind: domain.CheckKindIP, OK: true},
+				{Target: "https://a.example/", Kind: domain.CheckKindDomain, OK: false},
+			}},
+		}
+		env.chk.gatewayResults = []domain.TargetResult{{Target: "192.168.1.1:80", Kind: domain.CheckKindGateway, OK: true}}
+
+		code := Execute(t.Context(), env.settings, env.repo, env.mr, env.pr, env.chk, env.rb, env.nt, env.mc, env.pc, env.clk, domain.ModeSoft)
+
+		if code != domain.ExitOK {
+			t.Fatalf("Execute() = %d, want ExitOK (the link the reboot targeted is back)", code)
+		}
+
+		run := env.repo.run(t, "1")
+		if run.InternetRestoredAt == nil {
+			t.Fatal("InternetRestoredAt is nil, want set")
+		}
+	})
+}
+
+// equalStrings reports whether two string slices hold the same values in the
+// same order, so a phase-sequence assertion reads as one comparison instead
+// of a hand-rolled loop at every call site.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // errRebootFailed is a stand-in for gateway/router's real reboot errors;
@@ -709,6 +981,10 @@ type testEnv struct {
 // newTestEnv builds a testEnv with sane defaults (2h cooldown, 60s recovery
 // interval, 15m recovery timeout, reboot, metrics, and ping all enabled — the
 // design's own defaults) that a subtest can override before calling Execute.
+// The issue #6 false-positive guards are left at their "off" values
+// (CheckConfirmations 0, RebootMinStreak 0) so every pre-existing scenario
+// keeps asserting the flow it was written for; the guards have their own
+// subtests, which set them explicitly.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 

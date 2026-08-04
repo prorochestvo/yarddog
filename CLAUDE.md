@@ -91,9 +91,33 @@ recorded:
   `8.8.8.8:53`. Bypasses DNS; proves raw link.
 - **`domain`** — HTTP GET to `generate_204`-style endpoints. Exercises the DNS path too.
 
-The verdict is deliberately conservative: **down ⇔ (all `ip` targets fail) OR (all
-`domain` targets fail)**. A single failed target is never a trigger — that guards
-against rebooting the router because one remote server hiccuped.
+`domain.Verdict` grades one round into three states (issue #6): **`down` ⇔ all `ip`
+targets fail** (the only verdict a reboot may follow); **`degraded` ⇔ all `domain`
+targets fail while an `ip` target still answers** — the DNS/HTTPS path is broken, the
+raw link is not; everything else is `up`. A single failed target within a group is never
+a trigger, and an empty group is "not applicable" rather than vacuously failed — except
+that with no `ip` targets configured at all, the `domain` group becomes the only evidence
+there is and a full failure of it counts as `down`.
+
+The split is measured, not theoretical: of 29 "down" verdicts recorded in 21 days, 28 had
+both `ip` targets connecting in 19-1118 ms and ICMP answering 4/4 while only the two
+HTTPS probes timed out — they share one DNS path, in production through the very router
+being rebooted. Four reboots in seven hours on 2026-07-30 did not stop them.
+
+Two further guards sit between a `down` verdict and a reboot, both in
+`services/orchestrator.go`:
+
+- **In-run confirmation** — `confirmDown` re-probes `CHECK_CONFIRMATIONS` times,
+  `CHECK_CONFIRM_DELAY` apart (persisted under `PhaseConfirm`); one healthy sample ends
+  the run as `unconfirmed`, correcting the `internet_ok` it wrote from the first sample.
+- **Cross-run corroboration** — `outageSustained` requires the previous
+  `REBOOT_MIN_STREAK - 1` runs to have seen the outage too, via
+  `RunRepository.RecentRuns`. A run that falls short ends as `unsustained`. Fail-closed:
+  an unreadable history withholds the reboot rather than granting it.
+
+Neither guard sends a Telegram message — silence is the point; the `runs` row and a log
+line carry the record. `degraded` and cooldown-skip notices are edge-triggered
+(`shouldAnnounce`), so a state that lasts hours is announced once, not once per run.
 
 ### Data model
 
@@ -186,7 +210,8 @@ prepended.
 
 `README.md` holds the authoritative table. Required: `LABEL`, `TELEGRAMBOT_DSN`,
 `ROUTER_USER`, `ROUTER_PASS`. Optional (with defaults): `ROUTER_ADDR`, `ROUTER_KIND`,
-`DB_PATH`, `CHECK_IPS`, `CHECK_DOMAINS`, `CHECK_TIMEOUT`, `RECOVERY_INTERVAL`,
+`DB_PATH`, `CHECK_IPS`, `CHECK_DOMAINS`, `CHECK_TIMEOUT`, `CHECK_CONFIRMATIONS`,
+`CHECK_CONFIRM_DELAY`, `REBOOT_MIN_STREAK`, `RECOVERY_INTERVAL`,
 `RECOVERY_TIMEOUT`, `REBOOT_COOLDOWN`, `RETENTION_DAYS`, `REBOOT_ENABLED` (monitor-only
 when `false`: check/record/notify but never reboot), `METRICS_ENABLED`,
 `METRICS_TEMPERATURE`, `METRICS_FANS`, `METRICS_CPU`, `METRICS_MEMORY`, `METRICS_DISK`,
@@ -220,6 +245,7 @@ response (`writeError500`). The contract has these surfaces:
   | 3 | reboot request failed (login / `reboot.cgi`) |
   | 4 | reboot done, internet not restored within the timeout |
   | 5 | reboot skipped due to cooldown |
+  | 6 | a failure was observed but deliberately not acted on (`degraded`, `unsustained`) |
 
 - **Daemon exit codes** — its own disjoint contract: `0` clean shutdown (SIGINT/SIGTERM,
   drained), `1` configuration error (missing `DAEMON_TOKEN`, unparseable value), `2` the

@@ -1674,6 +1674,107 @@ func TestStore_ListRuns(t *testing.T) {
 	})
 }
 
+func TestStore_RecentRuns(t *testing.T) {
+	t.Run("empty store returns an empty slice, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		got, err := s.RecentRuns(t.Context(), "ffffffff-ffff-ffff-ffff-ffffffffffff", 3)
+		if err != nil {
+			t.Fatalf("RecentRuns() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("RecentRuns() = %d rows, want 0 on an empty store", len(got))
+		}
+	})
+
+	t.Run("returns the runs before the given id, newest first, honouring limit", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		down, up := false, true
+		states := []*bool{&up, &down, &down, &up, nil}
+
+		var ids []string
+		for _, state := range states {
+			id, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, state)
+			if err != nil {
+				t.Fatalf("InsertRun() error = %v", err)
+			}
+			ids = append(ids, id)
+		}
+
+		// asking from the newest run's own id must never hand it back its
+		// own row: the guards ask "what did the runs before me see?".
+		got, err := s.RecentRuns(t.Context(), ids[4], 2)
+		if err != nil {
+			t.Fatalf("RecentRuns() error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("RecentRuns() = %d rows, want 2 (limit honoured)", len(got))
+		}
+		if got[0].InternetOK == nil || !*got[0].InternetOK {
+			t.Fatalf("RecentRuns()[0].InternetOK = %v, want true (the run immediately before)", got[0].InternetOK)
+		}
+		if got[1].InternetOK == nil || *got[1].InternetOK {
+			t.Fatalf("RecentRuns()[1].InternetOK = %v, want false", got[1].InternetOK)
+		}
+	})
+
+	t.Run("a hard run's NULL internet_ok reads back as nil, not false", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		if _, err := s.InsertRun(t.Context(), time.Now(), domain.ModeHard, nil); err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+		newest, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, nil)
+		if err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+
+		got, err := s.RecentRuns(t.Context(), newest, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns() error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("RecentRuns() = %d rows, want 1", len(got))
+		}
+		if got[0].InternetOK != nil {
+			t.Fatalf("InternetOK = %v, want nil (a hard run never probed)", *got[0].InternetOK)
+		}
+	})
+
+	t.Run("carries the outcome the run ended on", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+
+		first, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, nil)
+		if err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+		outcome := domain.OutcomeDegraded
+		if err := s.UpdateRun(t.Context(), first, domain.RunUpdate{Outcome: &outcome}); err != nil {
+			t.Fatalf("UpdateRun() error = %v", err)
+		}
+		newest, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, nil)
+		if err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+
+		got, err := s.RecentRuns(t.Context(), newest, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns() error = %v", err)
+		}
+		if len(got) != 1 || got[0].Outcome != domain.OutcomeDegraded {
+			t.Fatalf("RecentRuns() = %+v, want one row carrying outcome %q", got, domain.OutcomeDegraded)
+		}
+	})
+}
+
 func TestStore_ListUnsentOutboxMessages(t *testing.T) {
 	t.Run("orders oldest first and excludes sent rows", func(t *testing.T) {
 		t.Parallel()
@@ -2625,6 +2726,30 @@ func TestStore_RunByID(t *testing.T) {
 }
 
 func TestStore_UpdateRun(t *testing.T) {
+	t.Run("corrects internet_ok written from a mistaken first sample", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestStore(t)
+		down := false
+		id, err := s.InsertRun(t.Context(), time.Now(), domain.ModeSoft, &down)
+		if err != nil {
+			t.Fatalf("InsertRun() error = %v", err)
+		}
+
+		up := true
+		if err := s.UpdateRun(t.Context(), id, domain.RunUpdate{InternetOK: &up}); err != nil {
+			t.Fatalf("UpdateRun() error = %v", err)
+		}
+
+		run, err := s.GetRun(t.Context(), id)
+		if err != nil {
+			t.Fatalf("GetRun() error = %v", err)
+		}
+		if run.InternetOK == nil || !*run.InternetOK {
+			t.Fatalf("InternetOK = %v, want true (issue #6: the re-check cleared the down verdict)", run.InternetOK)
+		}
+	})
+
 	t.Run("applies only the non-nil fields", func(t *testing.T) {
 		t.Parallel()
 

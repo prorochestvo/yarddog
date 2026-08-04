@@ -13,6 +13,9 @@ API and status dashboard over the LAN.
 - checks connectivity against independent IP and domain targets
 - soft mode (default) reboots only when the uplink is actually down; hard mode
   (`--hard-reboot`) reboots unconditionally
+- a down verdict must survive re-probing within the run and be corroborated by the previous
+  run before anything reboots; a failure of the domain targets alone, while raw IP
+  connectivity holds, is reported as degraded and never reboots
 - monitor-only mode (`YARDDOG_REBOOT_ENABLED=false`): watch and record, never reboot
 - records every run, check and recovery phase in SQLite, with optional per-run
   host-telemetry and ping metrics
