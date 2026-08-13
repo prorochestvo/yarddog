@@ -369,7 +369,7 @@ func (s *Store) LatestMetrics(ctx context.Context) ([]domain.MetricRecord, error
 	if err != nil {
 		return nil, fmt.Errorf("latest metrics: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out, err := scanMetricRecords(rows)
 	if err != nil {
@@ -403,7 +403,7 @@ func (s *Store) ListChecksByRun(ctx context.Context, runID string) ([]domain.Che
 	if err != nil {
 		return nil, fmt.Errorf("list checks for run %s: %w", runID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.Check
 	for rows.Next() {
@@ -476,7 +476,7 @@ func (s *Store) ListMetrics(ctx context.Context, f services.MetricsFilter) ([]do
 	if err != nil {
 		return nil, fmt.Errorf("list metrics: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out, err := scanMetricRecords(rows)
 	if err != nil {
@@ -498,7 +498,7 @@ func (s *Store) ListMetricsByRun(ctx context.Context, runID string) ([]domain.Me
 	if err != nil {
 		return nil, fmt.Errorf("list metrics for run %s: %w", runID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.MetricSample
 	for rows.Next() {
@@ -563,7 +563,7 @@ func (s *Store) ListPings(ctx context.Context, f services.PingFilter) ([]domain.
 	if err != nil {
 		return nil, fmt.Errorf("list pings: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out, err := scanPingRecords(rows)
 	if err != nil {
@@ -585,7 +585,7 @@ func (s *Store) ListPingsByRun(ctx context.Context, runID string) ([]domain.Ping
 	if err != nil {
 		return nil, fmt.Errorf("list pings for run %s: %w", runID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.PingResult
 	for rows.Next() {
@@ -624,7 +624,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]domain.Run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.Run
 	for rows.Next() {
@@ -653,7 +653,7 @@ func (s *Store) ListUnsentOutboxMessages(ctx context.Context) ([]domain.OutboxMe
 	if err != nil {
 		return nil, fmt.Errorf("list unsent outbox messages: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.OutboxMessage
 	for rows.Next() {
@@ -795,7 +795,7 @@ func (s *Store) OverviewMetrics(ctx context.Context, since time.Time, bucket tim
 	if err != nil {
 		return nil, fmt.Errorf("overview metrics: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.MetricSeries
 	var cur *domain.MetricSeries
@@ -863,7 +863,7 @@ func (s *Store) OverviewPings(ctx context.Context, since time.Time, bucket time.
 	if err != nil {
 		return nil, fmt.Errorf("overview pings: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.PingSeries
 	var cur *domain.PingSeries
@@ -921,7 +921,7 @@ func (s *Store) PingSamples(ctx context.Context, since time.Time) ([]domain.Ping
 	if err != nil {
 		return nil, fmt.Errorf("ping samples: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out, err := scanPingRecords(rows)
 	if err != nil {
@@ -1005,7 +1005,7 @@ func (s *Store) RecentRuns(ctx context.Context, beforeID string, limit int) ([]d
 	if err != nil {
 		return nil, fmt.Errorf("recent runs before %s: %w", beforeID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.RunSummary
 	for rows.Next() {

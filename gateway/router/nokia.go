@@ -126,7 +126,7 @@ func (d *NokiaDriver) Reboot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("router: reboot request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("router: read reboot response: %w", err)
@@ -167,7 +167,7 @@ func (d *NokiaDriver) fetchCSRFToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fetch reboot page: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -231,7 +231,7 @@ func (d *NokiaDriver) login(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("router: login request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		return fmt.Errorf("router: drain login response: %w", err)
 	}
