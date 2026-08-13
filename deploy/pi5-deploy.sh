@@ -95,10 +95,13 @@ echo "released $VERSION_ID on $(hostname): /ping ok at http://$ADDR"
 
 # prune: keep the newest KEEP artifact dirs; never delete one a bin/* channel still
 # points at. Non-fatal — a prune hiccup must not fail an otherwise-good deploy.
+# The in-use test reads a here-string, never a pipe: `grep -q` stops reading at its
+# first match, which SIGPIPEs the writer, and pipefail then reports that hit as a
+# miss — deleting the very artifact the guard just proved is live.
 in_use="$(for l in "$APP"/bin/*; do [ -e "$l" ] || continue; basename "$(readlink -f "$l")"; done | sort -u)"
 ls -1dt "$APP"/artifacts/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r d; do
   v="$(basename "$d")"
-  if printf '%s\n' "$in_use" | grep -qxF "$v"; then continue; fi
+  if grep -qxF "$v" <<<"$in_use"; then continue; fi
   rm -rf "$d" && echo "pruned old artifact $v"
 done
 true
