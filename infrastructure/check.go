@@ -116,7 +116,7 @@ func (c *Checker) probeHTTP(ctx context.Context, target string) domain.TargetRes
 	if err != nil {
 		return domain.TargetResult{Target: target, Kind: domain.CheckKindDomain, OK: false, Latency: latency, Error: stage.annotate(err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return domain.TargetResult{
@@ -143,7 +143,7 @@ func (c *Checker) probeTCP(ctx context.Context, target, kind string) domain.Targ
 	if err != nil {
 		return domain.TargetResult{Target: target, Kind: kind, OK: false, Latency: latency, Error: err.Error()}
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return domain.TargetResult{Target: target, Kind: kind, OK: true, Latency: latency}
 }

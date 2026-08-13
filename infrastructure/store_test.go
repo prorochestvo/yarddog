@@ -1405,7 +1405,7 @@ func TestStore_ListMetrics(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var plan strings.Builder
 		for rows.Next() {
@@ -1596,7 +1596,7 @@ func TestStore_ListPings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var plan strings.Builder
 		for rows.Next() {

@@ -392,10 +392,10 @@ func newRouterServer(t *testing.T, cfg routerServerConfig) (*httptest.Server, *r
 				return
 			}
 			if cfg.noTokenPage {
-				fmt.Fprint(w, "<html><body>no token here</body></html>")
+				_, _ = fmt.Fprint(w, "<html><body>no token here</body></html>")
 				return
 			}
-			fmt.Fprintf(w, `<html><body><form></form><script>$("form").prepend('<input type="hidden" name="csrf_token" value="%s" />');</script></body></html>`, token)
+			_, _ = fmt.Fprintf(w, `<html><body><form></form><script>$("form").prepend('<input type="hidden" name="csrf_token" value="%s" />');</script></body></html>`, token)
 		case http.MethodPost:
 			obs.rebootCalled = true
 			obs.rebootCT = r.Header.Get("Content-Type")
@@ -416,7 +416,7 @@ func newRouterServer(t *testing.T, cfg routerServerConfig) (*httptest.Server, *r
 			}
 			w.WriteHeader(http.StatusOK)
 			if !cfg.emptyRebootBody {
-				fmt.Fprint(w, dto.RebootDoneMarker) // confirmed reboot marker
+				_, _ = fmt.Fprint(w, dto.RebootDoneMarker) // confirmed reboot marker
 			}
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -444,11 +444,11 @@ func newRouterServerRecordingPaths(t *testing.T, paths *[]string) *httptest.Serv
 	mux.HandleFunc("/reboot.cgi", func(w http.ResponseWriter, r *http.Request) {
 		*paths = append(*paths, r.URL.Path)
 		if r.Method == http.MethodGet {
-			fmt.Fprintf(w, `<input type="hidden" name="csrf_token" value="%s" />`, defaultTestCSRF)
+			_, _ = fmt.Fprintf(w, `<input type="hidden" name="csrf_token" value="%s" />`, defaultTestCSRF)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, dto.RebootDoneMarker)
+		_, _ = fmt.Fprint(w, dto.RebootDoneMarker)
 	})
 
 	srv := httptest.NewServer(mux)
