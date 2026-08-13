@@ -22,7 +22,12 @@ endif
 # `make deploy` overrides it with the release VERSION_ID.
 VERSION ?= dev
 
-.PHONY: build deploy run run-daemon test test-race lint format clean
+GOLANGCI_VERSION := v2.12.2
+# Revision the adoption gate compares against: only code newer than this is
+# required to be clean while the standing findings are worked off.
+LINT_BASE ?= origin/main
+
+.PHONY: build deploy run run-daemon test test-race lint lint-new format clean
 
 # pure-Go build (no cgo) so the binaries cross-compile to the Pi without a C toolchain
 build:
@@ -55,11 +60,23 @@ test-race:
 	go test -race ./...
 
 # vet + guard against forbidden dependencies (stdlib-only bar modernc.org/sqlite)
+## lint: golangci-lint over the whole tree, then the text-level review checks
 lint:
-	CGO_ENABLED=0 go vet ./...
-	@if grep -Eq 'mattn/go-sqlite3|stretchr/testify' go.mod; then \
-		echo "forbidden dependency in go.mod (cgo sqlite driver / testify)"; exit 1; \
-	fi
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found — install $(GOLANGCI_VERSION): https://golangci-lint.run/docs/welcome/install/local/"; \
+		exit 1; \
+	}
+	CGO_ENABLED=0 golangci-lint run ./...
+	@scripts/lint-checks.sh
+
+## lint-new: lint only code changed since $(LINT_BASE); this is the mergeable gate
+lint-new:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found — install $(GOLANGCI_VERSION): https://golangci-lint.run/docs/welcome/install/local/"; \
+		exit 1; \
+	}
+	CGO_ENABLED=0 golangci-lint run --new-from-rev=$(LINT_BASE) ./...
+	@scripts/lint-checks.sh
 
 format:
 	go fmt ./...
