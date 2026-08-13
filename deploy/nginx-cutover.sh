@@ -33,9 +33,8 @@ die(){ echo "ABORT: $*" >&2; exit 1; }
 # ignores curlrc; --noproxy '*' ignores http(s)_proxy for every host.
 cget(){ curl -q --noproxy '*' "$@"; }
 
-# one scratch file for HTTP probes: fetch with `-o "$PROBE"` and check the FILE
-# (grep/wc), never a captured variable — a piped `grep -q` SIGPIPEs under
-# pipefail, and `$(...)` capture proved flakier than a file under sudo here.
+# one scratch file reused by every HTTP probe below: fetch with `-o "$PROBE"`,
+# then grep the file.
 PROBE="$(mktemp)"
 trap 'rm -f "$PROBE"' EXIT
 
@@ -64,8 +63,6 @@ echo "pre-flight: probing the daemon on http://$DAEMON ..."
 # genuinely old/absent daemon still fails all attempts and blocks the flip.
 ok=0
 for attempt in 1 2 3 4 5; do
-  # fetch to a file and grep the FILE (never a piped grep -q or a captured var):
-  # a piped grep -q SIGPIPEs under pipefail, and variable capture flapped under sudo.
   if cget -fsS -o "$PROBE" --max-time 5 "http://$DAEMON/" && grep -qF "$MARKER" "$PROBE"; then
     ok=1; break
   fi
