@@ -98,7 +98,7 @@ echo "released $VERSION_ID on $(hostname): /ping ok at http://$ADDR"
 in_use="$(for l in "$APP"/bin/*; do [ -e "$l" ] || continue; basename "$(readlink -f "$l")"; done | sort -u)"
 ls -1dt "$APP"/artifacts/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r d; do
   v="$(basename "$d")"
-  if printf '%s\n' "$in_use" | grep -qxF "$v"; then continue; fi
+  if grep -qxF "$v" <<<"$in_use"; then continue; fi
   rm -rf "$d" && echo "pruned old artifact $v"
 done
 true

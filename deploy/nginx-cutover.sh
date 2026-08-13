@@ -33,9 +33,21 @@ die(){ echo "ABORT: $*" >&2; exit 1; }
 # ignores curlrc; --noproxy '*' ignores http(s)_proxy for every host.
 cget(){ curl -q --noproxy '*' "$@"; }
 
-# one scratch file for HTTP probes: fetch with `-o "$PROBE"` and check the FILE
-# (grep/wc), never a captured variable — a piped `grep -q` SIGPIPEs under
-# pipefail, and `$(...)` capture proved flakier than a file under sudo here.
+# one scratch file reused by every HTTP probe below: fetch with `-o "$PROBE"`,
+# then grep the file — deliberately not `curl … | grep -q`.
+#
+# `grep -q` exits at its first match and closes the pipe; under pipefail a writer
+# still holding output then takes SIGPIPE (141) and the pipeline reports failure
+# although the marker WAS found — a hit read as a miss. It is a payload-size
+# threshold, not a fact about grep. Measured here 2026-08-12 (bash builtin printf,
+# 5 runs each): correct through 22 KB, wrong 1/5 at 24 KB, wrong 5/5 from 28 KB.
+# The nominal 64 KiB pipe capacity is NOT the limit — writes consume ring-buffer
+# pages, not exact bytes — so do not reason from that number.
+#
+# These probes read the dashboard body, ~35 KB: past the deterministic threshold.
+# This is exactly what cost many rounds of debugging as a phantom "root-vs-seil
+# localhost flap" before the cutover. Do not simplify this back into a pipe.
+# For short inputs a pipe is fine and needs no ceremony.
 PROBE="$(mktemp)"
 trap 'rm -f "$PROBE"' EXIT
 
@@ -64,8 +76,6 @@ echo "pre-flight: probing the daemon on http://$DAEMON ..."
 # genuinely old/absent daemon still fails all attempts and blocks the flip.
 ok=0
 for attempt in 1 2 3 4 5; do
-  # fetch to a file and grep the FILE (never a piped grep -q or a captured var):
-  # a piped grep -q SIGPIPEs under pipefail, and variable capture flapped under sudo.
   if cget -fsS -o "$PROBE" --max-time 5 "http://$DAEMON/" && grep -qF "$MARKER" "$PROBE"; then
     ok=1; break
   fi
