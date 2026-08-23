@@ -171,6 +171,6 @@ before starting non-trivial work. Project delta:
 
 - **Gate:** `go vet ./... && go test ./...`, or `make test`, which prefixes `go fmt ./...`.
   `-race` is **not** in it — see Build & run.
-- **Lenses:** standard three.
+- **Lenses:** standard set — see `pipeline:working-agreement`, which includes lens O.
 - **Branching:** standard (`type/<issue>-<slug>`, PR into `main`); releases are `v*` tags cut
   from `main` — see Standing tripwires.
