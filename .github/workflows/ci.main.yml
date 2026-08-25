@@ -24,11 +24,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # lint-new compares against LINT_BASE with --new-from-rev, and
+          # scripts/lint-checks.sh asks git what changed since it. The default
+          # shallow clone has neither the base commit nor the history to reach it.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: make lint
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      # lint-new, not lint: the tree carries standing findings being worked off
+      # under #10, so the full run is a worklist rather than a gate. Wiring CI to
+      # it would paint every branch red on findings its author never touched.
+      - run: make lint-new
       - run: make test
       # production-shape build: CGO off, linux/arm64 — exactly what release.yml
       # ships to the Pi. Catches the "tests pass on the amd64 runner but the arm64

@@ -22,7 +22,11 @@ endif
 # `make deploy` overrides it with the release VERSION_ID.
 VERSION ?= dev
 
-.PHONY: build deploy run run-daemon test test-race lint format clean
+# pinned so a linter release cannot turn someone else's day into a red build on an
+# untouched branch; CI installs exactly this version
+GOLANGCI_VERSION := v2.12.2
+
+.PHONY: build deploy run run-daemon test test-race lint lint-new format clean
 
 # pure-Go build (no cgo) so the binaries cross-compile to the Pi without a C toolchain
 build:
@@ -54,12 +58,36 @@ test:
 test-race:
 	go test -race ./...
 
-# vet + guard against forbidden dependencies (stdlib-only bar modernc.org/sqlite)
+# `lint` is the worklist and `lint-new` is the gate — the tree carries a standing
+# backlog (issue #10), and a gate that fails on it fails always, which teaches
+# everyone to ignore it. CI runs lint-new; run lint when working the backlog down.
+LINT_BASE ?= origin/main
+
+## lint: golangci-lint over the whole tree, then the text-level review checks
 lint:
 	CGO_ENABLED=0 go vet ./...
 	@if grep -Eq 'mattn/go-sqlite3|stretchr/testify' go.mod; then \
 		echo "forbidden dependency in go.mod (cgo sqlite driver / testify)"; exit 1; \
 	fi
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found — install $(GOLANGCI_VERSION): https://golangci-lint.run/docs/welcome/install/local/"; \
+		exit 1; \
+	}
+	CGO_ENABLED=0 golangci-lint run ./... --max-issues-per-linter=0 --max-same-issues=0
+	@bash scripts/lint-checks.sh
+
+## lint-new: the merge gate — only findings in code changed since LINT_BASE
+lint-new:
+	CGO_ENABLED=0 go vet ./...
+	@if grep -Eq 'mattn/go-sqlite3|stretchr/testify' go.mod; then \
+		echo "forbidden dependency in go.mod (cgo sqlite driver / testify)"; exit 1; \
+	fi
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found — install $(GOLANGCI_VERSION): https://golangci-lint.run/docs/welcome/install/local/"; \
+		exit 1; \
+	}
+	CGO_ENABLED=0 golangci-lint run --new-from-rev=$(LINT_BASE) ./...
+	@bash scripts/lint-checks.sh $(LINT_BASE)
 
 format:
 	go fmt ./...

@@ -1,0 +1,244 @@
+version: "2"
+
+# The shared golangci-lint standard, with this repository's two per-project blocks
+# filled in: the depguard rules below encode the layered dependency rule and the
+# stdlib-only constraint from CLAUDE.md, and the exclusions paths match the
+# build/tmp/logs convention. Everything else is the shared standard and should not
+# drift; change it upstream, not here.
+#
+# The upstream standard also runs gocritic's ruleguard check against a gorules/
+# rules file. That is deliberately absent here: the rules file needs
+# github.com/quasilyte/go-ruleguard/dsl in go.mod, and CLAUDE.md permits exactly one
+# third-party dependency (modernc.org/sqlite). Re-adding it means amending that rule
+# first.
+#
+# `make lint` gates on new code only (--new-from-rev); `make lint-all` shows the full
+# standing backlog, which is not yet zero. See issue #10.
+
+run:
+  timeout: 10m
+  tests: true
+  relative-path-mode: gomod
+
+linters:
+  default: none
+  enable:
+    # --- standard baseline ---
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # --- resource & lifecycle correctness ---
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - noctx
+    - containedctx
+    - contextcheck
+    - fatcontext
+    - durationcheck
+
+    # --- error discipline ---
+    - errorlint
+    - errchkjson
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - forcetypeassert
+
+    # --- type & value traps ---
+    - recvcheck
+    - makezero
+    - prealloc
+    - unconvert
+    - mirror
+    - perfsprint
+    - asasalint
+    - copyloopvar
+    - intrange
+    - reassign
+    - predeclared
+    - usestdlibvars
+
+    # --- structure & API surface ---
+    - gochecknoinits
+    - nakedret
+    - iface
+    - interfacebloat
+    - funcorder
+    - decorder
+    - depguard
+    - forbidigo
+
+    # --- docs & comments ---
+    - godot
+    - godoclint
+    - dupword
+    - misspell
+
+    # --- tests ---
+    - testifylint
+    - paralleltest
+    - thelper
+    - tparallel
+    - usetesting
+
+    # --- meta ---
+    - gocritic
+    - revive
+    - nolintlint
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # check-blank stays off. The house rule permits `_ = x.Close()` inside a
+      # defer, and errcheck cannot tell that position apart from an error
+      # discarded anywhere else — switching it on reports the documented
+      # exception as a violation.
+      check-blank: false
+      # Documented exceptions to "never discard an error".
+      exclude-functions:
+        - (*database/sql.Tx).Rollback
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+    govet:
+      enable-all: true
+      disable:
+        # Field ordering is a micro-optimisation that fights readability.
+        - fieldalignment
+
+    # PROJECT — the layered dependency rule from CLAUDE.md, made executable:
+    #   domain <- services <- { infrastructure, gateway/* } <- cmd/*
+    # Until now this was enforced by review and by reading `go list -deps` output.
+    depguard:
+      rules:
+        domain-is-pure:
+          list-mode: lax
+          files:
+            - "**/domain/**"
+          deny:
+            - pkg: github.com/prorochestvo/yarddog/services
+              desc: domain is the innermost layer and imports nothing internal
+            - pkg: github.com/prorochestvo/yarddog/infrastructure
+              desc: domain is the innermost layer and imports nothing internal
+            - pkg: github.com/prorochestvo/yarddog/gateway
+              desc: domain is the innermost layer and imports nothing internal
+            - pkg: net/http
+              desc: domain holds value objects only, no protocol types
+            - pkg: database/sql
+              desc: domain holds value objects only, no persistence concerns
+
+        services-imports-domain-only:
+          list-mode: lax
+          files:
+            - "**/services/**"
+          deny:
+            - pkg: github.com/prorochestvo/yarddog/infrastructure
+              desc: ports are defined at the consumer; services must not name an adapter
+            - pkg: github.com/prorochestvo/yarddog/gateway
+              desc: ports are defined at the consumer; services must not name an adapter
+            - pkg: database/sql
+              desc: SQL belongs in infrastructure
+
+        httpapi-has-no-infrastructure:
+          list-mode: lax
+          files:
+            - "**/gateway/httpapi/**"
+          deny:
+            - pkg: github.com/prorochestvo/yarddog/infrastructure
+              desc: the daemon's HTTP adapter consumes services, never infrastructure
+
+        # "nothing imports a cmd/* package" has no rule here on purpose: cmd/* are
+        # `package main`, which the compiler already refuses to import. A depguard
+        # entry for it could never be the thing that fires.
+
+        # PROJECT — stdlib-only bar modernc.org/sqlite. The Makefile's grep over
+        # go.mod catches these once they are already dependencies; depguard catches
+        # the import that would add them.
+        stdlib-only:
+          list-mode: lax
+          files:
+            - $all
+          deny:
+            - pkg: github.com/stretchr/testify
+              desc: stdlib testing only, no assertion library
+            - pkg: github.com/mattn/go-sqlite3
+              desc: cgo driver; modernc.org/sqlite is the only permitted SQLite driver
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^time\.Sleep$
+          msg: time-dependent tests are flaky by design; synchronise on an event or inject a clock
+
+    revive:
+      rules:
+        - name: early-return
+        - name: defer
+          arguments:
+            - ["loop", "return", "recover"]
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: errorf
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: unnecessary-stmt
+        - name: waitgroup-by-value
+        - name: unused-parameter
+        - name: unreachable-code
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+        - unnamedResult
+    funcorder:
+      # Standard-library order: the type declaration first, its constructor
+      # after it, methods below. Enforced on new code only — see the baseline
+      # step in the skill; existing files migrate when they are touched.
+      constructor: true
+      struct-method: true
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    godot:
+      scope: declarations
+
+    interfacebloat:
+      max: 8
+
+    nakedret:
+      max-func-lines: 0
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test files: relax the doc and structure rules, keep the correctness ones.
+      - path: _test\.go
+        linters:
+          - godot
+          - godoclint
+          - funcorder
+          - decorder
+          - errcheck
+          - forcetypeassert
+    paths:
+      - build
+      - tmp
+      - logs
+
+formatters:
+  enable:
+    - gofmt

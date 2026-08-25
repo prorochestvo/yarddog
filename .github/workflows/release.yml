@@ -36,11 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # lint-new resolves LINT_BASE through git; a shallow clone cannot reach it
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: make lint
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      # lint-new, matching ci.main.yml: `make lint` is the whole-tree worklist and
+      # is red while #10 is open, so gating a release on it would block every tag.
+      - run: make lint-new
       - run: make test
       # compile-only guard for the darwin-only collector (metrics_darwin.go):
       # this job's `make test` never compiles it (linux runner), so a
