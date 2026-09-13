@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 this repository.
 
 `yarddog` is a self-hosted watchdog for a home GPON router (Nokia G-240W-A): a
-short-lived CLI process, fired by cron on a Raspberry Pi, that checks the internet
+short-lived CLI process, fired by cron on the monitoring host, that checks the internet
 uplink and reboots the router over its web UI when the link is down. See `README.md`
 for the user-facing description.
 
@@ -19,30 +19,15 @@ share every layer package and the one SQLite database — the collector is its s
 ## Build & Run Commands
 
 Pure-Go, `CGO_ENABLED=0` — the only non-stdlib dependency is `modernc.org/sqlite` (a
-cgo-free SQLite driver), chosen so the binary cross-compiles to the Pi without a C
-toolchain.
+cgo-free SQLite driver).
 
-```bash
-make build           # -> ./build/{yarddog,yarddogd}          (native host, CGO_ENABLED=0)
-make build OS=arm64  # -> ./build/{yarddog,yarddogd}-arm64     (GOOS=linux GOARCH=arm64, for the Pi)
-make deploy          # build OS=arm64 + ship to pi5 (release-layout: flip bin/release, restart, /ping gate)
-make run        # go run ./cmd/yarddog   (collector, soft mode)
-make run-daemon # go run ./cmd/yarddogd  (query daemon)
-make test       # go fmt + go vet + go test ./...   (the completion gate)
-make test-race  # go test -race ./...   (opt-in; needs a C toolchain — the race runtime uses cgo)
-make lint       # go vet + forbidden-dependency guard
-make format     # go fmt ./...
-make clean      # rm -rf build/ + go mod tidy
-```
+The gate is `make test`. `make deploy` still targets the retired Pi — decide the host
+before running it. `make` lists the rest.
 
-Raw equivalents (no Makefile needed): `CGO_ENABLED=0 go build -o build/yarddog ./cmd/yarddog`
-(and `./cmd/yarddogd` for the daemon), `go vet ./... && go test ./...`. Targeted runs use
-the standard `go test` flags —
-`-run TestName[/subtest]`, `-v`, `-bench=. -benchmem -run=^$`.
 
 **The completion gate is `go vet ./... && go test ./...`** (matches the README and
-PLAN). `-race` is intentionally *not* in the default gate: it forces cgo, which the
-pure-Go build path avoids — run `make test-race` on a dev box that has a C compiler.
+PLAN). `-race` is not in the default gate; it forces cgo. Run `make test-race` where a C
+compiler exists.
 
 ## Architecture Overview
 
@@ -57,7 +42,7 @@ domain  ←  services  ←  { infrastructure, gateway/* }  ←  { cmd/yarddog, c
 | Package | Responsibility |
 |---|---|
 | `domain/` | pure value types + pure policy; imports nothing internal, no third-party. `Result`/`TargetResult` + the `Verdict` quorum rule; `Run`/`Check`/`RunUpdate` + `Mode`/`Action`/`Phase`/`Outcome` enums; `OutboxMessage`; `Exit*`/reason consts; `RouterKind`; `Downtime`. |
-| `services/` | application layer; imports `domain` only. Defines every port at the consumer: the collector's in `ports.go` (`Checker`, `Rebooter`, `Notifier`, `Sender`, `Clock`, `RunRepository`, `OutboxRepository`, `MetricsCollector`, `MetricsRepository`) and the daemon's beside their service (`HistoryRepository` in `query.go`, `HealthProbe` in `health.go`) — eleven in all. Holds the orchestrator + recovery state machine (`Execute`), the `OutboxService`, the daemon's `QueryService` (limit-clamping read layer) and `Inspector` (health aggregator); the single place mapping a terminal state to its (exit code, `runs.outcome`, message) triple. |
+| `services/` | application layer; imports `domain` only. Defines every port at the consumer: the collector's in `ports.go`. Holds the orchestrator + recovery state machine (`Execute`), the `OutboxService`, the daemon's `QueryService` (limit-clamping read layer) and `Inspector` (health aggregator); the single place mapping a terminal state to its (exit code, `runs.outcome`, message) triple. |
 | `infrastructure/` | driven adapters over local/generic tech: SQLite `Store` (satisfies `RunRepository`, `OutboxRepository`, `MetricsRepository`, `HistoryRepository`, and the `sqlite` `HealthProbe`), connectivity `Checker` (TCP/HTTP probes), `SystemClock`, host-metrics collectors (build-tagged `metrics_linux.go`/`metrics_darwin.go`, pure parsers in an untagged `metrics.go` so both are unit-tested on the Linux runner), the `collector-freshness` `HealthProbe` (`health.go`), config + `.env` loading (`config.go`) plus the daemon's own `LoadDaemonConfig` (`daemon_config.go`). |
 | `gateway/router/` | the device-driver *family*. `New(kind, cfg)` dispatches on `ROUTER_KIND` (default `nokia`) and returns a `services.Rebooter`. A new device (TP-Link ONT, Tapo/Sonoff smart-plug fallback) is "add a driver file + a factory case", never a fork. |
 | `gateway/telegram/` | Telegram Bot API `Client` (implements `Sender`): DSN parse, `sendMessage`, bot-token redaction. |
@@ -149,11 +134,11 @@ pair (the inspector pattern):
   real `SELECT 1`, since a ping alone can stay green while queries fail) and
   `collector-freshness` (newest `runs.started_at` within `DAEMON_STALE_AFTER`, catching a
   cron collector that has silently stopped writing). A third, **conditional** router
-  credential probe is active when both `YARDDOG_ROUTER_USER` and `YARDDOG_ROUTER_PASS` are
+  credential probe is active when both `ROUTER_USER` and `ROUTER_PASS` are
   set: it performs a live login to the router web UI and immediately resets the session
   (no TTL cache — the daemon's `/health/check` is a real-time "is auth still working?"
   view), **never calls reboot.cgi**, and coalesces concurrent `CheckUP` calls into one
-  in-flight login via a stdlib single-flight (no concurrent sessions). The router probe
+  in-flight login via a hand-rolled `sync.Mutex` single-flight (no concurrent sessions). The router probe
   is registered last so a wedged login cannot starve the SQLite probes. The daemon holds
   a `services.Credentialer`, not a `services.Rebooter`, making it structurally incapable
   of rebooting. Because the login executes on every `/health/check` hit, poll on demand
@@ -184,21 +169,17 @@ the bare logical key and only operator-facing error messages re-attach the prefi
 bare names below are the logical keys; the real variable is each one with `YARDDOG_`
 prepended.
 
-`README.md` holds the authoritative table. Required: `LABEL`, `TELEGRAMBOT_DSN`,
-`ROUTER_USER`, `ROUTER_PASS`. Optional (with defaults): `ROUTER_ADDR`, `ROUTER_KIND`,
-`DB_PATH`, `CHECK_IPS`, `CHECK_DOMAINS`, `CHECK_TIMEOUT`, `RECOVERY_INTERVAL`,
-`RECOVERY_TIMEOUT`, `REBOOT_COOLDOWN`, `RETENTION_DAYS`, `REBOOT_ENABLED` (monitor-only
-when `false`: check/record/notify but never reboot), `METRICS_ENABLED`,
-`METRICS_TEMPERATURE`, `METRICS_FANS`, `METRICS_CPU`, `METRICS_MEMORY`, `METRICS_DISK`,
-`METRICS_UPTIME`, `METRICS_NETWORK`, `METRICS_DISK_MOUNT`.
+`README.md` and `yarddog.env.example` hold the authoritative table. What neither shows
+is which absences change behaviour instead of failing the process:
 
-The **daemon** reads the same env file through its own `LoadDaemonConfig`, whose sole
-required key is `DAEMON_TOKEN` — it never requires or uses the router password or the
-Telegram DSN, so a monitor-only host can run just the daemon. Daemon-only optional keys
-(defaults in parens): `DAEMON_ADDR` (`127.0.0.1:8420` — loopback by default; production
-sets a LAN `ip:port` explicitly), `DAEMON_STALE_AFTER` (`90m`), `DAEMON_MAX_CONNS` (`2`),
-`DAEMON_HEALTH_TIMEOUT` (`5s`), `DAEMON_READ_TIMEOUT` (`10s`), `DAEMON_WRITE_TIMEOUT`
-(`15s`), `DAEMON_IDLE_TIMEOUT` (`60s`). `DB_PATH` is shared with the collector.
+- `REBOOT_ENABLED=false` leaves the collector checking, recording and notifying, but it
+  never reboots. Nothing in the logs calls this out.
+- The **daemon** requires only `DAEMON_TOKEN`. It never reads the router password or the
+  Telegram DSN, so a monitor-only host can run the daemon alone.
+- `DAEMON_ADDR` defaults to loopback; a production host must set a LAN `ip:port`
+  explicitly or the daemon is silently unreachable from anywhere else.
+- `DB_PATH` is shared between collector and daemon. Pointing them at different files
+  yields a daemon that answers correctly about an empty database.
 
 > Never read or edit `.env` files (`.claude/settings.json` denies it). Edit
 > `yarddog.env.example` when the config surface changes, never a real env file.
