@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# yarddog dashboard nginx cutover  (plans/011 Task 4 + overview proxy for plans/010+012)
+# yarddog dashboard nginx cutover  (.agents/plans/011 Task 4 + overview proxy for .agents/plans/010+012)
 #
 # Switches the pi5 vhost so GET / is served by the yarddog daemon's embedded
 # dashboard instead of the static /var/www/.../index.html, and adds the
@@ -104,7 +104,7 @@ OLD = """    # welcome page when no port is given
         try_files /index.html =404;
     }"""
 
-NEW = """    # yarddog weekly overview aggregation (plans/010+012), for the dashboard's
+NEW = """    # yarddog weekly overview aggregation (.agents/plans/010+012), for the dashboard's
     # retrospective section. same token injection + down-fallback as the
     # /api/v1/metrics and /api/v1/pings blocks; query string forwarded so the
     # page can pass ?bucket= / ?since= through to the daemon.
@@ -124,7 +124,7 @@ NEW = """    # yarddog weekly overview aggregation (plans/010+012), for the dash
         error_page 401 403 404 500 502 503 504 = @metrics_down;
     }
 
-    # serve the dashboard from the daemon (plans/011): the daemon owns the page
+    # serve the dashboard from the daemon (.agents/plans/011): the daemon owns the page
     # now, so the UI version always equals the API version. a hard-down daemon
     # would make / a bare 502, so intercept it with a tiny holding page (the
     # daemon has Restart=on-failure and deploys are /ping-gated -> transient).
@@ -212,6 +212,6 @@ echo "  backup kept at : $bak"
 echo "  the static index.html at /var/www/dev.seilbekskindirov.pi5/index.html is now DEAD"
 echo "  (location = / no longer serves it; 403.html/404.html still come from /var/www)."
 echo
-echo "  optional (plans/011 Task 5) — retire it reversibly, changes nothing observable:"
+echo "  optional (.agents/plans/011 Task 5) — retire it reversibly, changes nothing observable:"
 echo "     mv /var/www/dev.seilbekskindirov.pi5/index.html \\"
 echo "        /var/www/dev.seilbekskindirov.pi5/index.html.retired.$ts"

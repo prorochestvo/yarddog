@@ -43,7 +43,7 @@ needs it*:
   should pull it in; one that summarises the prose instead never loads, and its knowledge is
   lost.
 - **Neither** — incident narratives, enumerations derivable from `yarddog.env.example` or the
-  code, and the reasoning behind a decision already taken: commit bodies and `plans/`.
+  code, and the reasoning behind a decision already taken: commit bodies and `.agents/plans/`.
 
 **Measure, never estimate** — this file is mostly contracts and identifiers, which do not
 compress. `wc -c` before and after, and prove a move lost nothing by extracting every
