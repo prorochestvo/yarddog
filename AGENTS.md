@@ -38,7 +38,7 @@ needs it*:
   config model, error contract, conventions, working agreement), plus rules whose violation is
   **silent**. Every subject moved out leaves one such line behind: the sentence that stops
   someone getting it wrong before they load anything.
-- **A project skill** (`.claude/skills/<name>/SKILL.md`) — the depth for one subject area. Its
+- **A project skill** (`.agents/skills/<name>/SKILL.md`) — the depth for one subject area. Its
   `description` *is* the load trigger: name the packages, paths, symbols and env vars that
   should pull it in; one that summarises the prose instead never loads, and its knowledge is
   lost.
